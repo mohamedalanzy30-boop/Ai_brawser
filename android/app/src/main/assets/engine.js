@@ -12,6 +12,8 @@
     tone: true, temporal: true, interp: false, interpNeural: true, images: true
   }
   Object.assign(cfg, window.__minCfg0 || {})
+  const nativeShort = () => Math.round(Math.min(screen.width, screen.height) * (window.devicePixelRatio || 1))
+  const effTarget = () => cfg.target || nativeShort()
   const log = (...a) => { try { console.warn('[AIB]', ...a) } catch (e) { /* ignore */ } }
   const state = { videos: new Map(), failed: false, nn: null, stats: { nn: 'idle', fps: 0, ms: 0 } }
 
@@ -270,7 +272,7 @@ void main(){
   /* ---------------- video ---------------- */
   function outSize (vw, vh, rect) {
     const dpr = window.devicePixelRatio || 1
-    let h = Math.min(cfg.target, Math.round(rect.height * dpr)); let w = Math.round(h * rect.width / Math.max(rect.height, 1))
+    let h = Math.min(effTarget(), Math.round(rect.height * dpr)); let w = Math.round(h * rect.width / Math.max(rect.height, 1))
     if (h <= vh) { h = vh; w = vw }
     return [Math.max(w, 2), Math.max(h, 2)]
   }
@@ -304,12 +306,13 @@ void main(){
       if (video.mediaKeys) { detach(video); st.running = false; return }
       if (!state.videos.has(video) || !cfg.enabled) { st.running = false; return }
       const rect = video.getBoundingClientRect(); const vw = video.videoWidth; const vh = video.videoHeight; const dpr = window.devicePixelRatio || 1
-      const wantH = Math.min(cfg.target, rect.height * dpr)
+      const wantH = Math.min(effTarget(), rect.height * dpr)
       const visible = vw > 0 && video.readyState >= 2 && rect.width > 40 && rect.height > 40 && rect.bottom > 0 && rect.top < window.innerHeight && !document.hidden
       if (!(visible && vh < wantH * 0.95)) { st.canvas.style.display = 'none'; video.style.opacity = st.prevOpacity; next(tick); return }
       const [w, h] = outSize(vw, vh, rect)
       if (st.canvas.width !== w || st.canvas.height !== h) { st.canvas.width = w; st.canvas.height = h }
       const s = st.canvas.style; s.display = 'block'; s.left = rect.left + 'px'; s.top = rect.top + 'px'; s.width = rect.width + 'px'; s.height = rect.height + 'px'
+      state.stats.fps = Math.round(st.fpsEMA)
       state.stats.active = Array.from(state.videos.values()).filter(x => x.canvas.style.display === 'block').length
       try {
         st.R.resize(vw, vh); st.R.upload(video); st.frame++
@@ -351,7 +354,7 @@ void main(){
   function upscaleImage (img) {
     if (doneImages.has(img) || !img.complete || !img.naturalWidth || img.dataset.minEnhanced) return
     const rect = img.getBoundingClientRect(); const dpr = window.devicePixelRatio || 1
-    const wantW = Math.min(rect.width * dpr, cfg.target * (img.naturalWidth / img.naturalHeight))
+    const wantW = Math.min(rect.width * dpr, effTarget() * (img.naturalWidth / img.naturalHeight))
     if (rect.width < 80 || img.naturalWidth >= wantW * 0.9 || img.naturalWidth * img.naturalHeight > 4e6) return
     doneImages.add(img)
     try {

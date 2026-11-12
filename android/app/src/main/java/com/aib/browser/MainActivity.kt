@@ -69,7 +69,12 @@ class MainActivity : Activity() {
 
     private fun logText(): String {
         val wv = WebViewCompat.getCurrentWebViewPackage(this)
-        val head = "AI Browser 0.1 | ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} | Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) | WebView ${wv?.versionName}\nconfig=${config()}\nurl=${web.url}\n"
+        val d = windowManager.defaultDisplay
+        val hdr = d.hdrCapabilities?.supportedHdrTypes?.joinToString { when (it) { 1 -> "DolbyVision"; 2 -> "HDR10"; 3 -> "HLG"; 4 -> "HDR10+"; else -> "$it" } } ?: "none"
+        val rates = d.supportedModes.map { Math.round(it.refreshRate) }.distinct().sorted().joinToString("/")
+        val m = android.util.DisplayMetrics().also { d.getRealMetrics(it) }
+        val disp = "display=${m.widthPixels}x${m.heightPixels} dpi=${m.densityDpi} refresh=${Math.round(d.refreshRate)}Hz modes=$rates hdr=$hdr wideGamut=${d.isWideColorGamut}"
+        val head = "$disp\nAI Browser 0.1 | ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} | Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) | WebView ${wv?.versionName}\nconfig=${config()}\nurl=${web.url}\n"
         return head + synchronized(logLines) { logLines.joinToString("\n") }
     }
     private val prefs by lazy { getSharedPreferences("enhance", Context.MODE_PRIVATE) }
@@ -80,11 +85,13 @@ class MainActivity : Activity() {
         "tone" to "تباين HDR تكيفي",
         "temporal" to "استقرار زمني (يقلل الوميض)",
         "interp" to "توليد الإطارات (ثقيل)",
-        "images" to "تحسين الصور"
+        "images" to "تحسين الصور",
+        "refresh" to "مطابقة معدل تحديث الشاشة للفيديو (حتى 120Hz)",
+        "brightness" to "سطوع أعلى في ملء الشاشة"
     )
-    private val defaults = mapOf("enabled" to true, "neural" to true, "temporal" to true, "tone" to true, "interp" to false, "images" to true)
-    private val targets = intArrayOf(720, 1080, 1440, 2160)
-    private val targetLabels = arrayOf("720p", "1080p", "2K", "4K")
+    private val defaults = mapOf("enabled" to true, "neural" to true, "temporal" to true, "tone" to true, "interp" to false, "images" to true, "refresh" to true, "brightness" to false)
+    private val targets = intArrayOf(0, 720, 1080, 1440, 2160)
+    private val targetLabels = arrayOf("تلقائي", "720p", "1080p", "2K", "4K")
     private val denoise = floatArrayOf(0f, 0.2f, 0.35f, 0.6f)
     private val denoiseLabels = arrayOf("بدون", "خفيف", "متوسط", "قوي")
 
@@ -94,7 +101,7 @@ class MainActivity : Activity() {
     private fun config(): JSONObject {
         val o = JSONObject()
         for ((k, d) in defaults) o.put(k, prefs.getBoolean(k, d))
-        o.put("target", prefs.getInt("target", 1440))
+        o.put("target", prefs.getInt("target", 0))
         o.put("denoise", prefs.getFloat("denoise", 0.35f).toDouble())
         return o
     }
@@ -183,6 +190,7 @@ class MainActivity : Activity() {
                 content.setPadding(0, 0, 0, 0)
                 window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                 requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                if (prefs.getBoolean("brightness", false)) { val lp = window.attributes; lp.screenBrightness = 1f; window.attributes = lp }
             }
             override fun onHideCustomView() { exitFullscreen() }
             override fun onConsoleMessage(m: ConsoleMessage): Boolean {
@@ -240,9 +248,21 @@ class MainActivity : Activity() {
         setOnClickListener { onClick() }
     }
 
+    /** Picks the lowest supported refresh rate that is an integer multiple of the video fps (24->48, 30->60, 60->60/120). */
+    private fun matchRefresh(fps: Int) {
+        val lp = window.attributes
+        val rate = if (fps <= 0 || !prefs.getBoolean("refresh", true)) 0f else {
+            val rates = windowManager.defaultDisplay.supportedModes.map { it.refreshRate }.distinct().sorted()
+            rates.firstOrNull { r -> r >= fps - 1 && Math.abs(r / fps - Math.round(r / fps)) < 0.04f } ?: (rates.maxOrNull() ?: 0f)
+        }
+        if (lp.preferredRefreshRate != rate) { lp.preferredRefreshRate = rate; window.attributes = lp }
+    }
+
     private fun pollBadge() { // shows ✨ with a violet ring while a video is being enhanced
-        web.evaluateJavascript("(window.__minEnhance&&window.__minEnhance.state.stats.active)||0") { v ->
-            val on = (v?.toIntOrNull() ?: 0) > 0
+        web.evaluateJavascript("(function(){var s=window.__minEnhance&&window.__minEnhance.state.stats;return JSON.stringify({a:(s&&s.active)||0,f:(s&&s.fps)||0})})()") { raw ->
+            val j = try { JSONObject(org.json.JSONTokener(raw).nextValue() as String) } catch (e: Exception) { JSONObject() }
+            val on = j.optInt("a") > 0
+            matchRefresh(if (on) j.optInt("f") else 0)
             badge.background = pill(if (on) ACCENT else SURFACE, 22)
             badge.text = if (on) "✨ ON" else "✨"
             badge.textSize = if (on) 13f else 20f
@@ -265,6 +285,7 @@ class MainActivity : Activity() {
         customView = null
         customCallback?.onCustomViewHidden(); customCallback = null
         window.decorView.systemUiVisibility = 0
+        window.attributes = window.attributes.also { it.screenBrightness = android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE }
         requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
         content.requestApplyInsets()
     }
@@ -307,7 +328,7 @@ class MainActivity : Activity() {
             col.addView(row)
         }
         col.addView(label("الدقة المستهدفة"))
-        col.addView(chips(targetLabels, targets.indexOf(prefs.getInt("target", 1440)).coerceAtLeast(0)) { i -> prefs.edit().putInt("target", targets[i]).apply(); applyConfig() })
+        col.addView(chips(targetLabels, targets.indexOf(prefs.getInt("target", 0)).coerceAtLeast(0)) { i -> prefs.edit().putInt("target", targets[i]).apply(); applyConfig() })
         col.addView(label("إزالة الضوضاء وتكسّر الضغط"))
         col.addView(chips(denoiseLabels, denoise.indexOfFirst { it == prefs.getFloat("denoise", 0.35f) }.coerceAtLeast(2)) { i -> prefs.edit().putFloat("denoise", denoise[i]).apply(); applyConfig() })
         col.addView(label("التشخيص"))
