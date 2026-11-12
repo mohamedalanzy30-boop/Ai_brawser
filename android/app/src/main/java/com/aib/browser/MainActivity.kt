@@ -62,6 +62,12 @@ class MainActivity : Activity() {
 
     private fun addLog(line: String) {
         synchronized(logLines) {
+            val last = logLines.lastOrNull()
+            if (last != null && last.substringAfter(' ').replace(Regex(" ×\\d+$"), "") == line) {
+                val n = Regex(" ×(\\d+)$").find(last)?.groupValues?.get(1)?.toInt() ?: 1
+                logLines.removeLast(); logLines.addLast("${timeFmt.format(java.util.Date())} $line ×${n + 1}")
+                return
+            }
             logLines.addLast("${timeFmt.format(java.util.Date())} $line")
             while (logLines.size > 400) logLines.removeFirst()
         }
@@ -197,7 +203,8 @@ class MainActivity : Activity() {
             }
             override fun onHideCustomView() { exitFullscreen() }
             override fun onConsoleMessage(m: ConsoleMessage): Boolean {
-                val interesting = m.message().startsWith("[AIB]") || m.messageLevel() == ConsoleMessage.MessageLevel.ERROR
+                val noise = m.message().startsWith("Permissions policy violation")
+                val interesting = !noise && (m.message().startsWith("[AIB]") || m.messageLevel() == ConsoleMessage.MessageLevel.ERROR)
                 if (interesting) addLog("[${m.messageLevel()}] ${m.message()} (${m.sourceId().substringAfterLast('/')}:${m.lineNumber()})")
                 return true
             }
@@ -205,6 +212,7 @@ class MainActivity : Activity() {
         web.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                 val u = request.url
+                if (u.host == "fonts.gstatic.com" && request.method == "GET") return proxyFont(request)
                 if (u.host != ASSET_HOST) return null
                 val path = u.path.orEmpty().trimStart('/')
                 val cors = mapOf("Access-Control-Allow-Origin" to "*")
@@ -241,6 +249,18 @@ class MainActivity : Activity() {
         pollBadge()
         go(intent?.dataString ?: HOME)
     }
+
+    /** Some Google font files are served without CORS headers, so pages cannot use them. Same download, plus the header. */
+    private fun proxyFont(req: WebResourceRequest): WebResourceResponse? = try {
+        val c = java.net.URL(req.url.toString()).openConnection() as java.net.HttpURLConnection
+        c.connectTimeout = 8000; c.readTimeout = 15000
+        req.requestHeaders["User-Agent"]?.let { c.setRequestProperty("User-Agent", it) }
+        val code = c.responseCode
+        val acao = c.getHeaderField("Access-Control-Allow-Origin")
+        if (code != 200 || acao != null) { c.disconnect(); null } // already fine: let WebView load it normally
+        else WebResourceResponse(c.contentType?.substringBefore(';') ?: "font/woff2", null, 200, "OK",
+            mapOf("Access-Control-Allow-Origin" to "*", "Cache-Control" to "public, max-age=31536000"), c.inputStream)
+    } catch (e: Exception) { null }
 
     private fun injectFallback() { // main frame only, used if document-start scripts are unsupported
         web.evaluateJavascript("if(!window.__minEnhance){window.__minCfg0=${config()};$bundle\n}", null)
