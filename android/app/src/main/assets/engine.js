@@ -17,6 +17,18 @@
   try { // WebView: screen.orientation.lock() rejects, which breaks many players' fullscreen; native code rotates instead
     if (screen.orientation) { screen.orientation.lock = () => Promise.resolve(); screen.orientation.unlock = () => {} }
   } catch (e) { /* ignore */ }
+  const guard = { noInterp: false, noNeural: false }
+  const longTasks = []
+  try { new PerformanceObserver(l => { for (const e of l.getEntries()) longTasks.push([e.startTime, e.duration]) }).observe({ entryTypes: ['longtask'] }) } catch (e) { /* unsupported */ }
+  setInterval(() => {
+    const now = performance.now()
+    while (longTasks.length && now - longTasks[0][0] > 3000) longTasks.shift()
+    const busy = longTasks.reduce((a, t) => a + t[1], 0)
+    const playing = Array.from(state.videos.keys()).some(v => !v.paused)
+    if (!playing || busy < 400) return
+    if (cfg.interp && !guard.noInterp) { guard.noInterp = true; longTasks.length = 0; log('performance guard: frame interpolation turned off (main thread busy ' + Math.round(busy) + 'ms/3s)') }
+    else if (cfg.neural && !guard.noNeural) { guard.noNeural = true; longTasks.length = 0; log('performance guard: neural upscaling turned off while playing (busy ' + Math.round(busy) + 'ms/3s)') }
+  }, 2000)
   const log = (...a) => { try { console.warn('[AIB]', ...a) } catch (e) { /* ignore */ } }
   const state = { videos: new Map(), failed: false, nn: null, stats: { nn: 'idle', fps: 0, ms: 0 } }
 
@@ -326,15 +338,15 @@ void main(){
         if (cfg.tone && st.frame % 6 === 1) analyseTone(st, video)
         const tone = cfg.tone ? st.tone : { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }
         const dt = st.lastT ? (now - st.lastT) : 33; st.lastT = now; st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
-        const wantInterp = cfg.interp && !video.paused && st.fpsEMA < 40
+        const wantInterp = cfg.interp && !guard.noInterp && !video.paused && st.fpsEMA < 40
         if (wantInterp && cfg.interpNeural && vh <= 540 && !(rife.session && st.prevBytes && rife.ms < 0.9 * (1000 / st.fpsEMA))) st.prevBytes = grabBytes(video, vw, vh)
-        const wantNN = cfg.neural && !wantInterp && vh <= 540 && state.nn && state.nn.session && state.stats.nn !== 'error'
+        const wantNN = cfg.neural && (!guard.noNeural || video.paused) && !wantInterp && vh <= 540 && state.nn && state.nn.session && state.stats.nn !== 'error'
         if (cfg.neural && vh <= 540) nnInit()
         // Neural frames are only shown when they are consistent: exact frame while paused, or when the
         // model keeps up with the video (always one steady frame late). Never mix stale and live frames.
         const nnS = state.nn; const T = 1000 / Math.max(st.fpsEMA, 1)
         const fast = !!nnS && nnS.ms > 0 && nnS.ms < 0.8 * T
-        if (wantNN && !nnS.busy && (video.paused || fast || !nnS.ms || performance.now() - (nnS.lastProbe || 0) > 5000)) { nnS.lastProbe = performance.now(); nnRun(video, vw, vh) }
+        if (wantNN && !nnS.busy && (video.paused || fast || !nnS.ms)) { nnS.lastProbe = performance.now(); nnRun(video, vw, vh) }
         const r = nnS && nnS.last
         const fresh = wantNN && r && r.w === vw * 4 && (video.paused ? Math.abs(r.mediaTime - video.currentTime) < 0.05 : fast && Math.abs(r.mediaTime - video.currentTime) < 3 * T / 1000)
         if (fresh) {
@@ -443,6 +455,8 @@ void main(){
     window.__minEnhanceSet(c)
   })
   window.__minEnhanceSet = function (c) {
+    if (c && c.interp === true) guard.noInterp = false
+    if (c && c.neural === true) guard.noNeural = false
     Object.assign(cfg, c || {}); forward(c || {})
     if (cfg.enabled) { scan(); state.videos.forEach((_, v) => loop(v)) } else Array.from(state.videos.keys()).forEach(detach)
   }
