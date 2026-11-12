@@ -58,8 +58,13 @@ void main(){ uv = p*0.5+0.5; gl_Position = vec4(p,0.,1.); }`
   // stabilise: motion-adaptive temporal blend of previous and current source frame
   const FS_STAB = `#version 300 es
 precision highp float; uniform sampler2D cur, prev; uniform float amt; in vec2 uv; out vec4 o;
-void main(){ vec3 c=texture(cur,uv).rgb, p=texture(prev,uv).rgb;
-  float d=length(c-p); float a=amt*(1.0-smoothstep(0.07,0.22,d)); o=vec4(mix(c,p,a),1.); }`
+// history is clamped to the colour range of the current 3x3 neighbourhood (as in TAA), so moving
+// edges and bright highlights can never leave a trail ("ghost") behind; only static flicker is smoothed
+void main(){ vec2 t=1.0/vec2(textureSize(cur,0)); vec3 c=texture(cur,uv).rgb;
+  vec3 mn=c, mx=c;
+  for(int j=-1;j<=1;j++) for(int i=-1;i<=1;i++){ vec3 n=texture(cur,uv+vec2(float(i),float(j))*t).rgb; mn=min(mn,n); mx=max(mx,n); }
+  vec3 p=clamp(texture(prev,uv).rgb, mn-0.035, mx+0.035);
+  float d=length(c-texture(prev,uv).rgb); float a=amt*(1.0-smoothstep(0.06,0.2,d)); o=vec4(mix(c,p,a),1.); }`
 
   // flow: block matching at reduced resolution, output = displacement (source uv units) + sad
   const FS_FLOW = `#version 300 es
@@ -317,6 +322,19 @@ void main(){
     if (h <= vh) { h = vh; w = vw }
     return [Math.max(w, 2), Math.max(h, 2)]
   }
+  // The picture inside a <video> keeps its aspect ratio (object-fit: contain by default), so the
+  // overlay must cover only the real picture, never the whole element (that stretched the video).
+  function fitRect (video, rect, vw, vh) {
+    const fit = (getComputedStyle(video).objectFit || 'contain')
+    if (fit === 'fill' || !vw || !vh) return { left: rect.left, top: rect.top, width: rect.width, height: rect.height, clip: '' }
+    const ar = vw / vh; const er = rect.width / Math.max(rect.height, 1)
+    let w, h
+    if (fit === 'cover' ? ar < er : ar > er) { w = rect.width; h = w / ar } else { h = rect.height; w = h * ar }
+    if (fit === 'none' || fit === 'scale-down') { const sw = Math.min(w, vw); const sh = sw / ar; if (fit === 'none' || sw < w) { w = vw; h = vh } else { w = sw; h = sh } }
+    const left = rect.left + (rect.width - w) / 2; const top = rect.top + (rect.height - h) / 2
+    const clip = fit === 'cover' ? `inset(${Math.max(0, rect.top - top)}px ${Math.max(0, left + w - rect.right)}px ${Math.max(0, top + h - rect.bottom)}px ${Math.max(0, rect.left - left)}px)` : ''
+    return { left, top, width: w, height: h, clip }
+  }
   function host () { return document.fullscreenElement || document.webkitFullscreenElement || document.documentElement }
   document.addEventListener('fullscreenchange', () => state.videos.forEach(st => host().appendChild(st.canvas)))
   document.addEventListener('webkitfullscreenchange', () => state.videos.forEach(st => host().appendChild(st.canvas)))
@@ -347,14 +365,15 @@ void main(){
       if (video.mediaKeys) { detach(video); st.running = false; return }
       if (!state.videos.has(video) || !cfg.enabled) { st.running = false; return }
       const rect = video.getBoundingClientRect(); const vw = video.videoWidth; const vh = video.videoHeight; const dpr = window.devicePixelRatio || 1
-      const wantH = Math.min(effTarget(), rect.height * dpr)
+      const wantH = Math.min(effTarget(), fitRect(video, rect, vw, vh).height * dpr)
       const visible = vw > 0 && video.readyState >= 2 && rect.width > 40 && rect.height > 40 && rect.bottom > 0 && rect.top < window.innerHeight && !document.hidden
       const why = !visible ? 'hidden/not-ready' : (vh >= wantH * 0.95 ? 'source already >= target' : 'enhancing')
       if (st.why !== why) { st.why = why; log('video', vw + 'x' + vh, 'shown=' + Math.round(rect.width) + 'x' + Math.round(rect.height) + 'css', 'wantH=' + Math.round(wantH), '=>', why, 'frame=' + (window.top === window ? 'TOP' : 'FRAME')) }
       if (!(visible && vh < wantH * 0.95)) { st.canvas.style.display = 'none'; video.style.opacity = st.prevOpacity; next(tick); return }
-      const [w, h] = outSize(vw, vh, rect)
+      const fr = fitRect(video, rect, vw, vh)
+      const [w, h] = outSize(vw, vh, fr)
       if (st.canvas.width !== w || st.canvas.height !== h) { st.canvas.width = w; st.canvas.height = h }
-      const s = st.canvas.style; s.display = 'block'; s.left = rect.left + 'px'; s.top = rect.top + 'px'; s.width = rect.width + 'px'; s.height = rect.height + 'px'
+      const s = st.canvas.style; s.display = 'block'; s.left = fr.left + 'px'; s.top = fr.top + 'px'; s.width = fr.width + 'px'; s.height = fr.height + 'px'; s.clipPath = fr.clip
       state.stats.fps = Math.round(st.fpsEMA)
       state.stats.active = Array.from(state.videos.values()).filter(x => x.canvas.style.display === 'block').length
       try {
