@@ -12,6 +12,7 @@
     tone: true, temporal: true, interp: false, interpNeural: true, images: true
   }
   Object.assign(cfg, window.__minCfg0 || {})
+  const log = (...a) => { try { console.warn('[AIB]', ...a) } catch (e) { /* ignore */ } }
   const state = { videos: new Map(), failed: false, nn: null, stats: { nn: 'idle', fps: 0, ms: 0 } }
 
   /* ---------------- shaders ---------------- */
@@ -191,10 +192,11 @@ void main(){
       let hasGpu = false
       try { hasGpu = !!(navigator.gpu && await navigator.gpu.requestAdapter()) } catch (e) { /* none */ }
       for (const ep of hasGpu ? ['webgpu', 'wasm'] : ['wasm']) {
-        try { nn.session = await ort.InferenceSession.create(bytes, { executionProviders: [ep], graphOptimizationLevel: 'all' }); nn.backend = ep; break } catch (e) { /* next */ }
+        try { nn.session = await ort.InferenceSession.create(bytes, { executionProviders: [ep], graphOptimizationLevel: 'all' }); nn.backend = ep; break } catch (e) { log('SR backend', ep, 'failed:', String(e)) }
       }
       state.stats.nn = nn.session ? 'ready:' + nn.backend : 'error'
-    })().catch(() => { state.stats.nn = 'error' })
+      log('neural SR model', state.stats.nn)
+    })().catch((e) => { state.stats.nn = 'error'; log('neural SR load failed:', String(e)) })
   }
   const grab = document.createElement('canvas'); const grabCtx = grab.getContext('2d', { willReadFrequently: true })
   function grabBytes (video, vw, vh) {
@@ -214,7 +216,7 @@ void main(){
       const res = new Uint8Array(opx * 4)
       for (let i = 0, j = 0; i < opx; i++, j += 4) { res[j] = o[i] * 255 + 0.5; res[j + 1] = o[opx + i] * 255 + 0.5; res[j + 2] = o[2 * opx + i] * 255 + 0.5; res[j + 3] = 255 }
       nn.last = { mediaTime: mt, w: ow, h: oh, bytes: res }
-    } catch (e) { state.stats.nn = 'error' } finally { nn.busy = false }
+    } catch (e) { state.stats.nn = 'error'; log('SR inference failed:', String(e)) } finally { nn.busy = false }
   }
 
   /* ---------------- neural frame interpolation: RIFE 4.25 lite (MIT) ---------------- */
@@ -229,10 +231,11 @@ void main(){
       let hasGpu = false
       try { hasGpu = !!(navigator.gpu && await navigator.gpu.requestAdapter()) } catch (e) { /* none */ }
       for (const ep of hasGpu ? ['webgpu', 'wasm'] : ['wasm']) {
-        try { rife.session = await ort.InferenceSession.create(bytes, { executionProviders: [ep], graphOptimizationLevel: 'all' }); rife.backend = ep; break } catch (e) { /* next */ }
+        try { rife.session = await ort.InferenceSession.create(bytes, { executionProviders: [ep], graphOptimizationLevel: 'all' }); rife.backend = ep; break } catch (e) { log('RIFE backend', ep, 'failed:', String(e)) }
       }
       state.stats.rife = rife.session ? 'ready:' + rife.backend : 'error'
-    })().catch(() => { state.stats.rife = 'error'; rife.loading = false })
+      log('RIFE model', state.stats.rife)
+    })().catch((e) => { state.stats.rife = 'error'; rife.loading = false; log('RIFE load failed:', String(e)) })
   }
   function toPlanes (rgba, w, h, pw, ph) { // RGBA bytes -> padded NCHW float32
     const pl = pw * ph; const out = new Float32Array(3 * pl)
@@ -269,12 +272,13 @@ void main(){
   document.addEventListener('fullscreenchange', () => state.videos.forEach(st => host().appendChild(st.canvas)))
   document.addEventListener('webkitfullscreenchange', () => state.videos.forEach(st => host().appendChild(st.canvas)))
   function attach (video) {
-    if (state.videos.has(video) || state.failed || video.mediaKeys) return
+    if (video.mediaKeys) { log('DRM video skipped'); return }
+    if (state.videos.has(video) || state.failed) return
     const canvas = document.createElement('canvas')
     canvas.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483646;display:none'
     let R
     try { R = makeRenderer(canvas) } catch (e) { R = null; console.warn('enhance: shader error', e) }
-    if (!R) { state.failed = true; return }
+    if (!R) { state.failed = true; log('WebGL2 unavailable'); return }
     const st = { canvas, R, running: false, prevOpacity: video.style.opacity, errors: 0, frame: 0, tone: { lo: 0, hi: 1, contrast: 0.22, sat: 1.1, gamma: 1 }, lastT: 0, fpsEMA: 30 }
     state.videos.set(video, st); host().appendChild(canvas)
     video.addEventListener('play', () => loop(video)); loop(video)
@@ -323,14 +327,14 @@ void main(){
             rifeMid(prevB, cur, vw, vh).then(mid => {
               st.R.uploadRaw(mid, vw, vh); st.R.draw('raw', vw, vh, tone, cfg.sharpness)
               setTimeout(() => { if (state.videos.has(video)) { try { st.R.draw('cur', vw, vh, tone, cfg.sharpness) } catch (e) { /* ignore */ } } }, Math.max(8, 500 / st.fpsEMA))
-            }).catch(() => { rife.ms = 1e9 }).finally(() => { rife.busy = false })
+            }).catch((e) => { rife.ms = 1e9; log('RIFE inference failed:', String(e)) }).finally(() => { rife.busy = false })
           } else st.R.draw('cur', vw, vh, tone, cfg.sharpness)
         } else if (wantInterp && st.R.hasPrev) {
           st.R.draw('mid', vw, vh, tone, cfg.sharpness) // midpoint now, real frame half an interval later
           setTimeout(() => { if (state.videos.has(video)) { try { st.R.draw('cur', vw, vh, tone, cfg.sharpness) } catch (e) { /* ignore */ } } }, Math.max(8, 500 / st.fpsEMA))
         } else st.R.draw('cur', vw, vh, tone, cfg.sharpness)
         video.style.opacity = '0'; st.errors = 0
-      } catch (e) { if (++st.errors > 3) { detach(video); st.running = false; return } }
+      } catch (e) { if (++st.errors > 3) { log('video disabled (', String(e), ') src=', (video.currentSrc || '').slice(0, 80)); detach(video); st.running = false; return } }
       next(tick)
     }
     tick(performance.now())
@@ -368,5 +372,10 @@ void main(){
     if (cfg.enabled) { scan(); state.videos.forEach((_, v) => loop(v)) } else Array.from(state.videos.keys()).forEach(detach)
   }
   window.__minEnhance = { cfg, state }
+  if (window.top === window) {
+    const gpu = !!navigator.gpu
+    log('init', location.host, 'webgpu=' + gpu, 'ort=' + !!window.ort, 'cfg=' + JSON.stringify(cfg))
+    if (gpu) navigator.gpu.requestAdapter().then(a => log('webgpu adapter:', a ? 'ok' : 'none')).catch(e => log('webgpu adapter error', String(e)))
+  }
   scan()
 })()

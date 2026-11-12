@@ -3,6 +3,8 @@ package com.aib.browser
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Dialog
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -17,6 +19,9 @@ import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
 import android.view.inputmethod.EditorInfo
+import android.webkit.ConsoleMessage
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebResourceError
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -52,6 +57,21 @@ class MainActivity : Activity() {
     private var customCallback: WebChromeClient.CustomViewCallback? = null
     private var scriptHandler: ScriptHandler? = null
     private val ui = Handler(Looper.getMainLooper())
+    private val logLines = ArrayDeque<String>()
+    private val timeFmt = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
+
+    private fun addLog(line: String) {
+        synchronized(logLines) {
+            logLines.addLast("${timeFmt.format(java.util.Date())} $line")
+            while (logLines.size > 400) logLines.removeFirst()
+        }
+    }
+
+    private fun logText(): String {
+        val wv = WebViewCompat.getCurrentWebViewPackage(this)
+        val head = "AI Browser 0.1 | ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} | Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) | WebView ${wv?.versionName}\nconfig=${config()}\nurl=${web.url}\n"
+        return head + synchronized(logLines) { logLines.joinToString("\n") }
+    }
     private val prefs by lazy { getSharedPreferences("enhance", Context.MODE_PRIVATE) }
 
     private val toggles = linkedMapOf(
@@ -165,6 +185,11 @@ class MainActivity : Activity() {
                 requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
             }
             override fun onHideCustomView() { exitFullscreen() }
+            override fun onConsoleMessage(m: ConsoleMessage): Boolean {
+                val interesting = m.message().startsWith("[AIB]") || m.messageLevel() == ConsoleMessage.MessageLevel.ERROR
+                if (interesting) addLog("[${m.messageLevel()}] ${m.message()} (${m.sourceId().substringAfterLast('/')}:${m.lineNumber()})")
+                return true
+            }
         }
         web.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
@@ -182,6 +207,16 @@ class MainActivity : Activity() {
                 } catch (e: FileNotFoundException) {
                     WebResourceResponse("text/plain", "utf-8", 404, "Not Found", cors, "".byteInputStream())
                 }
+            }
+            override fun onReceivedError(view: WebView, req: WebResourceRequest, err: WebResourceError) {
+                if (req.isForMainFrame || req.url.host == ASSET_HOST) addLog("[LOAD ERROR] ${req.url} -> ${err.description}")
+            }
+            override fun onReceivedHttpError(view: WebView, req: WebResourceRequest, resp: WebResourceResponse) {
+                if (req.url.host == ASSET_HOST || req.isForMainFrame) addLog("[HTTP ${resp.statusCode}] ${req.url}")
+            }
+            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+                addLog("[CRASH] WebView renderer gone, didCrash=${detail.didCrash()}")
+                return true
             }
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 if (!urlBar.hasFocus()) urlBar.setText(url)
@@ -275,11 +310,36 @@ class MainActivity : Activity() {
         col.addView(chips(targetLabels, targets.indexOf(prefs.getInt("target", 1440)).coerceAtLeast(0)) { i -> prefs.edit().putInt("target", targets[i]).apply(); applyConfig() })
         col.addView(label("إزالة الضوضاء وتكسّر الضغط"))
         col.addView(chips(denoiseLabels, denoise.indexOfFirst { it == prefs.getFloat("denoise", 0.35f) }.coerceAtLeast(2)) { i -> prefs.edit().putFloat("denoise", denoise[i]).apply(); applyConfig() })
+        col.addView(label("التشخيص"))
+        col.addView(TextView(this).apply {
+            text = "📋 سجل الأخطاء (للنسخ)"; textSize = 15f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
+            background = pill(SURFACE, 18); setOnClickListener { dlg.dismiss(); showLog() }
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)))
         dlg.setContentView(ScrollView(this).apply { addView(col) })
         dlg.window?.apply {
             setBackgroundDrawable(pill(BG, 24)); setGravity(Gravity.BOTTOM)
             setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         }
+        dlg.show()
+    }
+
+    private fun showLog() {
+        val dlg = Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(BG); setPadding(dp(12), dp(12), dp(12), dp(12)) }
+        val txt = TextView(this).apply { text = logText(); textSize = 11f; setTextColor(0xFFD0D0D0.toInt()); setTextIsSelectable(true); typeface = android.graphics.Typeface.MONOSPACE }
+        val btns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun btn(t: String, f: () -> Unit) = TextView(this).apply {
+            text = t; textSize = 15f; gravity = Gravity.CENTER; setTextColor(Color.WHITE); background = pill(ACCENT, 18); setOnClickListener { f() }
+        }
+        btns.addView(btn("نسخ الكل") {
+            (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("AI Browser log", logText()))
+            android.widget.Toast.makeText(this, "تم النسخ", android.widget.Toast.LENGTH_SHORT).show()
+        }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(0, 0, dp(6), 0) })
+        btns.addView(btn("مسح") { synchronized(logLines) { logLines.clear() }; txt.text = logText() }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
+        btns.addView(btn("إغلاق") { dlg.dismiss() }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, 0, 0) })
+        col.addView(btns)
+        col.addView(ScrollView(this).apply { addView(txt) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dp(10) })
+        dlg.setContentView(col)
         dlg.show()
     }
 
