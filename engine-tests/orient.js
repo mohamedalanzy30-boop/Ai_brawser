@@ -9,7 +9,7 @@ const ENGINE = path.resolve(__dirname, '../android/app/src/main/assets/engine.js
     const q = new URL(route.request().url()).pathname; let f = null
     if (q.startsWith('/ort/')) f = path.join(ortDir, q.slice(5)); else if (q.includes('rife')) f = '/home/user/scratch_test/fake_rife.onnx'; else if (q.startsWith('/model/')) f = '/home/user/scratch_test/fake_x4.onnx'
     if (!f || !fs.existsSync(f)) return route.fulfill({ status: 404 })
-    route.fulfill({ body: fs.readFileSync(f), headers: { 'access-control-allow-origin': '*', 'content-type': f.endsWith('.wasm') ? 'application/wasm' : 'application/octet-stream' } })
+    route.fulfill({ body: fs.readFileSync(f), headers: { 'access-control-allow-origin': '*', 'content-type': f.endsWith('.wasm') ? 'application/wasm' : f.endsWith('.onnx') ? 'application/octet-stream' : 'text/javascript' } })
   })
   await page.route('https://test.local/', r => r.fulfill({ contentType: 'text/html', body: '<body style="margin:0"><video id=v muted autoplay style="width:640px;height:360px"></video></body>' }))
   await page.goto('https://test.local/')
@@ -29,7 +29,7 @@ const ENGINE = path.resolve(__dirname, '../android/app/src/main/assets/engine.js
   })
   for (const [name, c] of [['cur no-temporal', { neural: false, temporal: false, tone: false }], ['cur + temporal', { neural: false, temporal: true, tone: false }], ['neural SR (nn)', { neural: true, temporal: false, tone: false, interp: false }], ['neural RIFE (raw)', { neural: false, temporal: false, tone: false, interp: true, interpNeural: true }], ['interp shader (mid)', { neural: false, temporal: false, interp: true, interpNeural: false, tone: false }]]) {
     await page.evaluate(c => window.__minEnhanceSet(Object.assign({ enabled: true, target: 1080 }, c)), c)
-    await page.waitForTimeout(name.startsWith('neural') ? 9000 : 2000); console.log(name.padEnd(22), await probe())
+    await page.waitForTimeout(name.startsWith('neural') ? 9000 : 2000); console.log(name.padEnd(22), await probe(), name.startsWith('neural SR') ? await page.evaluate(() => { const n = window.__minEnhance.state.nn; const c = document.querySelector('canvas[style*="fixed"]'); const gl = c.getContext('webgl2'); return ' planes=' + (n && n.last && n.last.planes && n.last.planes.constructor.name) + ' glError=' + (gl ? gl.getError() : 'n/a') }) : '')
   }
   await browser.close()
 })()

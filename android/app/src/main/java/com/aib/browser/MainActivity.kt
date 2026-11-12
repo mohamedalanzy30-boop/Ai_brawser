@@ -179,6 +179,9 @@ class MainActivity : Activity() {
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
             setSupportZoom(true); builtInZoomControls = true; displayZoomControls = false
             useWideViewPort = true; loadWithOverviewMode = true
+            // use the phone's system font (e.g. Samsung One UI font) for pages that do not ship their own
+            standardFontFamily = "sans-serif"; sansSerifFontFamily = "sans-serif"; fixedFontFamily = "monospace"; serifFontFamily = "serif"
+            textZoom = 100
         }
         web.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView, p: Int) {

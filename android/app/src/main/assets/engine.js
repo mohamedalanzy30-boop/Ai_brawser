@@ -25,9 +25,10 @@
     while (longTasks.length && now - longTasks[0][0] > 3000) longTasks.shift()
     const busy = longTasks.reduce((a, t) => a + t[1], 0)
     const playing = Array.from(state.videos.keys()).some(v => !v.paused)
-    if (!playing || busy < 400) return
-    if (cfg.interp && !guard.noInterp) { guard.noInterp = true; longTasks.length = 0; log('performance guard: frame interpolation turned off (main thread busy ' + Math.round(busy) + 'ms/3s)') }
-    else if (cfg.neural && !guard.noNeural) { guard.noNeural = true; longTasks.length = 0; log('performance guard: neural upscaling turned off while playing (busy ' + Math.round(busy) + 'ms/3s)') }
+    if (guard.retryAt && now > guard.retryAt) { guard.noInterp = false; guard.noNeural = false; guard.retryAt = 0; log('performance guard: retrying heavy features') }
+    if (!playing || busy < 600) return
+    if (cfg.interp && !guard.noInterp) { guard.noInterp = true; guard.retryAt = now + 30000; longTasks.length = 0; log('performance guard: frame interpolation paused 30s (main thread busy ' + Math.round(busy) + 'ms/3s)') }
+    else if (cfg.neural && !guard.noNeural) { guard.noNeural = true; guard.retryAt = now + 30000; longTasks.length = 0; log('performance guard: neural upscaling paused 30s while playing (busy ' + Math.round(busy) + 'ms/3s)') }
   }, 2000)
   const log = (...a) => { try { console.warn('[AIB]', ...a) } catch (e) { /* ignore */ } }
   const state = { videos: new Map(), failed: false, nn: null, stats: { nn: 'idle', fps: 0, ms: 0 } }
@@ -69,6 +70,10 @@ void main(){
 precision highp float; uniform sampler2D cur, prev, flow; in vec2 uv; out vec4 o;
 void main(){ vec4 f=texture(flow,uv); vec2 d=f.xy; float ok=1.0-smoothstep(0.35,0.9,f.z);
   vec3 a=texture(cur,uv-d*0.5*ok).rgb, b=texture(prev,uv+d*0.5*ok).rgb; o=vec4(mix(a,b,0.5),1.); }`
+
+  const FS_PLANES = `#version 300 es
+precision highp float; uniform sampler2D pr, pg, pb; in vec2 uv; out vec4 o;
+void main(){ o=vec4(texture(pr,uv).r, texture(pg,uv).r, texture(pb,uv).r, 1.); }`
 
   const FS_MAIN = `#version 300 es
 precision highp float;
@@ -131,7 +136,7 @@ void main(){
     const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance' })
     if (!gl) return null
     const R = { gl, canvas, w: 0, h: 0 }
-    R.stab = program(gl, FS_STAB, VS_FBO); R.flowP = program(gl, FS_FLOW, VS_FBO); R.mid = program(gl, FS_MID, VS_FBO); R.main = program(gl, FS_MAIN)
+    R.stab = program(gl, FS_STAB, VS_FBO); R.flowP = program(gl, FS_FLOW, VS_FBO); R.mid = program(gl, FS_MID, VS_FBO); R.planesP = program(gl, FS_PLANES, VS_FBO); R.main = program(gl, FS_MAIN)
     const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf)
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW)
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
@@ -157,6 +162,16 @@ void main(){
       const t = R.texPrev; R.texPrev = R.texCur; R.texCur = t
       R.bind(0, R.texCur)
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source)
+    }
+    R.uploadPlanes = function (data, w, h) { // Float32 NCHW (3 planes) straight to the GPU; converted by a shader
+      const n = w * h
+      if (!R.texP || R.pw !== w || R.ph !== h) {
+        R.texP = [0, 1, 2].map(() => texture(gl, 0, 0, gl.NEAREST)); R.pw = w; R.ph = h
+        R.bind(0, R.texNN); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
+      }
+      gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
+      for (let i = 0; i < 3; i++) { R.bind(i, R.texP[i]); gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, w, h, 0, gl.RED, gl.FLOAT, data.subarray(i * n, (i + 1) * n)) }
+      R.pass(R.planesP, R.texNN, w, h, u => { gl.uniform1i(u.pr, 0); gl.uniform1i(u.pg, 1); gl.uniform1i(u.pb, 2) })
     }
     R.uploadRaw = function (bytes, w, h) {
       R.bind(0, R.texNN); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
@@ -208,7 +223,7 @@ void main(){
   /* ---------------- neural 4x via ONNX Runtime Web (in page) ---------------- */
   function nnInit () {
     if (state.nn || !window.ort) { if (!window.ort) state.stats.nn = 'ort-missing'; return }
-    const nn = state.nn = { session: null, busy: false, last: null, ms: 0, id: 0 }
+    const nn = state.nn = { session: null, busy: false, last: null, ms: 0, id: 0, rid: 0 }
     state.stats.nn = 'loading'
     const ort = window.ort
     ort.env.wasm.wasmPaths = HOST + 'ort/'; ort.env.wasm.numThreads = 1
@@ -237,10 +252,8 @@ void main(){
       const mt = video.currentTime; const t0 = performance.now()
       const out = await nn.session.run({ [nn.session.inputNames[0]]: new window.ort.Tensor('float32', inp, [1, 3, vh, vw]) })
       nn.ms = nn.ms ? nn.ms * 0.7 + (performance.now() - t0) * 0.3 : performance.now() - t0
-      const o = out[nn.session.outputNames[0]].data; const ow = vw * 4; const oh = vh * 4; const opx = ow * oh
-      const res = new Uint8Array(opx * 4)
-      for (let i = 0, j = 0; i < opx; i++, j += 4) { res[j] = o[i] * 255 + 0.5; res[j + 1] = o[opx + i] * 255 + 0.5; res[j + 2] = o[2 * opx + i] * 255 + 0.5; res[j + 3] = 255 }
-      nn.last = { mediaTime: mt, w: ow, h: oh, bytes: res }
+      const o = out[nn.session.outputNames[0]].data; const ow = vw * 4; const oh = vh * 4 // Float32 NCHW, converted on the GPU
+      nn.last = { mediaTime: mt, w: ow, h: oh, planes: o, id: ++nn.rid }
     } catch (e) { state.stats.nn = 'error'; log('SR inference failed:', String(e)) } finally { nn.busy = false }
   }
 
@@ -350,7 +363,8 @@ void main(){
         const r = nnS && nnS.last
         const fresh = wantNN && r && r.w === vw * 4 && (video.paused ? Math.abs(r.mediaTime - video.currentTime) < 0.05 : fast && Math.abs(r.mediaTime - video.currentTime) < 3 * T / 1000)
         if (fresh) {
-          st.R.uploadRaw(r.bytes, r.w, r.h); st.R.draw('nn', vw, vh, tone, cfg.sharpness * 0.3)
+          if (st.nnId !== r.id) { st.R.uploadPlanes(r.planes, r.w, r.h); st.nnId = r.id }
+          st.R.draw('nn', vw, vh, tone, cfg.sharpness * 0.3)
         } else if (wantInterp && cfg.interpNeural && vh <= 540 && (rifeInit(), rife.session) && st.prevBytes &&
                    rife.ms < 0.9 * (1000 / st.fpsEMA)) {
           // neural midpoint: present it first, then the real frame half an interval later
@@ -358,7 +372,7 @@ void main(){
           if (!rife.busy) {
             rife.busy = true
             rifeMid(prevB, cur, vw, vh).then(mid => {
-              st.R.uploadRaw(mid, vw, vh); st.R.draw('raw', vw, vh, tone, cfg.sharpness)
+              st.R.uploadRaw(mid, vw, vh); st.nnId = -1; st.R.draw('raw', vw, vh, tone, cfg.sharpness)
               setTimeout(() => { if (state.videos.has(video)) { try { st.R.draw('cur', vw, vh, tone, cfg.sharpness) } catch (e) { /* ignore */ } } }, Math.max(8, 500 / st.fpsEMA))
             }).catch((e) => { rife.ms = 1e9; log('RIFE inference failed:', String(e)) }).finally(() => { rife.busy = false })
           } else st.R.draw('cur', vw, vh, tone, cfg.sharpness)
