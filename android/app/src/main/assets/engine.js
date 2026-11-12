@@ -14,6 +14,9 @@
   Object.assign(cfg, window.__minCfg0 || {})
   const nativeShort = () => Math.round(Math.min(screen.width, screen.height) * (window.devicePixelRatio || 1))
   const effTarget = () => cfg.target || nativeShort()
+  try { // WebView: screen.orientation.lock() rejects, which breaks many players' fullscreen; native code rotates instead
+    if (screen.orientation) { screen.orientation.lock = () => Promise.resolve(); screen.orientation.unlock = () => {} }
+  } catch (e) { /* ignore */ }
   const log = (...a) => { try { console.warn('[AIB]', ...a) } catch (e) { /* ignore */ } }
   const state = { videos: new Map(), failed: false, nn: null, stats: { nn: 'idle', fps: 0, ms: 0 } }
 
@@ -310,6 +313,8 @@ void main(){
       const rect = video.getBoundingClientRect(); const vw = video.videoWidth; const vh = video.videoHeight; const dpr = window.devicePixelRatio || 1
       const wantH = Math.min(effTarget(), rect.height * dpr)
       const visible = vw > 0 && video.readyState >= 2 && rect.width > 40 && rect.height > 40 && rect.bottom > 0 && rect.top < window.innerHeight && !document.hidden
+      const why = !visible ? 'hidden/not-ready' : (vh >= wantH * 0.95 ? 'source already >= target' : 'enhancing')
+      if (st.why !== why) { st.why = why; log('video', vw + 'x' + vh, 'shown=' + Math.round(rect.width) + 'x' + Math.round(rect.height) + 'css', 'wantH=' + Math.round(wantH), '=>', why, 'frame=' + (window.top === window ? 'TOP' : 'FRAME')) }
       if (!(visible && vh < wantH * 0.95)) { st.canvas.style.display = 'none'; video.style.opacity = st.prevOpacity; next(tick); return }
       const [w, h] = outSize(vw, vh, rect)
       if (st.canvas.width !== w || st.canvas.height !== h) { st.canvas.width = w; st.canvas.height = h }
@@ -428,15 +433,21 @@ void main(){
   let timer = null
   new window.MutationObserver(() => { clearTimeout(timer); timer = setTimeout(scan, 400) }).observe(document, { childList: true, subtree: true })
   document.addEventListener('visibilitychange', () => { if (!document.hidden) state.videos.forEach((_, v) => loop(v)) })
+  const CFG_KEYS = ['enabled', 'target', 'sharpness', 'neural', 'denoise', 'tone', 'temporal', 'interp', 'interpNeural', 'images']
+  function forward (c) { // push the config into every child frame (players live in iframes)
+    for (let i = 0; i < window.frames.length; i++) { try { window.frames[i].postMessage({ __aibCfg: c }, '*') } catch (e) { /* ignore */ } }
+  }
+  window.addEventListener('message', (e) => {
+    if (e.source !== window.parent || !e.data || !e.data.__aibCfg) return
+    const c = {}; for (const k of CFG_KEYS) if (k in e.data.__aibCfg) c[k] = e.data.__aibCfg[k]
+    window.__minEnhanceSet(c)
+  })
   window.__minEnhanceSet = function (c) {
-    Object.assign(cfg, c || {})
+    Object.assign(cfg, c || {}); forward(c || {})
     if (cfg.enabled) { scan(); state.videos.forEach((_, v) => loop(v)) } else Array.from(state.videos.keys()).forEach(detach)
   }
   window.__minEnhance = { cfg, state }
-  if (window.top === window) {
-    const gpu = !!navigator.gpu
-    log('init', location.host, 'webgpu=' + gpu, 'ort=' + !!window.ort, 'cfg=' + JSON.stringify(cfg))
-    if (gpu) navigator.gpu.requestAdapter().then(a => log('webgpu adapter:', a ? 'ok' : 'none')).catch(e => log('webgpu adapter error', String(e)))
-  }
+  log('init', window.top === window ? 'TOP' : 'FRAME', location.host, 'enabled=' + cfg.enabled, 'neural=' + cfg.neural, 'target=' + (cfg.target || 'auto'))
+  if (window.top === window && navigator.gpu) navigator.gpu.requestAdapter().then(a => log('webgpu adapter:', a ? 'ok' : 'none')).catch(e => log('webgpu adapter error', String(e)))
   scan()
 })()
