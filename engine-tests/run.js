@@ -11,7 +11,7 @@ const [ortDir, modelPath] = process.argv.slice(2)
     const p = new URL(route.request().url()).pathname
     let file = null
     if (p.startsWith('/ort/')) file = path.join(ortDir, p.slice(5))
-    else if (p.startsWith('/model/')) file = modelPath
+    else if (p.startsWith('/model/')) file = p.includes('rife') ? modelPath.replace(/[^/]*$/, 'fake_rife.onnx') : modelPath
     if (!file || !fs.existsSync(file)) return route.fulfill({ status: 404 })
     route.fulfill({ body: fs.readFileSync(file), headers: { 'access-control-allow-origin': '*', 'content-type': file.endsWith('.wasm') ? 'application/wasm' : file.endsWith('.onnx') ? 'application/octet-stream' : 'text/javascript' } })
   })
@@ -30,11 +30,11 @@ const [ortDir, modelPath] = process.argv.slice(2)
     const t = document.createElement('canvas'); t.width = c.width; t.height = c.height; const x = t.getContext('2d'); x.drawImage(c, 0, 0)
     const d = x.getImageData(0, 0, t.width, t.height).data; let sum = 0, nonflat = new Set()
     for (let i = 0; i < d.length; i += 400) { sum += d[i]; nonflat.add(d[i] + ',' + d[i + 1]) }
-    return { overlay: true, w: c.width, h: c.height, colors: nonflat.size, sum, stats: window.__minEnhance.state.stats, vidOpacity: document.getElementById('v').style.opacity }
+    return { overlay: true, w: c.width, h: c.height, colors: nonflat.size, sum, stats: window.__minEnhance.state.stats, rife: window.__minEnhance.state.stats.rife, vidOpacity: document.getElementById('v').style.opacity }
   })
-  for (const [name, c] of [['shader only', { neural: false }], ['+interp', { neural: false, interp: true }], ['neural', { neural: true, interp: false }]]) {
+  for (const [name, c] of [['shader only', { neural: false }], ['+interp', { neural: false, interp: true }], ['neural', { neural: true, interp: false }], ['neural interp (RIFE)', { neural: false, interp: true, interpNeural: true }]]) {
     await page.evaluate(c => window.__minEnhanceSet(Object.assign({ enabled: true, target: 1080 }, c)), c)
-    await page.waitForTimeout(name === 'neural' ? 12000 : 2500)
+    await page.waitForTimeout(name.startsWith('neural') ? 12000 : 2500)
     console.log(name, JSON.stringify(await probe()))
   }
   await page.screenshot({ path: path.join(__dirname, 'shot.png') })

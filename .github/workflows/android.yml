@@ -25,6 +25,9 @@ jobs:
           rm -rf package onnxruntime-web-*.tgz
           curl -fL -o model/realesr-general-x4v3.onnx \
             https://huggingface.co/CoderViking/realesr-general-x4v3-onnx/resolve/main/realesr-general-x4v3.onnx
+          curl -fL -o model/rife_v425lite.onnx \
+            https://huggingface.co/t9749/rife-4.25-lite-onnx/resolve/main/rife_v425lite.onnx
+          echo "702802d0862ab78f2d72133c6bc3768e7e89b81756f7cd51d1055a2fe3d06577  model/rife_v425lite.onnx" | sha256sum -c -
           ls -la ort model
       - uses: gradle/actions/setup-gradle@v4
         with: { gradle-version: '8.10.2' }

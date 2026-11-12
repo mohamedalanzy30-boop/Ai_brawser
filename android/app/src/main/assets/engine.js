@@ -9,7 +9,7 @@
   const HOST = 'https://appassets.min.local/'
   const cfg = {
     enabled: true, target: 1440, sharpness: 0.6, neural: true, denoise: 0.35,
-    tone: true, temporal: true, interp: false, images: true
+    tone: true, temporal: true, interp: false, interpNeural: true, images: true
   }
   const state = { videos: new Map(), failed: false, nn: null, stats: { nn: 'idle', fps: 0, ms: 0 } }
 
@@ -140,7 +140,7 @@ void main(){
     // which: 'cur' | 'mid' | 'nn'
     R.draw = function (which, vw, vh, tone, sharp) {
       let src = R.texCur; let sw = vw; let sh = vh
-      if (which === 'nn') { src = R.texNN; sw = vw * 4; sh = vh * 4 } else {
+      if (which === 'nn') { src = R.texNN; sw = vw * 4; sh = vh * 4 } else if (which === 'raw') { src = R.texNN } else {
         if (cfg.temporal && R.hasPrev) {
           R.pass(R.stab, R.texStab, vw, vh, u => { R.bind(0, R.texCur); R.bind(1, R.texPrev); gl.uniform1i(u.cur, 0); gl.uniform1i(u.prev, 1); gl.uniform1f(u.amt, 0.55) })
           src = R.texStab
@@ -196,6 +196,10 @@ void main(){
     })().catch(() => { state.stats.nn = 'error' })
   }
   const grab = document.createElement('canvas'); const grabCtx = grab.getContext('2d', { willReadFrequently: true })
+  function grabBytes (video, vw, vh) {
+    grab.width = vw; grab.height = vh; grabCtx.drawImage(video, 0, 0, vw, vh)
+    return grabCtx.getImageData(0, 0, vw, vh).data
+  }
   async function nnRun (video, vw, vh) {
     const nn = state.nn; nn.busy = true
     try {
@@ -210,6 +214,47 @@ void main(){
       for (let i = 0, j = 0; i < opx; i++, j += 4) { res[j] = o[i] * 255 + 0.5; res[j + 1] = o[opx + i] * 255 + 0.5; res[j + 2] = o[2 * opx + i] * 255 + 0.5; res[j + 3] = 255 }
       nn.last = { mediaTime: mt, w: ow, h: oh, bytes: res }
     } catch (e) { state.stats.nn = 'error' } finally { nn.busy = false }
+  }
+
+  /* ---------------- neural frame interpolation: RIFE 4.25 lite (MIT) ---------------- */
+  const rife = { session: null, loading: false, busy: false, ms: 0, backend: null }
+  function rifeInit () {
+    if (rife.session || rife.loading || !window.ort) return
+    rife.loading = true
+    const ort = window.ort
+    ort.env.wasm.wasmPaths = HOST + 'ort/'; ort.env.wasm.numThreads = 1
+    ;(async () => {
+      const bytes = new Uint8Array(await (await fetch(HOST + 'model/rife_v425lite.onnx')).arrayBuffer())
+      let hasGpu = false
+      try { hasGpu = !!(navigator.gpu && await navigator.gpu.requestAdapter()) } catch (e) { /* none */ }
+      for (const ep of hasGpu ? ['webgpu', 'wasm'] : ['wasm']) {
+        try { rife.session = await ort.InferenceSession.create(bytes, { executionProviders: [ep], graphOptimizationLevel: 'all' }); rife.backend = ep; break } catch (e) { /* next */ }
+      }
+      state.stats.rife = rife.session ? 'ready:' + rife.backend : 'error'
+    })().catch(() => { state.stats.rife = 'error'; rife.loading = false })
+  }
+  function toPlanes (rgba, w, h, pw, ph) { // RGBA bytes -> padded NCHW float32
+    const pl = pw * ph; const out = new Float32Array(3 * pl)
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x; const j = i * 4; const o = y * pw + x
+      out[o] = rgba[j] / 255; out[pl + o] = rgba[j + 1] / 255; out[2 * pl + o] = rgba[j + 2] / 255
+    }
+    return out
+  }
+  async function rifeMid (prev, cur, w, h) {
+    const pw = Math.ceil(w / 64) * 64; const ph = Math.ceil(h / 64) * 64; const t0 = performance.now(); const ort = window.ort
+    const out = await rife.session.run({
+      img0: new ort.Tensor('float32', toPlanes(prev, w, h, pw, ph), [1, 3, ph, pw]),
+      img1: new ort.Tensor('float32', toPlanes(cur, w, h, pw, ph), [1, 3, ph, pw]),
+      timestep: new ort.Tensor('float32', new Float32Array([0.5]), [1, 1, 1, 1])
+    })
+    rife.ms = rife.ms ? rife.ms * 0.7 + (performance.now() - t0) * 0.3 : performance.now() - t0
+    const d = out[rife.session.outputNames[0]].data; const pl = pw * ph; const res = new Uint8Array(w * h * 4)
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const o = y * pw + x; const j = (y * w + x) * 4
+      res[j] = d[o] * 255 + 0.5; res[j + 1] = d[pl + o] * 255 + 0.5; res[j + 2] = d[2 * pl + o] * 255 + 0.5; res[j + 3] = 255
+    }
+    return res
   }
 
   /* ---------------- video ---------------- */
@@ -256,12 +301,24 @@ void main(){
         const tone = cfg.tone ? st.tone : { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }
         const dt = st.lastT ? (now - st.lastT) : 33; st.lastT = now; st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
         const wantInterp = cfg.interp && !video.paused && st.fpsEMA < 40
+        if (wantInterp && cfg.interpNeural && vh <= 540 && !(rife.session && st.prevBytes && rife.ms < 0.9 * (1000 / st.fpsEMA))) st.prevBytes = grabBytes(video, vw, vh)
         const wantNN = cfg.neural && !wantInterp && vh <= 540 && state.nn && state.nn.session && state.stats.nn !== 'error'
         if (cfg.neural && vh <= 540) nnInit()
         if (wantNN && !state.nn.busy && (state.nn.ms < 140 || video.paused)) nnRun(video, vw, vh)
         const r = state.nn && state.nn.last
         if (wantNN && r && r.w === vw * 4 && Math.abs(r.mediaTime - video.currentTime) < 0.15) {
           st.R.uploadRaw(r.bytes, r.w, r.h); st.R.draw('nn', vw, vh, tone, cfg.sharpness * 0.3)
+        } else if (wantInterp && cfg.interpNeural && vh <= 540 && (rifeInit(), rife.session) && st.prevBytes &&
+                   rife.ms < 0.9 * (1000 / st.fpsEMA)) {
+          // neural midpoint: present it first, then the real frame half an interval later
+          const cur = grabBytes(video, vw, vh); const prevB = st.prevBytes; st.prevBytes = cur
+          if (!rife.busy) {
+            rife.busy = true
+            rifeMid(prevB, cur, vw, vh).then(mid => {
+              st.R.uploadRaw(mid, vw, vh); st.R.draw('raw', vw, vh, tone, cfg.sharpness)
+              setTimeout(() => { if (state.videos.has(video)) { try { st.R.draw('cur', vw, vh, tone, cfg.sharpness) } catch (e) { /* ignore */ } } }, Math.max(8, 500 / st.fpsEMA))
+            }).catch(() => { rife.ms = 1e9 }).finally(() => { rife.busy = false })
+          } else st.R.draw('cur', vw, vh, tone, cfg.sharpness)
         } else if (wantInterp && st.R.hasPrev) {
           st.R.draw('mid', vw, vh, tone, cfg.sharpness) // midpoint now, real frame half an interval later
           setTimeout(() => { if (state.videos.has(video)) { try { st.R.draw('cur', vw, vh, tone, cfg.sharpness) } catch (e) { /* ignore */ } } }, Math.max(8, 500 / st.fpsEMA))
