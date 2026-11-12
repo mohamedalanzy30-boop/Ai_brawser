@@ -257,8 +257,11 @@ class MainActivity : Activity() {
         req.requestHeaders["User-Agent"]?.let { c.setRequestProperty("User-Agent", it) }
         val code = c.responseCode
         val acao = c.getHeaderField("Access-Control-Allow-Origin")
-        if (code != 200 || acao != null) { c.disconnect(); null } // already fine: let WebView load it normally
-        else WebResourceResponse(c.contentType?.substringBefore(';') ?: "font/woff2", null, 200, "OK",
+        if (acao != null) { c.disconnect(); null } // already fine: let WebView load it normally
+        else if (code != 200) { // font removed by Google (e.g. old /ea/ fonts): fail quietly, page falls back to the phone font
+            c.disconnect()
+            WebResourceResponse("text/plain", "utf-8", 404, "Not Found", mapOf("Access-Control-Allow-Origin" to "*"), "".byteInputStream())
+        } else WebResourceResponse(c.contentType?.substringBefore(';') ?: "font/woff2", null, 200, "OK",
             mapOf("Access-Control-Allow-Origin" to "*", "Cache-Control" to "public, max-age=31536000"), c.inputStream)
     } catch (e: Exception) { null }
 
