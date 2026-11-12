@@ -1,0 +1,35 @@
+name: Build Android APK
+on:
+  push:
+    branches: [main]
+    paths: ['android/**', '.github/workflows/android.yml']
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - name: Fetch ONNX Runtime Web + model into app assets
+        run: |
+          set -e
+          cd android/app/src/main/assets
+          mkdir -p ort model
+          npm pack onnxruntime-web@1.31.1 --silent
+          tar -xzf onnxruntime-web-*.tgz package/dist
+          cp package/dist/ort.webgpu.min.js ort/
+          cp package/dist/ort-wasm-simd-threaded*.mjs package/dist/ort-wasm-simd-threaded*.wasm ort/
+          rm -rf package onnxruntime-web-*.tgz
+          curl -fL -o model/realesr-general-x4v3.onnx \
+            https://huggingface.co/CoderViking/realesr-general-x4v3-onnx/resolve/main/realesr-general-x4v3.onnx
+          ls -la ort model
+      - uses: gradle/actions/setup-gradle@v4
+        with: { gradle-version: '8.10.2' }
+      - name: Build debug APK
+        working-directory: android
+        run: gradle --no-daemon assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-browser-debug-apk
+          path: android/app/build/outputs/apk/debug/*.apk
