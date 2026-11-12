@@ -9,7 +9,7 @@
   const HOST = 'https://appassets.min.local/'
   const cfg = {
     enabled: true, target: 1440, sharpness: 0.6, neural: true, denoise: 0.35,
-    tone: true, temporal: true, interp: false, interpNeural: true, images: true
+    tone: true, temporal: true, interp: false, interpNeural: true, images: true, gestures: true
   }
   Object.assign(cfg, window.__minCfg0 || {})
   const nativeShort = () => Math.round(Math.min(screen.width, screen.height) * (window.devicePixelRatio || 1))
@@ -463,7 +463,135 @@ void main(){
   fsBtn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); enterFs() }, true)
   const bump = (e) => { lastTouch = performance.now(); if (e && e.target === fsBtn) return }
   ;['touchstart', 'pointerdown', 'mousemove', 'click'].forEach(ev => document.addEventListener(ev, bump, { capture: true, passive: true }))
+  /* ---------------- player controls: speed, PiP, lock, double-tap seek, swipe brightness/volume ---------------- */
+  const NATIVE = window.AIBNative
+  const ctl = document.createElement('div') // toolbar that holds the fullscreen button and the extra controls
+  ctl.setAttribute('data-aib-ctl', '1')
+  ctl.style.cssText = 'position:fixed;z-index:2147483647;display:none;gap:8px;flex-direction:row-reverse'
+  fsBtn.style.position = 'static'
+  const mkBtn = (txt, title, fn) => {
+    const b = document.createElement('div'); b.textContent = txt; b.title = title
+    b.style.cssText = 'min-width:44px;height:44px;padding:0 8px;box-sizing:border-box;border-radius:22px;background:rgba(20,20,20,.72);color:#fff;font:600 16px/44px sans-serif;text-align:center;user-select:none;-webkit-tap-highlight-color:transparent'
+    b.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); lastTouch = performance.now(); fn(b) }, true)
+    return b
+  }
+  const SPEEDS = [1, 1.25, 1.5, 2, 0.75]
+  const speedBtn = mkBtn('1×', 'speed', (b) => { if (!fsTarget) return; const i = (SPEEDS.indexOf(fsTarget.playbackRate) + 1) % SPEEDS.length; fsTarget.playbackRate = SPEEDS[i]; b.textContent = SPEEDS[i] + '×'; toast(fsTarget, '⏱ ' + SPEEDS[i] + '×') })
+  const pipBtn = mkBtn('⧉', 'picture in picture', () => { if (NATIVE && NATIVE.pip) NATIVE.pip(); else if (fsTarget && fsTarget.requestPictureInPicture) fsTarget.requestPictureInPicture().catch(() => {}) })
+  const lockBtn = mkBtn('🔒', 'lock', () => lockScreen(true))
+  ctl.append(fsBtn, pipBtn, speedBtn, lockBtn)
+
+  const bubble = document.createElement('div')
+  bubble.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;padding:10px 18px;border-radius:24px;background:rgba(0,0,0,.65);color:#fff;font:600 18px sans-serif;display:none;transform:translate(-50%,-50%)'
+  let bubbleTimer = 0
+  function toast (v, text, xRel) {
+    const r = v.getBoundingClientRect(); const parent = document.fullscreenElement || document.webkitFullscreenElement || document.documentElement
+    if (bubble.parentNode !== parent) parent.appendChild(bubble)
+    bubble.textContent = text; bubble.style.left = (r.left + r.width * (xRel == null ? 0.5 : xRel)) + 'px'; bubble.style.top = (r.top + r.height / 2) + 'px'; bubble.style.display = 'block'
+    clearTimeout(bubbleTimer); bubbleTimer = setTimeout(() => { bubble.style.display = 'none' }, 700)
+  }
+
+  // lock: a transparent shield over the whole screen; tap it to show the unlock button
+  const shield = document.createElement('div')
+  shield.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:none;background:transparent;touch-action:none'
+  const unlockBtn = mkBtn('🔓', 'unlock', () => lockScreen(false)); unlockBtn.style.cssText += ';position:absolute;left:50%;bottom:48px;transform:translateX(-50%);display:none'
+  shield.appendChild(unlockBtn)
+  let unlockTimer = 0
+  const shieldTap = (e) => { if (e.target === unlockBtn) return; e.stopPropagation(); e.preventDefault(); unlockBtn.style.display = 'block'; clearTimeout(unlockTimer); unlockTimer = setTimeout(() => { unlockBtn.style.display = 'none' }, 2500) }
+  ;['touchstart', 'touchend', 'click', 'pointerdown', 'pointerup', 'mousedown', 'mouseup'].forEach(ev => shield.addEventListener(ev, shieldTap, { capture: false, passive: false }))
+  let locked = false
+  function lockScreen (on) {
+    locked = on
+    if (on) { (document.fullscreenElement || document.webkitFullscreenElement || document.documentElement).appendChild(shield); shield.style.display = 'block'; unlockBtn.style.display = 'none'; ctl.style.display = 'none' } else { shield.style.display = 'none'; lastTouch = performance.now() }
+  }
+  document.addEventListener('fullscreenchange', () => { if (!document.fullscreenElement && locked) lockScreen(false) })
+
+  function videoAt (x, y) {
+    let best = null; let area = 0
+    document.querySelectorAll('video').forEach(v => {
+      const r = v.getBoundingClientRect()
+      if (r.width < 160 || r.height < 90 || x < r.left || x > r.right || y < r.top || y > r.bottom || v.readyState < 1) return
+      if (r.width * r.height > area) { best = v; area = r.width * r.height }
+    })
+    return best
+  }
+  // double tap: left third -10s, right third +10s (repeated taps add up)
+  let lastTap = { t: 0, x: 0, y: 0 }; let seekAcc = 0; let seekTimer = 0
+  const swipe = { on: false, x0: 0, y0: 0, kind: '', v: null, acc: 0, sent: 0 }
+  document.addEventListener('touchend', (e) => {
+    if (!cfg.gestures || locked || e.changedTouches.length !== 1) return
+    if (swipe.on) { swipe.on = false; return }
+    const t = e.changedTouches[0]; const v = videoAt(t.clientX, t.clientY)
+    if (!v || ctl.contains(e.target)) return
+    const now = performance.now()
+    if (now - lastTap.t < 330 && Math.abs(t.clientX - lastTap.x) < 70 && Math.abs(t.clientY - lastTap.y) < 70) {
+      const r = v.getBoundingClientRect(); const rel = (t.clientX - r.left) / r.width
+      if (rel < 0.38 || rel > 0.62) {
+        const d = rel < 0.38 ? -10 : 10
+        seekAcc = Math.sign(seekAcc) === Math.sign(d) ? seekAcc + d : d
+        try { v.currentTime = Math.max(0, Math.min((v.duration || 1e9) - 0.5, v.currentTime + d)) } catch (err) { /* live stream */ }
+        toast(v, (d < 0 ? '⏪ ' : '⏩ ') + Math.abs(seekAcc) + 'ث', rel < 0.38 ? 0.2 : 0.8)
+        clearTimeout(seekTimer); seekTimer = setTimeout(() => { seekAcc = 0 }, 900)
+        e.preventDefault(); e.stopPropagation(); lastTap.t = now // keep the chain going for +20, +30...
+        return
+      }
+    }
+    lastTap = { t: now, x: t.clientX, y: t.clientY }
+  }, { capture: true, passive: false })
+  // vertical swipe in fullscreen: left half brightness, right half volume
+  const isFullVideo = (v) => { const r = v.getBoundingClientRect(); return !!(document.fullscreenElement || document.webkitFullscreenElement) || (r.width >= window.innerWidth * 0.95 && r.height >= window.innerHeight * 0.8) }
+  document.addEventListener('touchstart', (e) => {
+    swipe.on = false; swipe.kind = ''
+    if (!cfg.gestures || locked || e.touches.length !== 1 || !NATIVE) return
+    const t = e.touches[0]; const v = videoAt(t.clientX, t.clientY)
+    if (!v || !isFullVideo(v) || ctl.contains(e.target)) { swipe.v = null; return }
+    Object.assign(swipe, { x0: t.clientX, y0: t.clientY, v, acc: 0, sent: 0 })
+  }, { capture: true, passive: true })
+  document.addEventListener('touchmove', (e) => {
+    if (!swipe.v || e.touches.length !== 1) return
+    const t = e.touches[0]; const dx = t.clientX - swipe.x0; const dy = t.clientY - swipe.y0
+    if (!swipe.on) {
+      if (Math.abs(dy) < 22 || Math.abs(dy) < 2 * Math.abs(dx)) return
+      const r = swipe.v.getBoundingClientRect(); swipe.on = true; swipe.kind = swipe.x0 < r.left + r.width / 2 ? 'b' : 'v'; swipe.y0 = t.clientY
+    }
+    e.preventDefault(); e.stopPropagation()
+    const r = swipe.v.getBoundingClientRect(); const total = -(t.clientY - swipe.y0) / (r.height * 0.8)
+    const step = total - swipe.sent; if (Math.abs(step) < 0.03) return
+    swipe.sent = total
+    try {
+      if (swipe.kind === 'b') toast(swipe.v, '☀ ' + Math.round(NATIVE.brightness(step) * 100 || 0) + '%', 0.25)
+      else toast(swipe.v, '🔊 ' + Math.round(NATIVE.volume(step) * 100) + '%', 0.75)
+    } catch (err) { /* bridge missing */ }
+  }, { capture: true, passive: false })
+
+  // picture-in-picture: the playing video (and the iframes around it) temporarily fill the page
+  const pipSaved = []
+  function pipOn (el) { pipSaved.push([el, el.style.cssText]); el.style.cssText += ';position:fixed!important;inset:0!important;width:100vw!important;height:100vh!important;max-width:none!important;max-height:none!important;z-index:2147483645!important;background:#000!important;object-fit:contain!important;transform:none!important;margin:0!important' }
+  window.__aibPip = function (on) {
+    for (let i = 0; i < window.frames.length; i++) { try { window.frames[i].postMessage({ __aibPip: on }, '*') } catch (e) { /* ignore */ } }
+    ctl.style.display = 'none'
+    if (!on) { while (pipSaved.length) { const [el, css] = pipSaved.pop(); el.style.cssText = css } return }
+    const v = Array.from(document.querySelectorAll('video')).find(x => !x.paused && x.readyState >= 2)
+    if (v) { pipOn(v); if (window.parent !== window) window.parent.postMessage({ __aibPipFrame: true }, '*') }
+  }
+  window.addEventListener('message', (e) => {
+    if (!e.data) return
+    if (e.data.__aibPip !== undefined && e.source === window.parent) window.__aibPip(e.data.__aibPip)
+    if (e.data.__aibPipFrame) {
+      const f = Array.from(document.querySelectorAll('iframe')).find(x => x.contentWindow === e.source)
+      if (f) { pipOn(f); if (window.parent !== window) window.parent.postMessage({ __aibPipFrame: true }, '*') }
+    }
+  })
+  // tell the app when a video plays here (enables PiP on Home and the ad-redirect guard)
+  let reported = false
+  setInterval(() => {
+    if (!NATIVE) return
+    const v = Array.from(document.querySelectorAll('video')).find(x => !x.paused && !x.ended && x.readyState >= 2 && x.videoWidth > 0)
+    if (v) { NATIVE.playing(true, v.videoWidth, v.videoHeight); reported = true } else if (reported) { NATIVE.playing(false, 0, 0); reported = false }
+  }, 1500)
+
   function updateFsButton () {
+    if (locked) return
     let best = null; let area = 0
     document.querySelectorAll('video').forEach(v => {
       const r = v.getBoundingClientRect()
@@ -471,14 +599,19 @@ void main(){
       if (r.width * r.height > area) { best = v; area = r.width * r.height }
     })
     const inFs = !!(document.fullscreenElement || document.webkitFullscreenElement)
-    // do not offer the button for videos that already fill the whole screen unless we are in fullscreen
-    if (!best || performance.now() - lastTouch > 3500 && !best.paused) { fsBtn.style.display = 'none'; return }
+    if (!best || performance.now() - lastTouch > 3500 && !best.paused) { ctl.style.display = 'none'; fsBtn.style.display = 'none'; return }
     fsTarget = best
     const r = best.getBoundingClientRect(); const top = Math.max(8, r.top + 8); const right = Math.min(window.innerWidth - 8, r.right - 8)
     const parent = document.fullscreenElement || document.webkitFullscreenElement || document.documentElement
-    if (fsBtn.parentNode !== parent) parent.appendChild(fsBtn)
+    if (ctl.parentNode !== parent) parent.appendChild(ctl)
     fsBtn.textContent = inFs ? '✕' : '⛶'
-    fsBtn.style.left = Math.max(8, right - 44) + 'px'; fsBtn.style.top = top + 'px'; fsBtn.style.display = 'block'
+    const extra = cfg.gestures !== false
+    speedBtn.style.display = pipBtn.style.display = extra ? 'block' : 'none'
+    lockBtn.style.display = extra && inFs ? 'block' : 'none'
+    speedBtn.textContent = best.playbackRate + '×'
+    fsBtn.style.display = 'block'; ctl.style.display = 'flex'
+    ctl.style.right = (window.innerWidth - right) + 'px'; ctl.style.top = top + 'px'
+    fsBtn.style.left = Math.max(8, right - 44) + 'px'; fsBtn.style.top = top + 'px' // reported for diagnostics/tests
   }
   setInterval(updateFsButton, 400)
 
@@ -504,7 +637,7 @@ void main(){
   let timer = null
   new window.MutationObserver(() => { clearTimeout(timer); timer = setTimeout(scan, 400) }).observe(document, { childList: true, subtree: true })
   document.addEventListener('visibilitychange', () => { if (!document.hidden) state.videos.forEach((_, v) => loop(v)) })
-  const CFG_KEYS = ['enabled', 'target', 'sharpness', 'neural', 'denoise', 'tone', 'temporal', 'interp', 'interpNeural', 'images']
+  const CFG_KEYS = ['enabled', 'target', 'sharpness', 'neural', 'denoise', 'tone', 'temporal', 'interp', 'interpNeural', 'images', 'gestures']
   function forward (c) { // push the config into every child frame (players live in iframes)
     for (let i = 0; i < window.frames.length; i++) { try { window.frames[i].postMessage({ __aibCfg: c }, '*') } catch (e) { /* ignore */ } }
   }

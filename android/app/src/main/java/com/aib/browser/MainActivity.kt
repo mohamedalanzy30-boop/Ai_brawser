@@ -53,6 +53,7 @@ class MainActivity : Activity() {
     private lateinit var progress: ProgressBar
     private lateinit var badge: TextView
     private lateinit var content: FrameLayout
+    private lateinit var bottomBar: View
     private var customView: View? = null
     private var customCallback: WebChromeClient.CustomViewCallback? = null
     private var scriptHandler: ScriptHandler? = null
@@ -80,7 +81,7 @@ class MainActivity : Activity() {
         val rates = d.supportedModes.map { Math.round(it.refreshRate) }.distinct().sorted().joinToString("/")
         val m = android.util.DisplayMetrics().also { d.getRealMetrics(it) }
         val disp = "display=${m.widthPixels}x${m.heightPixels} dpi=${m.densityDpi} refresh=${Math.round(d.refreshRate)}Hz modes=$rates hdr=$hdr wideGamut=${d.isWideColorGamut}"
-        val head = "$disp\nAI Browser 0.1 | ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} | Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) | WebView ${wv?.versionName}\nconfig=${config()}\nadblock=${if (adblockOn) "on" else "off"} hosts=${adHosts.size} blocked=$blocked\nurl=${web.url}\n"
+        val head = "$disp\nAI Browser 0.1 | ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} | Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) | WebView ${wv?.versionName}\nconfig=${config()}\nadblock=${if (adblockOn) "on" else "off"} hosts=${adHosts.size} blocked=$blocked popups=$popupsBlocked\nurl=${web.url}\n"
         return head + synchronized(logLines) { logLines.joinToString("\n") }
     }
     private val prefs by lazy { getSharedPreferences("enhance", Context.MODE_PRIVATE) }
@@ -93,10 +94,13 @@ class MainActivity : Activity() {
         "interp" to "توليد الإطارات (ثقيل)",
         "images" to "تحسين الصور",
         "adblock" to "حظر الإعلانات والمتتبعات (أسرع وأخف)",
+        "popups" to "منع النوافذ المنبثقة والتحويلات الإعلانية",
+        "gestures" to "تحكم المشغّل: نقر مزدوج ±10ث، سحب للسطوع والصوت",
+        "protect" to "حماية متقدمة: تصفح آمن، HTTPS إجباري، إزالة روابط التتبع، منع الكاميرا والموقع",
         "refresh" to "مطابقة معدل تحديث الشاشة للفيديو (حتى 120Hz)",
         "brightness" to "سطوع أعلى في ملء الشاشة"
     )
-    private val defaults = mapOf("enabled" to true, "neural" to true, "temporal" to true, "tone" to true, "interp" to false, "images" to true, "adblock" to true, "refresh" to true, "brightness" to false)
+    private val defaults = mapOf("enabled" to true, "neural" to true, "temporal" to true, "tone" to true, "interp" to false, "images" to true, "adblock" to true, "popups" to true, "gestures" to true, "protect" to true, "refresh" to true, "brightness" to false)
     private val targets = intArrayOf(0, 720, 1080, 1440, 2160)
     private val targetLabels = arrayOf("تلقائي", "720p", "1080p", "2K", "4K")
     private val denoise = floatArrayOf(0f, 0.2f, 0.35f, 0.6f)
@@ -130,7 +134,88 @@ class MainActivity : Activity() {
         }
     }
     @Volatile private var adblockOn = true
-    private var pageHost: String? = null
+    @Volatile private var pageHost: String? = null
+    @Volatile private var popupsBlocked = 0
+    @Volatile private var videoPlaying = false
+    @Volatile private var videoAspect = android.util.Rational(16, 9)
+
+    /** Registrable domain, good enough to tell "same site" from "another site". */
+    private fun site(host: String?): String {
+        val p = (host ?: "").lowercase().split('.').filter { it.isNotEmpty() }
+        if (p.size <= 2) return p.joinToString(".")
+        val sld = p[p.size - 2]
+        val n = if (sld.length <= 3 && sld in setOf("co", "com", "net", "org", "gov", "edu", "ac", "or", "ne")) 3 else 2
+        return p.takeLast(n).joinToString(".")
+    }
+
+    /** Small bridge for the in-page player controls. Every method is harmless if a page calls it. */
+    inner class Bridge {
+        @android.webkit.JavascriptInterface fun playing(on: Boolean, w: Int, h: Int) {
+            videoPlaying = on
+            if (w > 0 && h > 0) { val r = w.toDouble() / h; videoAspect = if (r > 2.39) android.util.Rational(239, 100) else if (r < 0.42) android.util.Rational(42, 100) else android.util.Rational(w, h) }
+            ui.post { updatePipParams() }
+        }
+        @android.webkit.JavascriptInterface fun brightness(delta: Float): Float {
+            var v = 0f
+            ui.post {
+                val lp = window.attributes
+                val cur = if (lp.screenBrightness < 0) try { android.provider.Settings.System.getInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS) / 255f } catch (e: Exception) { 0.5f } else lp.screenBrightness
+                lp.screenBrightness = (cur + delta).coerceIn(0.02f, 1f); v = lp.screenBrightness; window.attributes = lp
+            }
+            return v
+        }
+        @android.webkit.JavascriptInterface fun volume(delta: Float): Float {
+            val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            val max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
+            val cur = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
+            val next = (cur + Math.round(delta * max)).coerceIn(0, max)
+            if (next != cur) am.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, next, 0)
+            return next.toFloat() / max
+        }
+        @android.webkit.JavascriptInterface fun pip() { ui.post { enterPip() } }
+    }
+
+    private fun pipParams(): android.app.PictureInPictureParams? {
+        if (android.os.Build.VERSION.SDK_INT < 26) return null
+        val b = android.app.PictureInPictureParams.Builder().setAspectRatio(videoAspect)
+        if (android.os.Build.VERSION.SDK_INT >= 31) b.setAutoEnterEnabled(videoPlaying && prefs.getBoolean("gestures", true)).setSeamlessResizeEnabled(true)
+        return b.build()
+    }
+    private fun updatePipParams() { try { pipParams()?.let { setPictureInPictureParams(it) } } catch (e: Exception) { /* ignore */ } }
+    private fun enterPip() {
+        if (!videoPlaying) return
+        try { pipParams()?.let { enterPictureInPictureMode(it) } } catch (e: Exception) { addLog("[AIB] PiP failed: $e") }
+    }
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (android.os.Build.VERSION.SDK_INT < 31 && videoPlaying && prefs.getBoolean("gestures", true)) enterPip()
+    }
+    override fun onPictureInPictureModeChanged(inPip: Boolean, newConfig: android.content.res.Configuration) {
+        super.onPictureInPictureModeChanged(inPip, newConfig)
+        bottomBar.visibility = if (inPip) View.GONE else View.VISIBLE
+        progress.visibility = View.GONE
+        if (inPip) content.setPadding(0, 0, 0, 0) else content.requestApplyInsets()
+        web.evaluateJavascript("window.__aibPip&&window.__aibPip($inPip)", null)
+    }
+
+    /* ---------- protection ---------- */
+    private val trackingParams = Regex("^(utm_.*|fbclid|gclid|dclid|gbraid|wbraid|msclkid|yclid|mc_eid|mc_cid|igshid|_hsenc|_hsmi|ref_src|si)$")
+    /** Removes tracking parameters (utm_*, fbclid, gclid...) from a URL; returns null if nothing changed. */
+    private fun cleanUrl(u: android.net.Uri): android.net.Uri? {
+        val names = try { u.queryParameterNames } catch (e: Exception) { return null }
+        if (names.none { trackingParams.matches(it) }) return null
+        val b = u.buildUpon().clearQuery()
+        for (n in names) if (!trackingParams.matches(n)) for (v in u.getQueryParameters(n)) b.appendQueryParameter(n, v)
+        return b.build()
+    }
+    private fun applyProtection() {
+        // third-party cookies stay allowed: embedded movie players need them; trackers are cut by the host list instead
+        android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
+        web.settings.apply {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) androidx.webkit.WebSettingsCompat.setSafeBrowsingEnabled(this, true)
+            allowFileAccess = false; allowContentAccess = false; setGeolocationEnabled(false)
+        }
+    }
 
     private fun asset(path: String): String = assets.open(path).bufferedReader().use { it.readText() }
     private val bundle by lazy { asset("ort/ort.webgpu.min.js") + "\n;" + asset("engine.js") }
@@ -188,6 +273,7 @@ class MainActivity : Activity() {
 
         root.addView(progress, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(2)))
         root.addView(web, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        bottomBar = bar
         root.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         content.addView(root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         setContentView(content)
@@ -208,7 +294,9 @@ class MainActivity : Activity() {
             // use the phone's system font (e.g. Samsung One UI font) for pages that do not ship their own
             standardFontFamily = "sans-serif"; sansSerifFontFamily = "sans-serif"; fixedFontFamily = "monospace"; serifFontFamily = "serif"
             textZoom = 100
+            setSupportMultipleWindows(true); javaScriptCanOpenWindowsAutomatically = false
         }
+        web.addJavascriptInterface(Bridge(), "AIBNative")
         web.webChromeClient = object : WebChromeClient() {
             override fun onProgressChanged(view: WebView, p: Int) {
                 progress.progress = p; progress.visibility = if (p in 1..99) View.VISIBLE else View.GONE
@@ -222,6 +310,26 @@ class MainActivity : Activity() {
                 if (prefs.getBoolean("brightness", false)) { val lp = window.attributes; lp.screenBrightness = 1f; window.attributes = lp }
             }
             override fun onHideCustomView() { exitFullscreen() }
+            override fun onPermissionRequest(request: android.webkit.PermissionRequest) { request.deny() } // no camera/mic for pages
+            override fun onGeolocationPermissionsShowPrompt(origin: String, cb: android.webkit.GeolocationPermissions.Callback) { cb.invoke(origin, false, false) }
+            override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message): Boolean {
+                // pop-ups: catch the URL in a throw-away WebView, then decide. Ads and pop-unders to other
+                // sites are dropped; a real link to the same site opens in this tab (single-tab browser).
+                val strict = prefs.getBoolean("popups", true)
+                if (strict && !isUserGesture) { popupsBlocked++; addLog("[AIB] blocked pop-up (no tap)"); return false }
+                val tmp = WebView(this@MainActivity)
+                tmp.webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
+                        val host = r.url.host
+                        val ad = isAd(host) || (strict && site(host) != site(pageHost))
+                        if (ad && strict) { popupsBlocked++; addLog("[AIB] blocked pop-up -> $host") } else web.loadUrl(r.url.toString())
+                        v.destroy(); return true
+                    }
+                }
+                (resultMsg.obj as WebView.WebViewTransport).webView = tmp
+                resultMsg.sendToTarget()
+                return true
+            }
             override fun onConsoleMessage(m: ConsoleMessage): Boolean {
                 val noise = m.message().startsWith("Permissions policy violation") || m.message().contains("VerifyEachNodeIsAssignedToAnEp") || m.message().startsWith("ResizeObserver loop")
                 val interesting = !noise && (m.message().startsWith("[AIB]") || m.messageLevel() == ConsoleMessage.MessageLevel.ERROR)
@@ -262,11 +370,20 @@ class MainActivity : Activity() {
                 return true
             }
             override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean {
+                if (req.isForMainFrame && prefs.getBoolean("protect", true)) {
+                    val clean = cleanUrl(req.url)
+                    if (req.url.scheme == "http" && !req.isRedirect) { view.loadUrl((clean ?: req.url).buildUpon().scheme("https").build().toString()); return true }
+                    if (clean != null) { view.loadUrl(clean.toString()); return true }
+                }
                 // pop-under / redirect ads: a frame or the page jumping to an ad host is dropped
                 if (adblockOn && isAd(req.url.host) && !isAd(pageHost)) { blocked++; addLog("[AIB] blocked ad redirect ${req.url.host}"); return true }
+                // while a video page is open, a jump to another site that nobody tapped is an ad redirect
+                if (prefs.getBoolean("popups", true) && req.isForMainFrame && !req.hasGesture() && !req.isRedirect && videoPlaying &&
+                    site(req.url.host) != site(pageHost)) { popupsBlocked++; addLog("[AIB] blocked redirect -> ${req.url.host}"); return true }
                 return false
             }
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                if (site(android.net.Uri.parse(url).host) != site(pageHost)) videoPlaying = false
                 pageHost = android.net.Uri.parse(url).host
                 if (!urlBar.hasFocus()) urlBar.setText(url)
                 if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
@@ -279,6 +396,7 @@ class MainActivity : Activity() {
         web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
         adblockOn = prefs.getBoolean("adblock", true)
         loadAdHosts()
+        applyProtection()
         registerScript()
         pollBadge()
         go(intent?.dataString ?: HOME)
@@ -383,7 +501,9 @@ class MainActivity : Activity() {
             row.addView(TextView(this).apply { text = title; textSize = 15f; setTextColor(Color.WHITE) }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             row.addView(Switch(this).apply {
                 isChecked = prefs.getBoolean(k, defaults[k] == true)
-                setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean(k, c).apply(); adblockOn = prefs.getBoolean("adblock", true); applyConfig() }
+                setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean(k, c).apply(); adblockOn = prefs.getBoolean("adblock", true)
+                    if (k == "protect") applyProtection()
+                    applyConfig() }
             })
             col.addView(row)
         }
