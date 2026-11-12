@@ -223,7 +223,7 @@ class MainActivity : Activity() {
             }
             override fun onHideCustomView() { exitFullscreen() }
             override fun onConsoleMessage(m: ConsoleMessage): Boolean {
-                val noise = m.message().startsWith("Permissions policy violation")
+                val noise = m.message().startsWith("Permissions policy violation") || m.message().contains("VerifyEachNodeIsAssignedToAnEp") || m.message().startsWith("ResizeObserver loop")
                 val interesting = !noise && (m.message().startsWith("[AIB]") || m.messageLevel() == ConsoleMessage.MessageLevel.ERROR)
                 if (interesting) addLog("[${m.messageLevel()}] ${m.message()} (${m.sourceId().substringAfterLast('/')}:${m.lineNumber()})")
                 return true
