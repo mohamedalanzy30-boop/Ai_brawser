@@ -381,10 +381,10 @@ void main(){
         if (cfg.tone && st.frame % 6 === 1) analyseTone(st, video)
         const tone = cfg.tone ? st.tone : { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }
         const dt = st.lastT ? (now - st.lastT) : 33; st.lastT = now; st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
-        const nnWins = cfg.neural && !guard.noNeural && vh * 4 <= effTarget() * 1.34 && state.nn && state.nn.ms > 0 && state.nn.ms < 0.6 * (1000 / Math.max(st.fpsEMA, 1))
+        const nnWins = cfg.neural && !guard.noNeural && vh * 4 <= Math.min(effTarget(), nativeShort()) * 1.1 && state.nn && state.nn.ms > 0 && state.nn.ms < 0.6 * (1000 / Math.max(st.fpsEMA, 1))
         const wantInterp = cfg.interp && !guard.noInterp && !video.paused && st.fpsEMA < 40 && !nnWins
         if (wantInterp && cfg.interpNeural && vh <= 540 && !(rife.session && st.prevBytes && rife.ms < 0.9 * (1000 / st.fpsEMA))) st.prevBytes = grabBytes(video, vw, vh)
-        const nnLiveOk = vh * 4 <= effTarget() * 1.34 // e.g. <=360p for a 1440p screen; bigger sources use the shader path
+        const nnLiveOk = vh * 4 <= Math.min(effTarget(), nativeShort()) * 1.1 // <=396p on a 1440p screen; bigger sources use the shader path
         const wantNN = cfg.neural && (video.paused || (!guard.noNeural && nnLiveOk)) && !wantInterp && vh <= 540 && state.nn && state.nn.session && state.stats.nn !== 'error'
         if (cfg.neural && vh <= 540) nnInit()
         // Neural frames are only shown when they are consistent: exact frame while paused, or when the

@@ -32,8 +32,11 @@ jobs:
             https://huggingface.co/t9749/rife-4.25-lite-onnx/resolve/main/rife_v425lite.onnx
           echo "702802d0862ab78f2d72133c6bc3768e7e89b81756f7cd51d1055a2fe3d06577  model/rife_v425lite.onnx" | sha256sum -c -
           # ad/tracker host list (StevenBlack/hosts, MIT), bundled so blocking needs no network at runtime
-          curl -fsSL https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts \
-            | awk '$1=="0.0.0.0" && $2!="0.0.0.0" {print tolower($2)}' | sort -u > adhosts.txt
+          # + HaGeZi Pro (GPL-3.0): covers the pop-under / redirect ad networks used by movie sites
+          { curl -fsSL https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts \
+              | awk '$1=="0.0.0.0" && $2!="0.0.0.0" {print tolower($2)}'
+            curl -fsSL https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt \
+              | grep -v '^#' | tr 'A-Z' 'a-z'; } | grep -E '^[a-z0-9.-]+$' | sort -u > adhosts.txt
           test "$(wc -l < adhosts.txt)" -gt 10000
           ls -la ort model adhosts.txt
       - uses: gradle/actions/setup-gradle@v4

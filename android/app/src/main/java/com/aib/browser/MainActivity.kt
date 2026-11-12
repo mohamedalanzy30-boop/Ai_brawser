@@ -370,6 +370,14 @@ class MainActivity : Activity() {
                 return true
             }
             override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean {
+                val scheme = req.url.scheme ?: ""
+                if (scheme != "http" && scheme != "https" && scheme != "about" && scheme != "data" && scheme != "blob") {
+                    // intent://, market:// ... : ads use these to throw you into Chrome or the Play Store
+                    if (prefs.getBoolean("popups", true) && (!req.hasGesture() || req.url.toString().contains("package=com.android.chrome"))) {
+                        popupsBlocked++; addLog("[AIB] blocked app redirect ${scheme}://${req.url.host}"); return true
+                    }
+                    return try { startActivity(android.content.Intent.parseUri(req.url.toString(), android.content.Intent.URI_INTENT_SCHEME).addCategory(android.content.Intent.CATEGORY_BROWSABLE).setComponent(null).setSelector(null)); true } catch (e: Exception) { true }
+                }
                 if (req.isForMainFrame && prefs.getBoolean("protect", true)) {
                     val clean = cleanUrl(req.url)
                     if (req.url.scheme == "http" && !req.isRedirect) { view.loadUrl((clean ?: req.url).buildUpon().scheme("https").build().toString()); return true }
