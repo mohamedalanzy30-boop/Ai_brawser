@@ -32,7 +32,7 @@ void main(){ uv = p*0.5+0.5; gl_Position = vec4(p,0.,1.); }`
   const FS_STAB = `#version 300 es
 precision highp float; uniform sampler2D cur, prev; uniform float amt; in vec2 uv; out vec4 o;
 void main(){ vec3 c=texture(cur,uv).rgb, p=texture(prev,uv).rgb;
-  float d=length(c-p); float a=amt*(1.0-smoothstep(0.04,0.18,d)); o=vec4(mix(c,p,a),1.); }`
+  float d=length(c-p); float a=amt*(1.0-smoothstep(0.07,0.22,d)); o=vec4(mix(c,p,a),1.); }`
 
   // flow: block matching at reduced resolution, output = displacement (source uv units) + sad
   const FS_FLOW = `#version 300 es
@@ -125,7 +125,7 @@ void main(){
     R.resize = function (w, h) { // source-sized intermediates
       if (R.w === w && R.h === h) return
       R.w = w; R.h = h
-      R.texStab = texture(gl, w, h); R.texMid = texture(gl, w, h)
+      R.texStab = texture(gl, w, h); R.texStabPrev = texture(gl, w, h); R.hasStab = false; R.texMid = texture(gl, w, h)
       R.fw = Math.max(8, Math.round(w / 4)); R.fh = Math.max(8, Math.round(h / 4))
       R.texFlow = texture(gl, R.fw, R.fh, gl.NEAREST)
       gl.bindTexture(gl.TEXTURE_2D, R.texFlow)
@@ -152,8 +152,10 @@ void main(){
       let src = R.texCur; let sw = vw; let sh = vh
       if (which === 'nn') { src = R.texNN; sw = vw * 4; sh = vh * 4 } else if (which === 'raw') { src = R.texNN } else {
         if (cfg.temporal && R.hasPrev) {
-          R.pass(R.stab, R.texStab, vw, vh, u => { R.bind(0, R.texCur); R.bind(1, R.texPrev); gl.uniform1i(u.cur, 0); gl.uniform1i(u.prev, 1); gl.uniform1f(u.amt, 0.55) })
+          // recursive filter: blend the new frame with the previous *filtered* frame (stronger than a 2-frame blend)
+          R.pass(R.stab, R.texStab, vw, vh, u => { R.bind(0, R.texCur); R.bind(1, R.hasStab ? R.texStabPrev : R.texPrev); gl.uniform1i(u.cur, 0); gl.uniform1i(u.prev, 1); gl.uniform1f(u.amt, 0.78) })
           src = R.texStab
+          const sw2 = R.texStab; R.texStab = R.texStabPrev; R.texStabPrev = sw2; R.hasStab = true
         }
         if (which === 'mid' && R.hasPrev) {
           R.pass(R.flowP, R.texFlow, R.fw, R.fh, u => { R.bind(0, R.texCur); R.bind(1, R.texPrev); gl.uniform1i(u.cur, 0); gl.uniform1i(u.prev, 1); gl.uniform2f(u.srcSize, vw, vh) })
@@ -289,7 +291,7 @@ void main(){
     if (!R) { state.failed = true; log('WebGL2 unavailable'); return }
     const st = { canvas, R, running: false, prevOpacity: video.style.opacity, errors: 0, frame: 0, tone: { lo: 0, hi: 1, contrast: 0.22, sat: 1.1, gamma: 1 }, lastT: 0, fpsEMA: 30 }
     state.videos.set(video, st); host().appendChild(canvas)
-    video.addEventListener('play', () => loop(video)); loop(video)
+    video.addEventListener('play', () => { st.fpsEMA = 30; st.lastT = 0; loop(video) }); loop(video)
   }
   function detach (video) {
     const st = state.videos.get(video); if (!st) return
@@ -323,9 +325,14 @@ void main(){
         if (wantInterp && cfg.interpNeural && vh <= 540 && !(rife.session && st.prevBytes && rife.ms < 0.9 * (1000 / st.fpsEMA))) st.prevBytes = grabBytes(video, vw, vh)
         const wantNN = cfg.neural && !wantInterp && vh <= 540 && state.nn && state.nn.session && state.stats.nn !== 'error'
         if (cfg.neural && vh <= 540) nnInit()
-        if (wantNN && !state.nn.busy && (state.nn.ms < 140 || video.paused)) nnRun(video, vw, vh)
-        const r = state.nn && state.nn.last
-        if (wantNN && r && r.w === vw * 4 && Math.abs(r.mediaTime - video.currentTime) < 0.15) {
+        // Neural frames are only shown when they are consistent: exact frame while paused, or when the
+        // model keeps up with the video (always one steady frame late). Never mix stale and live frames.
+        const nnS = state.nn; const T = 1000 / Math.max(st.fpsEMA, 1)
+        const fast = !!nnS && nnS.ms > 0 && nnS.ms < 0.8 * T
+        if (wantNN && !nnS.busy && (video.paused || fast || !nnS.ms || performance.now() - (nnS.lastProbe || 0) > 5000)) { nnS.lastProbe = performance.now(); nnRun(video, vw, vh) }
+        const r = nnS && nnS.last
+        const fresh = wantNN && r && r.w === vw * 4 && (video.paused ? Math.abs(r.mediaTime - video.currentTime) < 0.05 : fast && Math.abs(r.mediaTime - video.currentTime) < 3 * T / 1000)
+        if (fresh) {
           st.R.uploadRaw(r.bytes, r.w, r.h); st.R.draw('nn', vw, vh, tone, cfg.sharpness * 0.3)
         } else if (wantInterp && cfg.interpNeural && vh <= 540 && (rifeInit(), rife.session) && st.prevBytes &&
                    rife.ms < 0.9 * (1000 / st.fpsEMA)) {
