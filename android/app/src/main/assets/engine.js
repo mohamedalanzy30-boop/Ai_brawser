@@ -20,6 +20,12 @@
 in vec2 p; out vec2 uv;
 void main(){ uv = p*0.5+0.5; uv.y = 1.0-uv.y; gl_Position = vec4(p,0.,1.); }`
 
+  // vertex shader for render-to-texture passes: no vertical flip, so intermediate textures keep the
+  // same orientation as uploaded video frames (row 0 = top)
+  const VS_FBO = `#version 300 es
+in vec2 p; out vec2 uv;
+void main(){ uv = p*0.5+0.5; gl_Position = vec4(p,0.,1.); }`
+
   // stabilise: motion-adaptive temporal blend of previous and current source frame
   const FS_STAB = `#version 300 es
 precision highp float; uniform sampler2D cur, prev; uniform float amt; in vec2 uv; out vec4 o;
@@ -85,9 +91,9 @@ void main(){
     if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s))
     return s
   }
-  function program (gl, fs) {
+  function program (gl, fs, vs) {
     const p = gl.createProgram()
-    gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, VS)); gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fs))
+    gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vs || VS)); gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fs))
     gl.bindAttribLocation(p, 0, 'p'); gl.linkProgram(p)
     if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p))
     const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS)
@@ -108,7 +114,7 @@ void main(){
     const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance' })
     if (!gl) return null
     const R = { gl, canvas, w: 0, h: 0 }
-    R.stab = program(gl, FS_STAB); R.flowP = program(gl, FS_FLOW); R.mid = program(gl, FS_MID); R.main = program(gl, FS_MAIN)
+    R.stab = program(gl, FS_STAB, VS_FBO); R.flowP = program(gl, FS_FLOW, VS_FBO); R.mid = program(gl, FS_MID, VS_FBO); R.main = program(gl, FS_MAIN)
     const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf)
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW)
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
@@ -357,6 +363,51 @@ void main(){
       canvas.toBlob(b => { R.dispose(); if (b) { img.dataset.minEnhanced = '1'; img.removeAttribute('srcset'); img.src = URL.createObjectURL(b) } }, 'image/webp', 0.92)
     } catch (e) { /* tainted cross-origin image */ }
   }
+
+  /* ---------------- fullscreen button (like Samsung Internet) ---------------- */
+  const fsBtn = document.createElement('div')
+  fsBtn.setAttribute('data-aib-fs', '1')
+  fsBtn.style.cssText = 'position:fixed;z-index:2147483647;width:44px;height:44px;border-radius:22px;background:rgba(20,20,20,.72);' +
+    'color:#fff;font:22px/44px sans-serif;text-align:center;display:none;touch-action:manipulation;-webkit-tap-highlight-color:transparent;user-select:none'
+  let fsTarget = null; let lastTouch = 0; let fsOk = false
+  function playerBox (video) { // climb to the element that wraps the video + its controls
+    const r = video.getBoundingClientRect(); let el = video
+    for (let i = 0; i < 6 && el.parentElement && el.parentElement !== document.body; i++) {
+      const pr = el.parentElement.getBoundingClientRect()
+      if (pr.width > r.width * 1.15 + 4 || pr.height > r.height * 1.15 + 4) break
+      el = el.parentElement
+    }
+    return el === video ? (video.parentElement || video) : el
+  }
+  function enterFs () {
+    if (!fsTarget) return
+    const cur = document.fullscreenElement || document.webkitFullscreenElement
+    if (cur) { (document.exitFullscreen || document.webkitExitFullscreen).call(document); return }
+    const box = playerBox(fsTarget); const req = box.requestFullscreen || box.webkitRequestFullscreen
+    if (req) req.call(box).catch(() => { try { fsTarget.webkitEnterFullscreen && fsTarget.webkitEnterFullscreen() } catch (e) { log('fullscreen failed') } })
+    else if (fsTarget.webkitEnterFullscreen) fsTarget.webkitEnterFullscreen()
+  }
+  fsBtn.addEventListener('click', (e) => { e.stopPropagation(); e.preventDefault(); enterFs() }, true)
+  const bump = (e) => { lastTouch = performance.now(); if (e && e.target === fsBtn) return }
+  ;['touchstart', 'pointerdown', 'mousemove', 'click'].forEach(ev => document.addEventListener(ev, bump, { capture: true, passive: true }))
+  function updateFsButton () {
+    let best = null; let area = 0
+    document.querySelectorAll('video').forEach(v => {
+      const r = v.getBoundingClientRect()
+      if (r.width < 200 || r.height < 110 || r.bottom <= 0 || r.top >= window.innerHeight || v.readyState < 2 || v.ended) return
+      if (r.width * r.height > area) { best = v; area = r.width * r.height }
+    })
+    const inFs = !!(document.fullscreenElement || document.webkitFullscreenElement)
+    // do not offer the button for videos that already fill the whole screen unless we are in fullscreen
+    if (!best || performance.now() - lastTouch > 3500 && !best.paused) { fsBtn.style.display = 'none'; return }
+    fsTarget = best
+    const r = best.getBoundingClientRect(); const top = Math.max(8, r.top + 8); const right = Math.min(window.innerWidth - 8, r.right - 8)
+    const parent = document.fullscreenElement || document.webkitFullscreenElement || document.documentElement
+    if (fsBtn.parentNode !== parent) parent.appendChild(fsBtn)
+    fsBtn.textContent = inFs ? '✕' : '⛶'
+    fsBtn.style.left = Math.max(8, right - 44) + 'px'; fsBtn.style.top = top + 'px'; fsBtn.style.display = 'block'
+  }
+  setInterval(updateFsButton, 400)
 
   /* ---------------- orchestration ---------------- */
   function scan () {
