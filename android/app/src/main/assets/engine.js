@@ -11,6 +11,7 @@
     enabled: true, target: 1440, sharpness: 0.6, neural: true, denoise: 0.35,
     tone: true, temporal: true, interp: false, interpNeural: true, images: true
   }
+  Object.assign(cfg, window.__minCfg0 || {})
   const state = { videos: new Map(), failed: false, nn: null, stats: { nn: 'idle', fps: 0, ms: 0 } }
 
   /* ---------------- shaders ---------------- */
@@ -264,15 +265,18 @@ void main(){
     if (h <= vh) { h = vh; w = vw }
     return [Math.max(w, 2), Math.max(h, 2)]
   }
+  function host () { return document.fullscreenElement || document.webkitFullscreenElement || document.documentElement }
+  document.addEventListener('fullscreenchange', () => state.videos.forEach(st => host().appendChild(st.canvas)))
+  document.addEventListener('webkitfullscreenchange', () => state.videos.forEach(st => host().appendChild(st.canvas)))
   function attach (video) {
-    if (state.videos.has(video) || state.failed) return
+    if (state.videos.has(video) || state.failed || video.mediaKeys) return
     const canvas = document.createElement('canvas')
     canvas.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483646;display:none'
     let R
     try { R = makeRenderer(canvas) } catch (e) { R = null; console.warn('enhance: shader error', e) }
     if (!R) { state.failed = true; return }
     const st = { canvas, R, running: false, prevOpacity: video.style.opacity, errors: 0, frame: 0, tone: { lo: 0, hi: 1, contrast: 0.22, sat: 1.1, gamma: 1 }, lastT: 0, fpsEMA: 30 }
-    state.videos.set(video, st); document.documentElement.appendChild(canvas)
+    state.videos.set(video, st); host().appendChild(canvas)
     video.addEventListener('play', () => loop(video)); loop(video)
   }
   function detach (video) {
@@ -287,6 +291,7 @@ void main(){
       else setTimeout(() => requestAnimationFrame(cb), video.paused ? 250 : 16)
     }
     const tick = (now, meta) => {
+      if (video.mediaKeys) { detach(video); st.running = false; return }
       if (!state.videos.has(video) || !cfg.enabled) { st.running = false; return }
       const rect = video.getBoundingClientRect(); const vw = video.videoWidth; const vh = video.videoHeight; const dpr = window.devicePixelRatio || 1
       const wantH = Math.min(cfg.target, rect.height * dpr)
@@ -295,6 +300,7 @@ void main(){
       const [w, h] = outSize(vw, vh, rect)
       if (st.canvas.width !== w || st.canvas.height !== h) { st.canvas.width = w; st.canvas.height = h }
       const s = st.canvas.style; s.display = 'block'; s.left = rect.left + 'px'; s.top = rect.top + 'px'; s.width = rect.width + 'px'; s.height = rect.height + 'px'
+      state.stats.active = Array.from(state.videos.values()).filter(x => x.canvas.style.display === 'block').length
       try {
         st.R.resize(vw, vh); st.R.upload(video); st.frame++
         if (cfg.tone && st.frame % 6 === 1) analyseTone(st, video)
