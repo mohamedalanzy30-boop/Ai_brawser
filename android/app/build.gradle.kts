@@ -14,8 +14,19 @@ android {
         applicationId = "com.aib.browser"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1"
+        // CI passes -Pvc=<run number> so every build can be installed over the previous one
+        val vc = (project.findProperty("vc") as String?)?.toIntOrNull() ?: 1
+        versionCode = vc
+        versionName = "0.1.$vc"
+    }
+    signingConfigs {
+        // fixed key so updates install over previous builds (debug-only key, not a secret)
+        getByName("debug") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
     }
     buildTypes { release { isMinifyEnabled = false } }
     compileOptions {
