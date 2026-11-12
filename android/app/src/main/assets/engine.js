@@ -17,7 +17,10 @@
   try { // WebView: screen.orientation.lock() rejects, which breaks many players' fullscreen; native code rotates instead
     if (screen.orientation) { screen.orientation.lock = () => Promise.resolve(); screen.orientation.unlock = () => {} }
   } catch (e) { /* ignore */ }
-  const guard = { noInterp: false, noNeural: false }
+  // Performance guard: watches main-thread long tasks while a video plays and sheds the heaviest
+  // feature first. Each repeated overload pauses it longer (20s, 60s, 3min); the 4th time it stays
+  // off until the page is reloaded, so the phone never stays overloaded.
+  const guard = { noInterp: false, noNeural: false, strikes: 0, retryAt: 0, off: false }
   const longTasks = []
   try { new PerformanceObserver(l => { for (const e of l.getEntries()) longTasks.push([e.startTime, e.duration]) }).observe({ entryTypes: ['longtask'] }) } catch (e) { /* unsupported */ }
   setInterval(() => {
@@ -25,11 +28,19 @@
     while (longTasks.length && now - longTasks[0][0] > 3000) longTasks.shift()
     const busy = longTasks.reduce((a, t) => a + t[1], 0)
     const playing = Array.from(state.videos.keys()).some(v => !v.paused)
-    if (guard.retryAt && now > guard.retryAt) { guard.noInterp = false; guard.noNeural = false; guard.retryAt = 0; log('performance guard: retrying heavy features') }
-    if (!playing || busy < 600) return
-    if (cfg.interp && !guard.noInterp) { guard.noInterp = true; guard.retryAt = now + 30000; longTasks.length = 0; log('performance guard: frame interpolation paused 30s (main thread busy ' + Math.round(busy) + 'ms/3s)') }
-    else if (cfg.neural && !guard.noNeural) { guard.noNeural = true; guard.retryAt = now + 30000; longTasks.length = 0; log('performance guard: neural upscaling paused 30s while playing (busy ' + Math.round(busy) + 'ms/3s)') }
-  }, 2000)
+    if (guard.retryAt && now > guard.retryAt && !guard.off) { guard.noInterp = false; guard.noNeural = false; guard.retryAt = 0; longTasks.length = 0; log('performance guard: retrying heavy features') }
+    if (!playing || busy < 450) return
+    const what = (cfg.interp && !guard.noInterp) ? 'interp' : (cfg.neural && !guard.noNeural) ? 'neural' : null
+    if (!what) return
+    if (what === 'interp') guard.noInterp = true; else guard.noNeural = true
+    // turning off interpolation alone counts as a light step; a neural overload is a strike
+    if (what === 'neural') guard.strikes++
+    longTasks.length = 0
+    if (guard.strikes >= 4) { guard.off = true; guard.noInterp = guard.noNeural = true; log('performance guard: heavy features off for this page (busy ' + Math.round(busy) + 'ms/3s)'); return }
+    const secs = what === 'interp' ? 30 : [0, 20, 60, 180][guard.strikes]
+    guard.retryAt = now + secs * 1000
+    log('performance guard:', what === 'interp' ? 'frame interpolation' : 'neural upscaling', 'paused ' + secs + 's (busy ' + Math.round(busy) + 'ms/3s)')
+  }, 1500)
   const log = (...a) => { try { console.warn('[AIB]', ...a) } catch (e) { /* ignore */ } }
   const state = { videos: new Map(), failed: false, nn: null, stats: { nn: 'idle', fps: 0, ms: 0 } }
 
@@ -351,14 +362,16 @@ void main(){
         if (cfg.tone && st.frame % 6 === 1) analyseTone(st, video)
         const tone = cfg.tone ? st.tone : { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }
         const dt = st.lastT ? (now - st.lastT) : 33; st.lastT = now; st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
-        const wantInterp = cfg.interp && !guard.noInterp && !video.paused && st.fpsEMA < 40
+        const nnWins = cfg.neural && !guard.noNeural && vh * 4 <= effTarget() * 1.34 && state.nn && state.nn.ms > 0 && state.nn.ms < 0.6 * (1000 / Math.max(st.fpsEMA, 1))
+        const wantInterp = cfg.interp && !guard.noInterp && !video.paused && st.fpsEMA < 40 && !nnWins
         if (wantInterp && cfg.interpNeural && vh <= 540 && !(rife.session && st.prevBytes && rife.ms < 0.9 * (1000 / st.fpsEMA))) st.prevBytes = grabBytes(video, vw, vh)
-        const wantNN = cfg.neural && (!guard.noNeural || video.paused) && !wantInterp && vh <= 540 && state.nn && state.nn.session && state.stats.nn !== 'error'
+        const nnLiveOk = vh * 4 <= effTarget() * 1.34 // e.g. <=360p for a 1440p screen; bigger sources use the shader path
+        const wantNN = cfg.neural && (video.paused || (!guard.noNeural && nnLiveOk)) && !wantInterp && vh <= 540 && state.nn && state.nn.session && state.stats.nn !== 'error'
         if (cfg.neural && vh <= 540) nnInit()
         // Neural frames are only shown when they are consistent: exact frame while paused, or when the
         // model keeps up with the video (always one steady frame late). Never mix stale and live frames.
         const nnS = state.nn; const T = 1000 / Math.max(st.fpsEMA, 1)
-        const fast = !!nnS && nnS.ms > 0 && nnS.ms < 0.8 * T
+        const fast = !!nnS && nnS.ms > 0 && nnS.ms < 0.6 * T
         if (wantNN && !nnS.busy && (video.paused || fast || !nnS.ms)) { nnS.lastProbe = performance.now(); nnRun(video, vw, vh) }
         const r = nnS && nnS.last
         const fresh = wantNN && r && r.w === vw * 4 && (video.paused ? Math.abs(r.mediaTime - video.currentTime) < 0.05 : fast && Math.abs(r.mediaTime - video.currentTime) < 3 * T / 1000)
@@ -454,7 +467,20 @@ void main(){
   function scan () {
     if (!cfg.enabled || state.failed) return
     document.querySelectorAll('video').forEach(attach)
-    if (cfg.images) document.querySelectorAll('img').forEach(upscaleImage)
+    if (cfg.images) document.querySelectorAll('img').forEach(i => { if (!imgQueue.includes(i)) imgQueue.push(i) })
+    pumpImages()
+  }
+  const imgQueue = []; let imgDone = 0; let imgPumping = false
+  function pumpImages () { // one image per 120ms, max 40 per page: keeps scrolling and playback smooth
+    if (imgPumping) return
+    imgPumping = true
+    const step = () => {
+      const img = imgQueue.shift()
+      if (!img || imgDone >= 40 || !cfg.images || !cfg.enabled) { imgPumping = false; imgQueue.length = 0; return }
+      if (!doneImages.has(img)) { upscaleImage(img); if (doneImages.has(img)) imgDone++ }
+      setTimeout(step, doneImages.has(img) ? 120 : 0)
+    }
+    step()
   }
   let timer = null
   new window.MutationObserver(() => { clearTimeout(timer); timer = setTimeout(scan, 400) }).observe(document, { childList: true, subtree: true })
@@ -470,7 +496,7 @@ void main(){
   })
   window.__minEnhanceSet = function (c) {
     if (c && c.interp === true) guard.noInterp = false
-    if (c && c.neural === true) guard.noNeural = false
+    if (c && c.neural === true) { guard.noNeural = false; guard.off = false; guard.strikes = 0 }
     Object.assign(cfg, c || {}); forward(c || {})
     if (cfg.enabled) { scan(); state.videos.forEach((_, v) => loop(v)) } else Array.from(state.videos.keys()).forEach(detach)
   }

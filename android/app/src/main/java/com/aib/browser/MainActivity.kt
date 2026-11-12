@@ -80,7 +80,7 @@ class MainActivity : Activity() {
         val rates = d.supportedModes.map { Math.round(it.refreshRate) }.distinct().sorted().joinToString("/")
         val m = android.util.DisplayMetrics().also { d.getRealMetrics(it) }
         val disp = "display=${m.widthPixels}x${m.heightPixels} dpi=${m.densityDpi} refresh=${Math.round(d.refreshRate)}Hz modes=$rates hdr=$hdr wideGamut=${d.isWideColorGamut}"
-        val head = "$disp\nAI Browser 0.1 | ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} | Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) | WebView ${wv?.versionName}\nconfig=${config()}\nurl=${web.url}\n"
+        val head = "$disp\nAI Browser 0.1 | ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} | Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) | WebView ${wv?.versionName}\nconfig=${config()}\nadblock=${if (adblockOn) "on" else "off"} hosts=${adHosts.size} blocked=$blocked\nurl=${web.url}\n"
         return head + synchronized(logLines) { logLines.joinToString("\n") }
     }
     private val prefs by lazy { getSharedPreferences("enhance", Context.MODE_PRIVATE) }
@@ -92,10 +92,11 @@ class MainActivity : Activity() {
         "temporal" to "استقرار زمني (يقلل الوميض)",
         "interp" to "توليد الإطارات (ثقيل)",
         "images" to "تحسين الصور",
+        "adblock" to "حظر الإعلانات والمتتبعات (أسرع وأخف)",
         "refresh" to "مطابقة معدل تحديث الشاشة للفيديو (حتى 120Hz)",
         "brightness" to "سطوع أعلى في ملء الشاشة"
     )
-    private val defaults = mapOf("enabled" to true, "neural" to true, "temporal" to true, "tone" to true, "interp" to false, "images" to true, "refresh" to true, "brightness" to false)
+    private val defaults = mapOf("enabled" to true, "neural" to true, "temporal" to true, "tone" to true, "interp" to false, "images" to true, "adblock" to true, "refresh" to true, "brightness" to false)
     private val targets = intArrayOf(0, 720, 1080, 1440, 2160)
     private val targetLabels = arrayOf("تلقائي", "720p", "1080p", "2K", "4K")
     private val denoise = floatArrayOf(0f, 0.2f, 0.35f, 0.6f)
@@ -111,6 +112,25 @@ class MainActivity : Activity() {
         o.put("denoise", prefs.getFloat("denoise", 0.35f).toDouble())
         return o
     }
+
+    /* ---------- ad / tracker blocking: bundled host list, no network needed ---------- */
+    @Volatile private var adHosts: Set<String> = emptySet()
+    @Volatile private var blocked = 0
+    private fun loadAdHosts() = Thread {
+        adHosts = try { assets.open("adhosts.txt").bufferedReader().useLines { l -> l.filter { it.isNotBlank() }.toHashSet() } } catch (e: Exception) { emptySet() }
+        addLog("[AIB] ad blocker: ${adHosts.size} hosts loaded")
+    }.start()
+    private fun isAd(host: String?): Boolean {
+        if (host == null || adHosts.isEmpty()) return false
+        var h: String = host.lowercase()
+        while (true) { // also matches subdomains (x.ads.example.com -> ads.example.com)
+            if (h in adHosts) return true
+            val i = h.indexOf('.'); if (i < 0 || h.indexOf('.', i + 1) < 0) return false
+            h = h.substring(i + 1)
+        }
+    }
+    @Volatile private var adblockOn = true
+    private var pageHost: String? = null
 
     private fun asset(path: String): String = assets.open(path).bufferedReader().use { it.readText() }
     private val bundle by lazy { asset("ort/ort.webgpu.min.js") + "\n;" + asset("engine.js") }
@@ -212,6 +232,10 @@ class MainActivity : Activity() {
         web.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                 val u = request.url
+                if (adblockOn && !request.isForMainFrame && isAd(u.host) && !isAd(pageHost)) {
+                    blocked++
+                    return WebResourceResponse("text/plain", "utf-8", 204, "No Content", mapOf("Access-Control-Allow-Origin" to "*"), "".byteInputStream())
+                }
                 if (u.host == "fonts.gstatic.com" && request.method == "GET") return proxyFont(request)
                 if (u.host != ASSET_HOST) return null
                 val path = u.path.orEmpty().trimStart('/')
@@ -237,7 +261,13 @@ class MainActivity : Activity() {
                 addLog("[CRASH] WebView renderer gone, didCrash=${detail.didCrash()}")
                 return true
             }
+            override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean {
+                // pop-under / redirect ads: a frame or the page jumping to an ad host is dropped
+                if (adblockOn && isAd(req.url.host) && !isAd(pageHost)) { blocked++; addLog("[AIB] blocked ad redirect ${req.url.host}"); return true }
+                return false
+            }
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+                pageHost = android.net.Uri.parse(url).host
                 if (!urlBar.hasFocus()) urlBar.setText(url)
                 if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
             }
@@ -245,6 +275,10 @@ class MainActivity : Activity() {
                 if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
             }
         }
+        // keep the page's renderer (video decoding + audio) at high priority so playback does not crackle
+        web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
+        adblockOn = prefs.getBoolean("adblock", true)
+        loadAdHosts()
         registerScript()
         pollBadge()
         go(intent?.dataString ?: HOME)
@@ -349,7 +383,7 @@ class MainActivity : Activity() {
             row.addView(TextView(this).apply { text = title; textSize = 15f; setTextColor(Color.WHITE) }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             row.addView(Switch(this).apply {
                 isChecked = prefs.getBoolean(k, defaults[k] == true)
-                setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean(k, c).apply(); applyConfig() }
+                setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean(k, c).apply(); adblockOn = prefs.getBoolean("adblock", true); applyConfig() }
             })
             col.addView(row)
         }
