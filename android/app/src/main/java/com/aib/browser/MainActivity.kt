@@ -251,7 +251,7 @@ class MainActivity : Activity() {
         web = WebView(this).apply { setBackgroundColor(BG) }
 
         // bottom bar (thumb friendly): back | address | enhance
-        val back = iconButton("‹", 30) { if (web.canGoBack()) web.goBack() }
+        val back = iconButton("‹", 30) { goBackOnce() }
         urlBar = EditText(this).apply {
             setSingleLine(); hint = "ابحث أو اكتب عنوان"; setHintTextColor(0xFF8A8A8A.toInt()); setTextColor(Color.WHITE)
             textSize = 15f; background = pill(SURFACE, 22); setPadding(dp(16), 0, dp(16), 0)
@@ -376,7 +376,11 @@ class MainActivity : Activity() {
                     if (prefs.getBoolean("popups", true) && (!req.hasGesture() || req.url.toString().contains("package=com.android.chrome"))) {
                         popupsBlocked++; addLog("[AIB] blocked app redirect ${scheme}://${req.url.host}"); return true
                     }
-                    return try { startActivity(android.content.Intent.parseUri(req.url.toString(), android.content.Intent.URI_INTENT_SCHEME).addCategory(android.content.Intent.CATEGORY_BROWSABLE).setComponent(null).setSelector(null)); true } catch (e: Exception) { true }
+                    return try {
+                        val it = android.content.Intent.parseUri(req.url.toString(), android.content.Intent.URI_INTENT_SCHEME)
+                        it.addCategory(android.content.Intent.CATEGORY_BROWSABLE); it.component = null; it.selector = null
+                        startActivity(it); true
+                    } catch (e: Exception) { true }
                 }
                 if (req.isForMainFrame && prefs.getBoolean("protect", true)) {
                     val clean = cleanUrl(req.url)
@@ -552,13 +556,35 @@ class MainActivity : Activity() {
         dlg.show()
     }
 
-    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_BACK) {
-            if (customView != null) { exitFullscreen(); return true }
-            if (web.canGoBack()) { web.goBack(); return true }
+    /**
+     * One back = one page. Pages (and ads) leave duplicate or redirect entries in the history, and some
+     * phones deliver back twice; so: ignore a second back within 450 ms, and skip entries that are the
+     * same address as the current page or an ad host.
+     */
+    private var lastBack = 0L
+    private fun goBackOnce(): Boolean {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (now - lastBack < 450) return true
+        lastBack = now
+        if (customView != null) { exitFullscreen(); return true }
+        val list = web.copyBackForwardList(); val cur = list.currentIndex
+        if (cur <= 0) return false
+        val here = list.currentItem?.url?.substringBefore('#')
+        var i = cur - 1
+        while (i > 0) {
+            val u = list.getItemAtIndex(i).url
+            if (u.substringBefore('#') != here && !isAd(android.net.Uri.parse(u).host)) break
+            i--
         }
+        web.goBackOrForward(i - cur)
+        return true
+    }
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK) { if ((event?.repeatCount ?: 0) > 0) return true; if (goBackOnce()) return true }
         return super.onKeyDown(keyCode, event)
     }
+    @Deprecated("handled through onKeyDown")
+    override fun onBackPressed() { if (!goBackOnce()) super.onBackPressed() }
 
     override fun onDestroy() { ui.removeCallbacksAndMessages(null); super.onDestroy() }
 }
