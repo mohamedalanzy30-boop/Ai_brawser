@@ -16,6 +16,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with: { distribution: temurin, java-version: '17' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
       - name: Fetch ONNX Runtime Web + model into app assets
         run: |
           set -e
@@ -32,7 +34,7 @@ jobs:
             https://huggingface.co/t9749/rife-4.25-lite-onnx/resolve/main/rife_v425lite.onnx
           echo "702802d0862ab78f2d72133c6bc3768e7e89b81756f7cd51d1055a2fe3d06577  model/rife_v425lite.onnx" | sha256sum -c -
           # fixed-size copy of the SR model for the NPU (native player)
-          pip install --quiet onnx==1.17.0
+          pip install --quiet --only-binary=:all: onnx
           python3 "$GITHUB_WORKSPACE/tools/fix_model.py" model/realesr-general-x4v3.onnx model/realesr-x4v3-640x360.onnx 360 640
           # ad/tracker host list (StevenBlack/hosts, MIT), bundled so blocking needs no network at runtime
           # + HaGeZi Pro (GPL-3.0): covers the pop-under / redirect ad networks used by movie sites
