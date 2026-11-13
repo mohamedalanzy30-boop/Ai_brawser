@@ -54,6 +54,7 @@ import java.io.FileNotFoundException
 private const val ASSET_HOST = "appassets.min.local"
 private const val HOME = "https://www.google.com"
 private const val FILE_REQ = 41
+private const val PLAYER_REQ = 42
 
 class MainActivity : Activity() {
     private lateinit var web: WebView
@@ -108,7 +109,7 @@ class MainActivity : Activity() {
     /* ======================= settings ======================= */
     private val defaults = mapOf(
         "enabled" to true, "neural" to true, "tone" to true, "images" to true,
-        "autoNative" to true, "gestures" to true, "brightness" to false,
+        "autoNative" to true, "gestures" to false, "brightness" to false,
         "adblock" to true, "popups" to true, "protect" to true, "adult" to false, "dark" to true, "cookies" to true, "noAutoplay" to true
     )
     private val targets = intArrayOf(0, 720, 1080, 1440, 2160)
@@ -172,6 +173,9 @@ class MainActivity : Activity() {
         val s = u.toString()
         if (media.none { it.url == s }) { media.add(Media(s, req.requestHeaders["Referer"], hls)); while (media.size > 30) media.removeAt(0) }
     }
+    /** sites where the native player could not play the video: they stay in the page player for this session */
+    private val noNative = java.util.Collections.synchronizedSet(HashSet<String?>())
+    private var nativeHost: String? = null
     private fun openNative(src: String, posSec: Double) {
         val direct = if (src.startsWith("http")) Media(src, web.url, src.contains(".m3u8", true)) else null
         // HLS players request the master playlist first, so the first .m3u8 is the best choice
@@ -184,10 +188,11 @@ class MainActivity : Activity() {
         val saved = Resume.position(this, page)
         val pos = if (posSec < 5 && saved > 0) saved else (posSec * 1000).toLong()
         addLog("[AIB] native player: ${if (m.hls) "HLS" else "file"} ${m.url.take(120)} from ${pos / 1000}s")
-        startActivity(Intent(this, PlayerActivity::class.java)
+        nativeHost = pageHost
+        startActivityForResult(Intent(this, PlayerActivity::class.java)
             .putExtra("url", m.url).putExtra("hls", m.hls).putExtra("referer", m.referer ?: page)
             .putExtra("ua", web.settings.userAgentString).putExtra("cookie", CookieManager.getInstance().getCookie(m.url) ?: "")
-            .putExtra("pos", pos).putExtra("title", web.title ?: "").putExtra("page", page))
+            .putExtra("pos", pos).putExtra("title", web.title ?: "").putExtra("page", page), PLAYER_REQ)
     }
 
     /** Small bridge for the in-page player controls. Every method is harmless if a page calls it. */
@@ -195,7 +200,7 @@ class MainActivity : Activity() {
         @android.webkit.JavascriptInterface fun openNative(src: String, pos: Double) { ui.post { this@MainActivity.openNative(src, pos) } }
         /** auto mode: only switches when a real video address is known; otherwise the page keeps playing */
         @android.webkit.JavascriptInterface fun autoNative(src: String, pos: Double): Boolean {
-            if (!on("autoNative")) return false
+            if (!on("autoNative") || pageHost in noNative) return false
             if (!src.startsWith("http") && media.isEmpty()) return false
             ui.post { this@MainActivity.openNative(src, pos) }
             return true
@@ -232,12 +237,12 @@ class MainActivity : Activity() {
     /* ======================= picture in picture ======================= */
     private fun pipParams(): android.app.PictureInPictureParams {
         val b = android.app.PictureInPictureParams.Builder().setAspectRatio(videoAspect)
-        if (android.os.Build.VERSION.SDK_INT >= 31) b.setAutoEnterEnabled(videoPlaying && on("gestures")).setSeamlessResizeEnabled(true)
+        if (android.os.Build.VERSION.SDK_INT >= 31) b.setAutoEnterEnabled(videoPlaying).setSeamlessResizeEnabled(true)
         return b.build()
     }
     private fun updatePipParams() { try { setPictureInPictureParams(pipParams()) } catch (e: Exception) { } }
     private fun enterPip() { if (videoPlaying) try { enterPictureInPictureMode(pipParams()) } catch (e: Exception) { addLog("[AIB] PiP failed: $e") } }
-    override fun onUserLeaveHint() { super.onUserLeaveHint(); if (android.os.Build.VERSION.SDK_INT < 31 && videoPlaying && on("gestures")) enterPip() }
+    override fun onUserLeaveHint() { super.onUserLeaveHint(); if (android.os.Build.VERSION.SDK_INT < 31 && videoPlaying) enterPip() }
     override fun onPictureInPictureModeChanged(inPip: Boolean, newConfig: android.content.res.Configuration) {
         super.onPictureInPictureModeChanged(inPip, newConfig)
         bottomBar.visibility = if (inPip) View.GONE else View.VISIBLE
@@ -268,7 +273,7 @@ class MainActivity : Activity() {
         scriptHandler = WebViewCompat.addDocumentStartJavaScript(web, "window.__minCfg0=${config()};\n$bundle$extra", setOf("*"))
     }
     /** Tells the app on every touch whether the touched content is scrolled to its top (inner scroll areas too), so pull-to-refresh never fires mid-page. */
-    private val PULL_JS = """(function(){if(window.__aibPull)return;window.__aibPull=1;addEventListener('touchstart',function(e){var n=window.AIBNative;if(!n||!n.pullOk)return;var ok=(document.scrollingElement||document.documentElement).scrollTop<=0;for(var el=e.target;ok&&el&&el.nodeType===1;el=el.parentElement){if(el.scrollTop>0)ok=false}try{n.pullOk(ok)}catch(x){}},{passive:true,capture:true})})();"""
+    private val PULL_JS = """(function(){if(window.__aibPull)return;window.__aibPull=1;addEventListener('touchstart',function(e){var n=window.AIBNative;if(!n||!n.pullOk)return;var ok=(document.scrollingElement||document.documentElement).scrollTop<=0;for(var el=e.target;ok&&el&&el.nodeType===1;el=el.parentElement){if(el.scrollTop>0)ok=false}try{n.pullOk(ok)}catch(x){}},{passive:true,capture:true});window.__aibResume=function(t,play){var vs=[].slice.call(document.querySelectorAll('video')).filter(function(v){return v.duration>0});vs.sort(function(a,b){return b.duration-a.duration});var v=vs[0];if(v){if(t>1)v.currentTime=t;if(play)v.play().catch(function(){})}for(var i=0;i<frames.length;i++)try{frames[i].postMessage({__aibResume:[t,play]},'*')}catch(x){}};addEventListener('message',function(e){if(e.data&&e.data.__aibResume&&e.source===parent)window.__aibResume(e.data.__aibResume[0],e.data.__aibResume[1])})})();"""
     @Volatile private var pullOk = true
     private fun applyConfig() {
         registerScript()
@@ -648,6 +653,17 @@ class MainActivity : Activity() {
     }
     @Deprecated("plain Activity API")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == PLAYER_REQ) {
+            val failed = data?.getBooleanExtra("failed", false) == true
+            val pos = (data?.getLongExtra("pos", 0L) ?: 0L) / 1000.0
+            if (failed) {
+                noNative.add(nativeHost)
+                Toast.makeText(this, "المشغّل الأصلي لم يستطع تشغيل هذا الفيديو، أكملته هنا", Toast.LENGTH_LONG).show()
+            }
+            // the page video continues from where the native player stopped (it plays again only if the native player failed)
+            web.evaluateJavascript("window.__aibResume&&window.__aibResume($pos,$failed)", null)
+            return
+        }
         if (requestCode == FILE_REQ) { fileCallback?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data)); fileCallback = null; return }
         @Suppress("DEPRECATION") super.onActivityResult(requestCode, resultCode, data)
     }
@@ -697,7 +713,7 @@ class MainActivity : Activity() {
             Ui.Group(this, col, "إزالة الضوضاء وتكسّر الضغط").segmented(denoiseLabels, denoise.indexOfFirst { it == prefs.getFloat("denoise", 0.35f) }.let { if (it < 0) 2 else it }) { i -> prefs.edit().putFloat("denoise", denoise[i]).apply(); applyConfig() }
             Ui.Group(this, col, "المشغّل", "المشغّل الأصلي يرفع الدقة على المعالج العصبي في جوالك.").apply {
                 toggle("فتح الأفلام تلقائياً في المشغّل الأصلي", on("autoNative")) { set("autoNative", it); applyConfig() }
-                toggle("أزرار وإيماءات المشغّل في الصفحات", on("gestures")) { set("gestures", it); applyConfig() }
+                toggle("أدوات إضافية فوق مشغّل الموقع (سرعة، قفل، إيماءات)", on("gestures")) { set("gestures", it); applyConfig() }
                 toggle("سطوع أعلى في ملء الشاشة", on("brightness")) { set("brightness", it) }
                 link("أكمل المشاهدة", "${Resume.list(this@MainActivity).size}") { dlg.dismiss(); showContinue() }
             }

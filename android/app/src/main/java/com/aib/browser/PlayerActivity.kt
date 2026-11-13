@@ -73,7 +73,13 @@ class PlayerActivity : Activity() {
     private var renderer: Renderer? = null
     @Volatile private var aiWanted = true
     private var page = ""
+    private val startedAt = System.currentTimeMillis()
     private var retries = 0
+    private var dragging = false
+    private var everPlayed = false
+    private var failed = false
+    private var autoQuality = true
+    private lateinit var spinner: android.widget.ProgressBar
     private lateinit var directView: SurfaceView
     private var hdrDirect = false
     private lateinit var eqBtn: TextView
@@ -121,9 +127,10 @@ class PlayerActivity : Activity() {
         seek = SeekBar(this).apply {
             max = 1000
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { if (fromUser && player.duration > 0) player.seekTo(player.duration * p / 1000) }
-                override fun onStartTrackingTouch(s: SeekBar) { ui.removeCallbacks(hideControls) }
-                override fun onStopTrackingTouch(s: SeekBar) { showControls() }
+                // while dragging only the time label follows the finger; one seek when the finger lifts (no stutter on slow networks)
+                override fun onProgressChanged(s: SeekBar, p: Int, fromUser: Boolean) { if (fromUser && player.duration > 0) time.text = "  ${fmt(player.duration * p / 1000)} / ${fmt(player.duration)}" }
+                override fun onStartTrackingTouch(s: SeekBar) { dragging = true; ui.removeCallbacks(hideControls) }
+                override fun onStopTrackingTouch(s: SeekBar) { dragging = false; if (player.duration > 0) player.seekTo(player.duration * s.progress / 1000); showControls() }
             })
         }
         time = TextView(this).apply { textSize = 13f; setTextColor(Color.WHITE) }
@@ -145,19 +152,35 @@ class PlayerActivity : Activity() {
         overlay.addView(status, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.START).apply { setMargins(dp(20), 0, 0, dp(64)) })
         controls = overlay
         root.addView(overlay, FrameLayout.LayoutParams(-1, -1))
+        spinner = android.widget.ProgressBar(this).apply { isIndeterminate = true; indeterminateTintList = android.content.res.ColorStateList.valueOf(Color.WHITE); visibility = View.GONE }
+        root.addView(spinner, FrameLayout.LayoutParams(dp(56), dp(56), Gravity.CENTER))
         toast = TextView(this).apply { textSize = 20f; setTextColor(Color.WHITE); background = pill(0xAA000000.toInt()); setPadding(dp(18), dp(10), dp(18), dp(10)); visibility = View.GONE }
         root.addView(toast, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
         setContentView(root)
 
         val http = DefaultHttpDataSource.Factory().setUserAgent(ua).setDefaultRequestProperties(headers).setAllowCrossProtocolRedirects(true)
             .setConnectTimeoutMs(15000).setReadTimeoutMs(20000)
-        player = ExoPlayer.Builder(this).setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(http)).build()
+        // keep downloading ahead while you watch (up to 30 minutes or ~300 MB in memory, whichever comes first), so a weak or dropping
+        // connection does not stop the movie; playback starts as soon as 1.5 s is ready
+        val load = androidx.media3.exoplayer.DefaultLoadControl.Builder()
+            .setBufferDurationsMs(10 * 60_000, 30 * 60_000, 1_500, 3_000)
+            .setTargetBufferBytes(300 * 1024 * 1024).setPrioritizeTimeOverSizeThresholds(false)
+            .setBackBuffer(2 * 60_000, true) // seeking back up to 2 minutes is instant
+            .build()
+        player = ExoPlayer.Builder(this).setLoadControl(load).setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(http)).build()
         setupSound()
         val item = MediaItem.Builder().setUri(url).apply { if (url.contains(".m3u8", true) || intent.getBooleanExtra("hls", false)) setMimeType(MimeTypes.APPLICATION_M3U8) }.build()
         player.setMediaItem(item, intent.getLongExtra("pos", 0L).coerceAtLeast(0L))
         player.prepare(); player.playWhenReady = true
         player.addListener(object : Player.Listener {
-            override fun onIsPlayingChanged(isPlaying: Boolean) { playBtn.text = if (isPlaying) "⏸" else "▶"; if (isPlaying) retries = 0 }
+            override fun onIsPlayingChanged(isPlaying: Boolean) { playBtn.text = if (isPlaying) "⏸" else "▶"; if (isPlaying) { retries = 0; everPlayed = true } }
+            override fun onRenderedFirstFrame() { everPlayed = true }
+            override fun onPlaybackStateChanged(state: Int) {
+                val buffering = state == Player.STATE_BUFFERING
+                spinner.visibility = if (buffering) View.VISIBLE else View.GONE
+                playBtn.visibility = if (buffering) View.INVISIBLE else View.VISIBLE
+                if (state == Player.STATE_ENDED) { Resume.remove(this@PlayerActivity, page); finish() }
+            }
             override fun onPlayerError(error: PlaybackException) {
                 addLog("[player] error ${error.errorCodeName} ${error.message}")
                 // network dropped or the server hiccuped: try again from the same second, waiting a bit longer each time
@@ -174,7 +197,8 @@ class PlayerActivity : Activity() {
                         if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW) player.seekToDefaultPosition()
                         player.prepare(); player.playWhenReady = true
                     }, wait)
-                } else status.text = if (c == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS || c == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND) "انتهت صلاحية رابط الفيديو، ارجع للصفحة وشغّله من جديد" else "خطأ في التشغيل: ${error.errorCodeName}"
+                } else if (!everPlayed) giveUp("${error.errorCodeName}")
+                else status.text = if (c == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS || c == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND) "انتهت صلاحية رابط الفيديو، ارجع للصفحة وشغّله من جديد" else "خطأ في التشغيل: ${error.errorCodeName}"
             }
             override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
                 val f = tracks.groups.firstOrNull { it.type == C.TRACK_TYPE_VIDEO && it.isSelected }?.let { g -> (0 until g.length).firstOrNull { g.isTrackSelected(it) }?.let { g.getTrackFormat(it) } }
@@ -201,13 +225,30 @@ class PlayerActivity : Activity() {
         tickUi(); showControls()
     }
 
+    /** The native player could not start this video (protected stream, wrong address...): go back, the page keeps playing it. */
+    private fun giveUp(why: String) {
+        if (failed || isFinishing) return
+        failed = true; addLog("[player] gave up before the first frame: $why")
+        finish()
+    }
+    override fun finish() {
+        if (::player.isInitialized) setResult(RESULT_OK, Intent().putExtra("pos", player.currentPosition).putExtra("failed", failed))
+        super.finish()
+    }
+
     private val hideControls = Runnable { controls.visibility = View.GONE }
     private fun showControls() { controls.visibility = View.VISIBLE; ui.removeCallbacks(hideControls); ui.postDelayed(hideControls, 3500) }
     private fun fmt(ms: Long): String { val s = ms / 1000; return if (s >= 3600) "%d:%02d:%02d".format(s / 3600, s / 60 % 60, s % 60) else "%d:%02d".format(s / 60, s % 60) }
     private fun tickUi() {
         if (isFinishing) return
         val d = player.duration
-        if (d > 0) { seek.progress = (player.currentPosition * 1000 / d).toInt(); time.text = "  ${fmt(player.currentPosition)} / ${fmt(d)}" }
+        if (d > 0 && !dragging) {
+            seek.progress = (player.currentPosition * 1000 / d).toInt(); seek.secondaryProgress = (player.bufferedPosition * 1000 / d).toInt()
+            time.text = "  ${fmt(player.currentPosition)} / ${fmt(d)}"
+        }
+        if (autoQuality) { val h = player.videoSize.height; qualityBtn.text = if (h > 0) "تلقائي ${h}p" else "تلقائي" }
+        // still nothing on screen after 30 s: this address does not work here, hand the video back to the page
+        if (!everPlayed && !failed && player.playbackState == Player.STATE_BUFFERING && System.currentTimeMillis() - startedAt > 30_000) giveUp("timeout")
         ui.postDelayed({ tickUi() }, 500)
     }
     private fun flash(t: String) { toast.text = t; toast.visibility = View.VISIBLE; ui.removeCallbacks(hideToast); ui.postDelayed(hideToast, 700) }
@@ -284,7 +325,7 @@ class PlayerActivity : Activity() {
         val opts = ArrayList<Pair<String, (() -> Unit)>>()
         opts.add("تلقائي" to {
             player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().clearOverridesOfType(C.TRACK_TYPE_VIDEO).build()
-            qualityBtn.text = "تلقائي"
+            autoQuality = true
         })
         for (g in player.currentTracks.groups) {
             if (g.type != C.TRACK_TYPE_VIDEO) continue
@@ -294,7 +335,7 @@ class PlayerActivity : Activity() {
                 opts.add("${h}p" to {
                     player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
                         .setOverrideForType(androidx.media3.common.TrackSelectionOverride(g.mediaTrackGroup, i)).build()
-                    qualityBtn.text = "${h}p"
+                    qualityBtn.text = "${h}p"; autoQuality = false
                 })
             }
         }
@@ -347,7 +388,7 @@ class PlayerActivity : Activity() {
         ui.removeCallbacksAndMessages(null)
         saveResume()
         try { eq?.release(); loud?.release() } catch (e: Throwable) { }
-        if (::player.isInitialized) { setResult(RESULT_OK, Intent().putExtra("pos", player.currentPosition)); player.release() }
+        if (::player.isInitialized) player.release()
         renderer?.stop(); renderer = null
         super.onDestroy()
     }

@@ -5,6 +5,7 @@ const ENGINE = path.resolve(__dirname, '../android/app/src/main/assets/engine.js
   const page = await browser.newPage({ viewport: { width: 800, height: 500 } })
   page.on('pageerror', e => console.log('[pageerror]', e.message))
   await page.route('https://test.local/', r => r.fulfill({ contentType: 'text/html', body: '<body style="margin:0"><div id=box style="width:640px;height:360px"><video id=v muted autoplay style="width:640px;height:360px"></video></div></body>' }))
+  await page.addInitScript(() => { window.__minCfg0 = { gestures: true } })
   await page.goto('https://test.local/')
   await page.evaluate(() => { const c = document.createElement('canvas'); c.width = 160; c.height = 90; const x = c.getContext('2d'); setInterval(() => { x.fillStyle = '#345'; x.fillRect(0, 0, 160, 90) }, 33); const v = document.getElementById('v'); v.srcObject = c.captureStream(30); v.play() })
   await page.waitForFunction(() => document.getElementById('v').videoWidth > 0)

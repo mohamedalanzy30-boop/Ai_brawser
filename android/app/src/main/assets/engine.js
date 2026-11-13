@@ -8,9 +8,23 @@
   const HOST = 'https://appassets.min.local/'
   const cfg = {
     enabled: true, target: 1440, sharpness: 0.6, neural: true, denoise: 0.35,
-    tone: true, images: true, gestures: true, autoNative: true
+    tone: true, images: true, gestures: false, autoNative: true
   }
   Object.assign(cfg, window.__minCfg0 || {})
+  /* Read-ahead for site players: hls.js and video.js normally fetch only ~30 s ahead; ask them to keep loading
+     up to 10 minutes ahead (capped at ~200 MB), so a slow or dropping connection does not stall the movie. */
+  ;(function bufferAhead () {
+    const tuneHls = (H) => { try { const c = H && H.DefaultConfig; if (c && !c.__aib) { c.__aib = 1; c.maxBufferLength = 600; c.maxMaxBufferLength = 1800; c.maxBufferSize = 200 * 1000 * 1000; c.backBufferLength = 120 } } catch (e) { /* ignore */ } }
+    const tuneVjs = (V) => { try { const v = V && (V.Vhs || V.Hls); if (v && !v.__aib) { v.__aib = 1; v.GOAL_BUFFER_LENGTH = 600; v.MAX_GOAL_BUFFER_LENGTH = 1800; v.GOAL_BUFFER_LENGTH_RATE = 1 } } catch (e) { /* ignore */ } }
+    const trap = (name, tune) => {
+      if (window[name]) { tune(window[name]); return }
+      let val
+      try { Object.defineProperty(window, name, { configurable: true, enumerable: true, get () { return val }, set (v) { val = v; tune(v) } }) } catch (e) { /* ignore */ }
+    }
+    trap('Hls', tuneHls); trap('videojs', tuneVjs)
+    // players that load later through a bundler: check again once the page has loaded
+    window.addEventListener('load', () => { tuneHls(window.Hls); tuneVjs(window.videojs) })
+  })()
   const nativeShort = () => Math.round(Math.min(screen.width, screen.height) * (window.devicePixelRatio || 1))
   const effTarget = () => cfg.target || nativeShort()
   try { // WebView: screen.orientation.lock() rejects, which breaks many players' fullscreen; native code rotates instead
@@ -509,12 +523,12 @@ void main(){
     const parent = document.fullscreenElement || document.webkitFullscreenElement || document.documentElement
     if (ctl.parentNode !== parent) parent.appendChild(ctl)
     fsBtn.textContent = inFs ? '✕' : '⛶'
-    const extra = cfg.gestures !== false
+    const extra = cfg.gestures === true // the site's own player controls are used; our extra buttons only if switched on
     speedBtn.style.display = pipBtn.style.display = extra ? 'block' : 'none'
     lockBtn.style.display = extra && inFs ? 'block' : 'none'
     nativeBtn.style.display = NATIVE && NATIVE.openNative ? 'block' : 'none'
     speedBtn.textContent = best.playbackRate + '×'
-    fsBtn.style.display = 'block'; ctl.style.display = 'flex'
+    fsBtn.style.display = extra ? 'block' : 'none'; ctl.style.display = 'flex'
     ctl.style.right = (window.innerWidth - right) + 'px'; ctl.style.top = top + 'px'
     fsBtn.style.left = Math.max(8, right - 44) + 'px'; fsBtn.style.top = top + 'px' // reported for diagnostics/tests
   }

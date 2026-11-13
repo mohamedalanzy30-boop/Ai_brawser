@@ -8,7 +8,7 @@ const ENGINE = path.resolve(__dirname, '../android/app/src/main/assets/engine.js
   page.on('console', m => { if (/AIB|Error/.test(m.text())) console.log('   ', m.text()) })
   await page.route('https://test.local/', r => r.fulfill({ contentType: 'text/html', body: '<meta name=viewport content="width=device-width"><body style="margin:0"><video id=v muted autoplay playsinline src="/t.webm" style="width:400px;height:225px;display:block;margin-top:100px"></video></body>' }))
   await page.route('https://test.local/t.webm', r => r.fulfill({ contentType: 'video/webm', body: fs.readFileSync('/tmp/claude-0/t.webm') }))
-  await page.addInitScript(() => { window.__calls = []; window.AIBNative = { playing: (a, w, h) => window.__calls.push(['playing', a, w, h]), brightness: d => { window.__calls.push(['b', d]); return 0.5 }, volume: d => { window.__calls.push(['v', d]); return 0.6 }, pip: () => window.__calls.push(['pip']) } })
+  await page.addInitScript(() => { window.__minCfg0 = { gestures: true } }); await page.addInitScript(() => { window.__calls = []; window.AIBNative = { playing: (a, w, h) => window.__calls.push(['playing', a, w, h]), brightness: d => { window.__calls.push(['b', d]); return 0.5 }, volume: d => { window.__calls.push(['v', d]); return 0.6 }, pip: () => window.__calls.push(['pip']) } })
   await page.goto('https://test.local/')
   await page.addScriptTag({ content: fs.readFileSync(ENGINE, 'utf8') })
   await page.waitForFunction(() => document.getElementById('v').readyState >= 2)
