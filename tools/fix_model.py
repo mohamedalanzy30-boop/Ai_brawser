@@ -18,4 +18,5 @@ onnx.checker.check_model(m)
 print('input', inp.name, [d.dim_value for d in m.graph.input[0].type.tensor_type.shape.dim],
       'output', m.graph.output[0].name, [d.dim_value for d in m.graph.output[0].type.tensor_type.shape.dim],
       'ops', sorted({n.op_type for n in m.graph.node}))
+m.ir_version = min(m.ir_version, 9)  # ONNX Runtime on the phone reads up to IR 10
 onnx.save(m, dst)

@@ -96,12 +96,13 @@ class MainActivity : Activity() {
         "images" to "تحسين الصور",
         "adblock" to "حظر الإعلانات والمتتبعات (أسرع وأخف)",
         "popups" to "منع النوافذ المنبثقة والتحويلات الإعلانية",
+        "autoNative" to "فتح الأفلام تلقائياً في المشغّل الأصلي (AI)",
         "gestures" to "تحكم المشغّل: نقر مزدوج ±10ث، سحب للسطوع والصوت",
         "protect" to "حماية متقدمة: تصفح آمن، HTTPS إجباري، إزالة روابط التتبع، منع الكاميرا والموقع",
         "refresh" to "مطابقة معدل تحديث الشاشة للفيديو (حتى 120Hz)",
         "brightness" to "سطوع أعلى في ملء الشاشة"
     )
-    private val defaults = mapOf("enabled" to true, "neural" to true, "temporal2" to false, "tone" to true, "interp" to false, "images" to true, "adblock" to true, "popups" to true, "gestures" to true, "protect" to true, "refresh" to true, "brightness" to false)
+    private val defaults = mapOf("enabled" to true, "neural" to true, "temporal2" to false, "tone" to true, "interp" to false, "images" to true, "adblock" to true, "popups" to true, "gestures" to true, "autoNative" to true, "protect" to true, "refresh" to true, "brightness" to false)
     private val targets = intArrayOf(0, 720, 1080, 1440, 2160)
     private val targetLabels = arrayOf("تلقائي", "720p", "1080p", "2K", "4K")
     private val denoise = floatArrayOf(0f, 0.2f, 0.35f, 0.6f)
@@ -179,6 +180,13 @@ class MainActivity : Activity() {
 
     inner class Bridge {
         @android.webkit.JavascriptInterface fun openNative(src: String, pos: Double) { ui.post { this@MainActivity.openNative(src, pos) } }
+        /** auto mode: only switches when a real video address is known; otherwise the page keeps playing */
+        @android.webkit.JavascriptInterface fun autoNative(src: String, pos: Double): Boolean {
+            if (!prefs.getBoolean("autoNative", true)) return false
+            if (!src.startsWith("http") && media.isEmpty()) return false
+            ui.post { this@MainActivity.openNative(src, pos) }
+            return true
+        }
         @android.webkit.JavascriptInterface fun playing(on: Boolean, w: Int, h: Int) {
             videoPlaying = on
             if (w > 0 && h > 0) { val r = w.toDouble() / h; videoAspect = if (r > 2.39) android.util.Rational(239, 100) else if (r < 0.42) android.util.Rational(42, 100) else android.util.Rational(w, h) }
@@ -280,7 +288,7 @@ class MainActivity : Activity() {
         web = WebView(this).apply { setBackgroundColor(BG) }
 
         // bottom bar (thumb friendly): back | address | enhance
-        val back = iconButton("‹", 30) { goBackOnce() }
+        val back = iconButton("‹", 30) { goBackOnce() }.apply { setOnLongClickListener { showHistory(); true } }
         urlBar = EditText(this).apply {
             setSingleLine(); hint = "ابحث أو اكتب عنوان"; setHintTextColor(0xFF8A8A8A.toInt()); setTextColor(Color.WHITE)
             textSize = 15f; background = pill(SURFACE, 22); setPadding(dp(16), 0, dp(16), 0)
@@ -431,6 +439,7 @@ class MainActivity : Activity() {
                 if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
             }
             override fun onPageFinished(view: WebView, url: String) {
+                recordHistory(url, view.title)
                 if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
             }
         }
@@ -553,6 +562,11 @@ class MainActivity : Activity() {
         col.addView(chips(targetLabels, targets.indexOf(prefs.getInt("target", 0)).coerceAtLeast(0)) { i -> prefs.edit().putInt("target", targets[i]).apply(); applyConfig() })
         col.addView(label("إزالة الضوضاء وتكسّر الضغط"))
         col.addView(chips(denoiseLabels, denoise.indexOfFirst { it == prefs.getFloat("denoise", 0.35f) }.coerceAtLeast(2)) { i -> prefs.edit().putFloat("denoise", denoise[i]).apply(); applyConfig() })
+        col.addView(label("التصفح"))
+        col.addView(TextView(this).apply {
+            text = "🕘 السجل"; textSize = 15f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
+            background = pill(SURFACE, 18); setOnClickListener { dlg.dismiss(); showHistory() }
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)))
         col.addView(label("التشخيص"))
         col.addView(TextView(this).apply {
             text = "📋 سجل الأخطاء (للنسخ)"; textSize = 15f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
@@ -564,6 +578,56 @@ class MainActivity : Activity() {
             setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         }
         dlg.show()
+    }
+
+    /* ---------- browsing history (on the phone only) ---------- */
+    private val histFile by lazy { java.io.File(filesDir, "history.json") }
+    private val history: org.json.JSONArray by lazy { try { org.json.JSONArray(histFile.readText()) } catch (e: Exception) { org.json.JSONArray() } }
+    private fun saveHistory() { val txt = history.toString(); Thread { try { histFile.writeText(txt) } catch (e: Exception) { } }.start() }
+    private fun recordHistory(url: String, title: String?) {
+        val host = android.net.Uri.parse(url).host
+        if (!url.startsWith("http") || isAd(host)) return
+        val n = history.length()
+        val last = if (n > 0) history.getJSONObject(n - 1) else null
+        if (last != null && last.optString("u") == url) { if (!title.isNullOrBlank()) last.put("t", title); saveHistory(); return }
+        history.put(JSONObject().put("u", url).put("t", title ?: "").put("d", System.currentTimeMillis()))
+        while (history.length() > 1500) history.remove(0)
+        saveHistory()
+    }
+    private fun showHistory() {
+        val dlg = Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(BG); setPadding(dp(12), dp(12), dp(12), dp(12)) }
+        val search = EditText(this).apply { hint = "🔍 ابحث في السجل"; setHintTextColor(0xFF8A8A8A.toInt()); setTextColor(Color.WHITE); background = pill(SURFACE, 20); setPadding(dp(16), 0, dp(16), 0); setSingleLine() }
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val fmt = java.text.SimpleDateFormat("d/M HH:mm", java.util.Locale.US)
+        fun fill(q: String) {
+            list.removeAllViews(); var shown = 0
+            for (i in history.length() - 1 downTo 0) {
+                val o = history.getJSONObject(i); val u = o.optString("u"); val t = o.optString("t").ifBlank { android.net.Uri.parse(u).host ?: u }
+                if (q.isNotEmpty() && !u.contains(q, true) && !t.contains(q, true)) continue
+                list.addView(TextView(this).apply {
+                    text = "$t\n${fmt.format(java.util.Date(o.optLong("d")))} · ${android.net.Uri.parse(u).host}"; textSize = 14f; setTextColor(Color.WHITE)
+                    setPadding(dp(8), dp(10), dp(8), dp(10)); maxLines = 2
+                    setOnClickListener { dlg.dismiss(); web.loadUrl(u) }
+                })
+                if (++shown >= 300) break
+            }
+            if (shown == 0) list.addView(TextView(this).apply { text = "لا يوجد شيء"; setTextColor(0xFF9A9A9A.toInt()); setPadding(dp(8), dp(16), dp(8), dp(16)) })
+        }
+        search.addTextChangedListener(object : android.text.TextWatcher {
+            override fun afterTextChanged(e: android.text.Editable?) { fill(e?.toString()?.trim() ?: "") }
+            override fun beforeTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+            override fun onTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+        })
+        val btns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        fun btn(t: String, f: () -> Unit) = TextView(this).apply { text = t; textSize = 15f; gravity = Gravity.CENTER; setTextColor(Color.WHITE); background = pill(ACCENT, 18); setOnClickListener { f() } }
+        btns.addView(btn("مسح السجل") { while (history.length() > 0) history.remove(0); saveHistory(); fill("") }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(0, 0, dp(6), 0) })
+        btns.addView(btn("إغلاق") { dlg.dismiss() }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, 0, 0) })
+        col.addView(TextView(this).apply { text = "🕘 السجل"; textSize = 19f; setTextColor(Color.WHITE); setPadding(dp(4), 0, 0, dp(10)) })
+        col.addView(search, LinearLayout.LayoutParams(-1, dp(44)))
+        col.addView(ScrollView(this).apply { addView(list) }, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(8); bottomMargin = dp(8) })
+        col.addView(btns)
+        dlg.setContentView(col); fill(""); dlg.show()
     }
 
     private fun showLog() {

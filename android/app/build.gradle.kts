@@ -40,13 +40,13 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
-    // wasm / onnx must be stored uncompressed so they can be streamed from assets
-    androidResources { noCompress += listOf("wasm", "onnx", "mjs") }
+    // assets are read through streams, so they can be compressed (wasm shrinks ~4x)
     packaging {
         jniLibs {
             useLegacyPackaging = true // extracted to nativeLibraryDir, where the NPU driver looks for its DSP library
-            // keep only the Hexagon generations of current Snapdragon phones (8 Gen 2 = V73, 8 Gen 3 = V75, 8 Elite = V79, next = V81)
-            excludes += listOf("**/libQnnDsp*.so", "**/libQnnGpu.so", "**/libQnnHtpV68*.so", "**/libQnnHtpV69*.so")
+            // keep only Hexagon V79 = Snapdragon 8 Elite (Galaxy S25 Ultra)
+            excludes += listOf("**/libQnnDsp*.so", "**/libQnnGpu.so", "**/libQnnHtpV68*.so", "**/libQnnHtpV69*.so",
+                "**/libQnnHtpV73*.so", "**/libQnnHtpV75*.so", "**/libQnnHtpV81*.so")
         }
     }
 }

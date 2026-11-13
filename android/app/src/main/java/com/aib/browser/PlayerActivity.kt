@@ -260,20 +260,26 @@ class PlayerActivity : Activity() {
                 // the NPU (Hexagon HTP) user-space driver finds its DSP-side library through ADSP_LIBRARY_PATH
                 android.system.Os.setenv("ADSP_LIBRARY_PATH", ctx.applicationInfo.nativeLibraryDir + ";/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp", true)
                 val e = OrtEnvironment.getEnvironment(); env = e
-                val bytes = ctx.assets.open("model/realesr-x4v3-640x360.onnx").use { it.readBytes() }
-                val ctxFile = java.io.File(ctx.filesDir, "sr_npu_ctx.onnx")
-                val tries = listOf("npu", "cpu")
-                for (t in tries) {
+                fun model(n: String) = try { ctx.assets.open("model/$n").use { it.readBytes() } } catch (x: Exception) { null }
+                // fastest first: 16-bit/8-bit quantized model on the NPU, then the float model on the NPU, then CPU
+                val tries = listOf("npu-a16w8" to "realesr-x4v3-640x360-a16w8.onnx", "npu" to "realesr-x4v3-640x360.onnx", "cpu" to "realesr-x4v3-640x360.onnx")
+                for ((t, file) in tries) {
+                    val bytes = model(file) ?: continue
+                    val ctxFile = java.io.File(ctx.filesDir, "sr_ctx_$t.onnx")
                     try {
-                        val so = OrtSession.SessionOptions()
-                        so.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                        if (t == "npu") {
-                            so.addConfigEntry("session.disable_cpu_ep_fallback", "1") // all-or-nothing on the NPU
-                            so.addConfigEntry("ep.context_enable", "1"); so.addConfigEntry("ep.context_file_path", ctxFile.absolutePath)
-                            so.addQnn(mapOf("backend_path" to "libQnnHtp.so", "htp_performance_mode" to "burst", "enable_htp_fp16_precision" to "1", "htp_graph_finalization_optimization_mode" to "3"))
-                        } else so.addXnnpack(mapOf("intra_op_num_threads" to "4"))
+                        fun opts(dump: Boolean) = OrtSession.SessionOptions().apply {
+                            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                            if (t.startsWith("npu")) {
+                                addConfigEntry("session.disable_cpu_ep_fallback", "1") // all-or-nothing on the NPU
+                                // first run compiles the graph for the NPU (slow) and saves it; later runs load the saved one
+                                if (dump) { addConfigEntry("ep.context_enable", "1"); addConfigEntry("ep.context_file_path", ctxFile.absolutePath) }
+                                addQnn(mapOf("backend_path" to "libQnnHtp.so", "htp_performance_mode" to "burst", "htp_graph_finalization_optimization_mode" to "3") + (if (t == "npu") mapOf("enable_htp_fp16_precision" to "1") else emptyMap()))
+                            } else addXnnpack(mapOf("intra_op_num_threads" to "4"))
+                        }
                         val t0 = System.currentTimeMillis()
-                        val s = if (t == "npu" && ctxFile.exists() && ctxFile.length() > 0) try { e.createSession(ctxFile.absolutePath, so) } catch (x: Exception) { ctxFile.delete(); e.createSession(bytes, so) } else e.createSession(bytes, so)
+                        val s = if (t.startsWith("npu") && ctxFile.exists() && ctxFile.length() > 0)
+                            try { e.createSession(ctxFile.absolutePath, opts(false)) } catch (x: Exception) { ctxFile.delete(); e.createSession(bytes, opts(true)) }
+                        else { ctxFile.delete(); e.createSession(bytes, opts(t.startsWith("npu"))) }
                         addLog("[player] SR session on $t in ${System.currentTimeMillis() - t0}ms")
                         inBuf = ByteBuffer.allocateDirect(3 * IN_W * IN_H * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
                         outBuf = ByteBuffer.allocateDirect(3 * OUT_W * OUT_H * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
@@ -281,7 +287,7 @@ class PlayerActivity : Activity() {
                         outTensor = OnnxTensor.createTensor(e, outBuf, longArrayOf(1, 3, OUT_H.toLong(), OUT_W.toLong()))
                         backend = t; session = s
                         break
-                    } catch (x: Throwable) { addLog("[player] SR on $t failed: ${x.message?.take(200)}"); if (t == "npu") ctxFile.delete() }
+                    } catch (x: Throwable) { addLog("[player] SR on $t failed: ${x.message?.take(200)}"); if (t.startsWith("npu")) ctxFile.delete() }
                 }
                 if (session == null) backend = "unavailable"
             } catch (x: Throwable) { backend = "error"; addLog("[player] SR load error: ${x.message?.take(200)}") }
@@ -341,7 +347,7 @@ class PlayerActivity : Activity() {
         }
 
         private fun statusText(vw: Int, vh: Int, ai: Boolean): String {
-            val b = when (backend) { "npu" -> "NPU"; "cpu" -> "CPU"; "loading" -> "…"; else -> backend }
+            val b = when (backend) { "npu-a16w8" -> "NPU (int)"; "npu" -> "NPU"; "cpu" -> "CPU"; "loading" -> "…"; else -> backend }
             return when {
                 !aiWanted -> "${vw}×${vh}  AI مطفأ"
                 ai -> "✨ ${vw}×${vh} → 4× عصبي على $b  ${emaMs.toInt()}ms"

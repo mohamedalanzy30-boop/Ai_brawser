@@ -9,7 +9,7 @@
   const HOST = 'https://appassets.min.local/'
   const cfg = {
     enabled: true, target: 1440, sharpness: 0.6, neural: true, denoise: 0.35,
-    tone: true, temporal: false, interp: false, interpNeural: true, images: true, gestures: true
+    tone: true, temporal: false, interp: false, interpNeural: true, images: true, gestures: true, autoNative: true
   }
   Object.assign(cfg, window.__minCfg0 || {})
   const nativeShort = () => Math.round(Math.min(screen.width, screen.height) * (window.devicePixelRatio || 1))
@@ -585,6 +585,19 @@ void main(){
       if (f) { pipOn(f); if (window.parent !== window) window.parent.postMessage({ __aibPipFrame: true }, '*') }
     }
   })
+  // auto: a real movie (>= 10 min) that starts playing moves to the native AI player (once per video)
+  document.addEventListener('play', (e) => {
+    const v = e.target
+    if (!(v instanceof HTMLVideoElement) || v.__aibAuto || !cfg.autoNative || !NATIVE || !NATIVE.autoNative || v.mediaKeys) return
+    const go = () => {
+      if (v.__aibAuto || v.paused) return
+      const r = v.getBoundingClientRect()
+      if (!(v.duration >= 600) || r.width < 200) return
+      v.__aibAuto = true
+      try { if (NATIVE.autoNative(v.currentSrc || v.src || '', v.currentTime || 0)) v.pause() } catch (err) { /* ignore */ }
+    }
+    if (v.duration >= 600) go(); else v.addEventListener('durationchange', go, { once: true })
+  }, true)
   // tell the app when a video plays here (enables PiP on Home and the ad-redirect guard)
   let reported = false
   setInterval(() => {
@@ -641,7 +654,7 @@ void main(){
   let timer = null
   new window.MutationObserver(() => { clearTimeout(timer); timer = setTimeout(scan, 400) }).observe(document, { childList: true, subtree: true })
   document.addEventListener('visibilitychange', () => { if (!document.hidden) state.videos.forEach((_, v) => loop(v)) })
-  const CFG_KEYS = ['enabled', 'target', 'sharpness', 'neural', 'denoise', 'tone', 'temporal', 'interp', 'interpNeural', 'images', 'gestures']
+  const CFG_KEYS = ['enabled', 'target', 'sharpness', 'neural', 'denoise', 'tone', 'temporal', 'interp', 'interpNeural', 'images', 'gestures', 'autoNative']
   function forward (c) { // push the config into every child frame (players live in iframes)
     for (let i = 0; i < window.frames.length; i++) { try { window.frames[i].postMessage({ __aibCfg: c }, '*') } catch (e) { /* ignore */ } }
   }

@@ -26,7 +26,8 @@ jobs:
           npm pack onnxruntime-web@1.31.1 --silent
           tar -xzf onnxruntime-web-*.tgz package/dist
           cp package/dist/ort.webgpu.min.js ort/
-          cp package/dist/ort-wasm-simd-threaded*.mjs package/dist/ort-wasm-simd-threaded*.wasm ort/
+          # the WebGPU bundle only loads the asyncify build; the other three variants were 60 MB of dead weight
+          cp package/dist/ort-wasm-simd-threaded.asyncify.mjs package/dist/ort-wasm-simd-threaded.asyncify.wasm ort/
           rm -rf package onnxruntime-web-*.tgz
           curl -fL -o model/realesr-general-x4v3.onnx \
             https://huggingface.co/CoderViking/realesr-general-x4v3-onnx/resolve/main/realesr-general-x4v3.onnx
@@ -36,6 +37,14 @@ jobs:
           # fixed-size copy of the SR model for the NPU (native player)
           pip install --quiet --only-binary=:all: onnx
           python3 "$GITHUB_WORKSPACE/tools/fix_model.py" model/realesr-general-x4v3.onnx model/realesr-x4v3-640x360.onnx 360 640
+          # A16W8 quantized copy for the NPU, calibrated on real video frames (Big Buck Bunny, CC-BY Blender Foundation).
+          # Optional: if anything here fails the app simply uses the float model.
+          ( pip install --quiet --only-binary=:all: onnxruntime imageio-ffmpeg &&
+            FFMPEG=$(python3 -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())") &&
+            "$FFMPEG" -loglevel error -i https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4 \
+              -vf "select='not(mod(n\,600))',scale=640:360:flags=bicubic" -vsync vfr -frames:v 24 -f rawvideo -pix_fmt rgb24 "$RUNNER_TEMP/calib.rgb" &&
+            python3 "$GITHUB_WORKSPACE/tools/quantize_qnn.py" model/realesr-x4v3-640x360.onnx "$RUNNER_TEMP/calib.rgb" model/realesr-x4v3-640x360-a16w8.onnx &&
+            rm -f model/*.pre.onnx ) || echo "::warning::quantized model skipped"
           # ad/tracker host list (StevenBlack/hosts, MIT), bundled so blocking needs no network at runtime
           # + HaGeZi Pro (GPL-3.0): covers the pop-under / redirect ad networks used by movie sites
           { curl -fsSL https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts \
