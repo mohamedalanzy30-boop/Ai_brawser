@@ -457,7 +457,7 @@ class PlayerActivity : Activity() {
         private var eglSurf: EGLSurface = EGL14.EGL_NO_SURFACE
         private var oesTex = 0; private var st: SurfaceTexture? = null; private var videoSurface: Surface? = null
         private var progOes = 0; private var progPlanes = 0; private var progDirect = 0
-        private var fbo = 0; private var fboTex = 0; private val planeTex = IntArray(3)
+        private var fbo = 0; private var fboTex = 0; private var outTex = 0
         private var viewW = 1; private var viewH = 1; @Volatile private var vidW = 0; @Volatile private var vidH = 0; @Volatile private var par = 1f
         private val stMatrix = FloatArray(16)
         // neural
@@ -468,6 +468,16 @@ class PlayerActivity : Activity() {
         private val rgba = IntArray(IN_W * IN_H)
         private val planes = FloatArray(3 * IN_W * IN_H)
         private val LUT = FloatArray(256) { it / 255f }
+        // model output packed to RGBA8 on 4 cores: 4x less to upload than 3 float planes (44 MB -> 15 MB a frame) and the GPU filters it itself
+        private val outPix: ByteBuffer = ByteBuffer.allocateDirect(OUT_W * OUT_H * 4).order(ByteOrder.nativeOrder())
+        private val pool = java.util.concurrent.Executors.newFixedThreadPool(4)
+        private val tmp = Array(4) { Array(3) { FloatArray(OUT_W * 16) } }
+        private val tmpI = Array(4) { IntArray(OUT_W * 16) }
+        private val stage = DoubleArray(4); private var stageN = 0
+        private fun parallel(n: Int, body: (Int, Int, Int) -> Unit) {
+            val step = (n + 3) / 4
+            (0 until 4).map { j -> pool.submit(Runnable { val lo = j * step; val hi = Math.min(n, lo + step); if (lo < hi) body(j, lo, hi) }) }.forEach { it.get() }
+        }
         private var backend = "loading"; private var emaMs = 0.0; private var slowSince = 0L; private var disabledReason = ""
         private var lastFrameNs = 0L; private var fpsEma = 30.0; private var frames = 0
         private val content = FloatArray(4) // content rect inside the 640x360 model input (u0,v0,u1,v1)
@@ -478,7 +488,7 @@ class PlayerActivity : Activity() {
             videoSurface = Surface(st); onSurface(videoSurface!!)
             Thread { loadModel() }.start()
         }
-        fun stop() { h.post { try { session?.close(); inTensor?.close(); outTensor?.close() } catch (e: Exception) { }; session = null; st?.release(); videoSurface?.release(); EGL14.eglMakeCurrent(egl, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT); EGL14.eglDestroySurface(egl, eglSurf); EGL14.eglDestroyContext(egl, eglCtx); EGL14.eglTerminate(egl); thread.quitSafely() } }
+        fun stop() { h.post { try { session?.close(); inTensor?.close(); outTensor?.close() } catch (e: Exception) { }; session = null; st?.release(); videoSurface?.release(); EGL14.eglMakeCurrent(egl, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT); EGL14.eglDestroySurface(egl, eglSurf); EGL14.eglDestroyContext(egl, eglCtx); EGL14.eglTerminate(egl); pool.shutdown(); thread.quitSafely() } }
         fun setViewSize(w: Int, hh: Int) = h.post { viewW = w; viewH = hh }
         fun setVideoSize(w: Int, hh: Int, p: Float) { vidW = w; vidH = hh; par = if (p > 0) p else 1f; h.post { slowSince = 0; emaMs = 0.0; disabledReason = "" } }
 
@@ -561,24 +571,46 @@ class PlayerActivity : Activity() {
                 val inb = inBuf!!; val px = IN_W * IN_H; pixels.rewind()
                 pixels.asIntBuffer().get(rgba); pixels.rewind()
                 val pl = planes; val little = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN
-                for (i in 0 until px) {
-                    val c = rgba[i]
-                    val r = if (little) c and 255 else (c ushr 24) and 255
-                    val g = (if (little) c ushr 8 else c ushr 16) and 255
-                    val b = (if (little) c ushr 16 else c ushr 8) and 255
-                    pl[i] = LUT[r]; pl[px + i] = LUT[g]; pl[2 * px + i] = LUT[b]
+                val t1 = System.nanoTime()
+                parallel(px) { _, lo, hi ->
+                    for (i in lo until hi) {
+                        val c = rgba[i]
+                        val r = if (little) c and 255 else (c ushr 24) and 255
+                        val g = (if (little) c ushr 8 else c ushr 16) and 255
+                        val b = (if (little) c ushr 16 else c ushr 8) and 255
+                        pl[i] = LUT[r]; pl[px + i] = LUT[g]; pl[2 * px + i] = LUT[b]
+                    }
                 }
                 inb.position(0); inb.put(pl); inb.position(0)
                 // 3) NPU inference into the pinned output buffer
+                val t2 = System.nanoTime()
                 s!!.run(mapOf(s.inputNames.first() to inTensor!!), mapOf(s.outputNames.first() to outTensor!!)).close()
-                // 4) planes -> GPU (3 x R32F), shader converts and draws
-                val ob = outBuf!!; val n = OUT_W * OUT_H
-                for (c in 0 until 3) {
-                    GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + c); GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, planeTex[c])
-                    ob.position(c * n); GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, OUT_W, OUT_H, GLES30.GL_RED, GLES30.GL_FLOAT, ob.slice())
+                // 4) float planes -> RGBA8 (4 cores, 16 rows at a time), one 15 MB upload, GPU bilinear
+                val t3 = System.nanoTime()
+                val ob = outBuf!!; val n = OUT_W * OUT_H; val opx = outPix.asIntBuffer()
+                parallel(OUT_H) { j, r0, r1 ->
+                    val src = ob.duplicate(); val dst = opx.duplicate(); val tr = tmp[j]; val ti = tmpI[j]
+                    var row = r0
+                    while (row < r1) {
+                        val rows = Math.min(16, r1 - row); val off = row * OUT_W; val len = rows * OUT_W
+                        for (c in 0 until 3) { src.position(c * n + off); src.get(tr[c], 0, len) }
+                        val rr = tr[0]; val gg = tr[1]; val bb = tr[2]
+                        for (i in 0 until len) {
+                            val r = (rr[i] * 255f + 0.5f).toInt().coerceIn(0, 255)
+                            val g = (gg[i] * 255f + 0.5f).toInt().coerceIn(0, 255)
+                            val b = (bb[i] * 255f + 0.5f).toInt().coerceIn(0, 255)
+                            ti[i] = if (little) r or (g shl 8) or (b shl 16) or (255 shl 24) else (r shl 24) or (g shl 16) or (b shl 8) or 255
+                        }
+                        dst.position(off); dst.put(ti, 0, len)
+                        row += rows
+                    }
                 }
-                ob.position(0)
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE0); GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, outTex)
+                GLES30.glTexSubImage2D(GLES30.GL_TEXTURE_2D, 0, 0, 0, OUT_W, OUT_H, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, outPix.rewind())
                 drawToScreen(progPlanes, dispAspect)
+                val t4 = System.nanoTime()
+                stage[0] += (t1 - t0) / 1e6; stage[1] += (t2 - t1) / 1e6; stage[2] += (t3 - t2) / 1e6; stage[3] += (t4 - t3) / 1e6
+                if (++stageN == 120) { addLog("[player] SR per frame: read ${"%.1f".format(stage[0] / 120)}ms, in ${"%.1f".format(stage[1] / 120)}ms, NPU ${"%.1f".format(stage[2] / 120)}ms, out ${"%.1f".format(stage[3] / 120)}ms"); stage.fill(0.0); stageN = 0 }
                 ms = (System.nanoTime() - t0) / 1e6
                 emaMs = if (emaMs == 0.0) ms else emaMs * 0.85 + ms * 0.15
                 // NPU too slow for this video's frame rate for 3 s -> stay smooth, fall back to the GPU shader
@@ -633,9 +665,8 @@ class PlayerActivity : Activity() {
                 drawOes(p, flipY = false)
             } else {
                 GLES30.glUseProgram(p)
-                for (c in 0 until 3) { GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + c); GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, planeTex[c]); GLES30.glUniform1i(GLES30.glGetUniformLocation(p, "p$c"), c) }
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE0); GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, outTex); GLES30.glUniform1i(GLES30.glGetUniformLocation(p, "img"), 0)
                 GLES30.glUniform4f(GLES30.glGetUniformLocation(p, "crop"), content[0], content[1], content[2], content[3])
-                GLES30.glUniform2f(GLES30.glGetUniformLocation(p, "texel"), 1f / OUT_W, 1f / OUT_H)
                 drawQuad(p)
             }
         }
@@ -673,14 +704,12 @@ class PlayerActivity : Activity() {
             GLES30.glGenFramebuffers(1, t, 0); fbo = t[0]; GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo)
             GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, fboTex, 0)
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
-            // model output planes (R32F is not filterable on every GPU: sample with NEAREST + manual bilinear)
-            GLES30.glGenTextures(3, planeTex, 0)
-            for (c in 0 until 3) {
-                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, planeTex[c])
-                GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_R32F, OUT_W, OUT_H, 0, GLES30.GL_RED, GLES30.GL_FLOAT, null)
-                GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_NEAREST); GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
-                GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE); GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
-            }
+            // model output as one RGBA8 texture (filterable everywhere: hardware bilinear)
+            GLES30.glGenTextures(1, t, 0); outTex = t[0]; GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, outTex)
+            GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, OUT_W, OUT_H, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR); GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE); GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 4)
             val vsOes = """#version 300 es
 in vec2 pos; uniform mat4 stm; uniform float flip; out vec2 uv;
 void main(){ vec2 t = pos*0.5+0.5; if (flip > 0.5) t.y = 1.0 - t.y; uv = (stm*vec4(t,0.,1.)).xy; gl_Position = vec4(pos,0.,1.); }"""
@@ -696,14 +725,12 @@ void main(){ vec3 c=texture(tex,uv).rgb; vec3 n=texture(tex,uv+vec2(0.,texel.y))
   vec3 mn=min(c,min(min(n,s),min(e,w))), mx=max(c,max(max(n,s),max(e,w)));
   vec3 amp=sqrt(clamp(min(mn,2.-mx)/max(mx,1e-4),0.,1.)); vec3 k=-amp/mix(8.,5.,0.5);
   o=vec4(clamp((c+(n+s+e+w)*k)/(1.+4.*k),0.,1.),1.); }""")
-            // neural path: planes (rows top-first) -> RGB, cropped to the real picture
+            // neural path: model output (rows top-first), cropped to the real picture
             progPlanes = program("""#version 300 es
 in vec2 pos; uniform vec4 crop; out vec2 uv;
 void main(){ vec2 t = pos*0.5+0.5; t.y = 1.0 - t.y; uv = mix(crop.xy, crop.zw, t); gl_Position = vec4(pos,0.,1.); }""", """#version 300 es
-precision highp float; uniform highp sampler2D p0, p1, p2; uniform vec2 texel; in vec2 uv; out vec4 o;
-float bl(highp sampler2D s, vec2 u){ vec2 f=u/texel-0.5; vec2 i=floor(f); vec2 w=f-i; vec2 b=(i+0.5)*texel;
-  return mix(mix(texture(s,b).r, texture(s,b+vec2(texel.x,0.)).r, w.x), mix(texture(s,b+vec2(0.,texel.y)).r, texture(s,b+texel).r, w.x), w.y); }
-void main(){ o = vec4(clamp(vec3(bl(p0,uv), bl(p1,uv), bl(p2,uv)),0.,1.), 1.); }""")
+precision mediump float; uniform sampler2D img; in vec2 uv; out vec4 o;
+void main(){ o = vec4(texture(img, uv).rgb, 1.); }""")
         }
     }
 }
