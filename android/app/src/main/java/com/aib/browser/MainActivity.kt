@@ -112,6 +112,9 @@ class MainActivity : Activity() {
         "autoNative" to true, "gestures" to false, "brightness" to false,
         "adblock" to true, "popups" to true, "protect" to true, "adult" to false, "dark" to true, "cookies" to true, "noAutoplay" to true
     )
+    private val zooms = intArrayOf(0, 90, 110, 125)
+    private val zoomLabels = arrayOf("حسب الجوال", "أصغر", "أكبر", "كبير جداً")
+    private fun textZoomNow(): Int = prefs.getInt("textZoom", 0).let { if (it > 0) it else Math.round(resources.configuration.fontScale * 100) }
     private val targets = intArrayOf(0, 720, 1080, 1440, 2160)
     private val targetLabels = arrayOf("تلقائي", "720p", "1080p", "2K", "4K")
     private val denoise = floatArrayOf(0f, 0.2f, 0.35f, 0.6f)
@@ -404,7 +407,10 @@ class MainActivity : Activity() {
             setSupportZoom(true); builtInZoomControls = true; displayZoomControls = false
             useWideViewPort = true; loadWithOverviewMode = true
             standardFontFamily = "sans-serif"; sansSerifFontFamily = "sans-serif"; fixedFontFamily = "monospace"; serifFontFamily = "serif"
-            textZoom = 100
+            // text follows the phone's font size setting (or the size picked in ✨), and desktop-only pages get readable
+            // text the way Chrome does it (font boosting) instead of tiny zoomed-out text
+            textZoom = textZoomNow()
+            @Suppress("DEPRECATION") layoutAlgorithm = WebSettings.LayoutAlgorithm.TEXT_AUTOSIZING
             setSupportMultipleWindows(true); javaScriptCanOpenWindowsAutomatically = false
             offscreenPreRaster = true
             // look like Chrome, not like an embedded WebView: Google sign-in and some sites refuse WebViews
@@ -728,6 +734,9 @@ class MainActivity : Activity() {
                 media.lastOrNull { !it.hls }?.let { m -> link("تحميل الفيديو الحالي") { dlg.dismiss(); download(m.url, web.settings.userAgentString, null, "video/mp4") } }
                 link("التحميلات") { dlg.dismiss(); showDownloads() }
                 link("الصفحات المحفوظة", "${savedDir.listFiles()?.size ?: 0}") { dlg.dismiss(); showSaved() }
+            }
+            Ui.Group(this, col, "حجم النص في المواقع").segmented(zoomLabels, zooms.indexOf(prefs.getInt("textZoom", 0)).coerceAtLeast(0)) { i ->
+                prefs.edit().putInt("textZoom", zooms[i]).apply(); web.settings.textZoom = textZoomNow()
             }
             Ui.Group(this, col, "عام").apply {
                 toggle("الوضع الداكن لكل المواقع", on("dark")) { set("dark", it); applyDark(); web.reload() }
