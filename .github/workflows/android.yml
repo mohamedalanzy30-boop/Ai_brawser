@@ -34,12 +34,17 @@ jobs:
           # fixed-size copy of the SR model for the NPU (native player)
           pip install --quiet --only-binary=:all: onnx
           python3 "$GITHUB_WORKSPACE/tools/fix_model.py" model/realesr-general-x4v3.onnx model/realesr-x4v3-640x360.onnx 360 640
-          # A16W8 quantized copy for the NPU, calibrated on real video frames (Big Buck Bunny, CC-BY Blender Foundation).
+          # A16W8 quantized copy for the NPU, calibrated on real video frames (Big Buck Bunny, CC-BY Blender Foundation; first mirror that answers).
           # Optional: if anything here fails the app simply uses the float model.
           ( pip install --quiet --only-binary=:all: onnxruntime imageio-ffmpeg &&
             FFMPEG=$(python3 -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())") &&
-            "$FFMPEG" -loglevel error -i https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4 \
-              -vf "select='not(mod(n\,600))',scale=640:360:flags=bicubic" -fps_mode vfr -frames:v 24 -f rawvideo -pix_fmt rgb24 "$RUNNER_TEMP/calib.rgb" &&
+            for SRC in https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4 \
+                       https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_5MB.mp4 \
+                       https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_480p_h264.mov; do
+              "$FFMPEG" -loglevel error -y -i "$SRC" -t 600 \
+                -vf "select='not(mod(n\,300))',scale=640:360:flags=bicubic" -fps_mode vfr -frames:v 24 -f rawvideo -pix_fmt rgb24 "$RUNNER_TEMP/calib.rgb" \
+                && [ -s "$RUNNER_TEMP/calib.rgb" ] && echo "calibration frames from $SRC" && break
+            done && [ -s "$RUNNER_TEMP/calib.rgb" ] &&
             python3 "$GITHUB_WORKSPACE/tools/quantize_qnn.py" model/realesr-x4v3-640x360.onnx "$RUNNER_TEMP/calib.rgb" model/realesr-x4v3-640x360-a16w8.onnx &&
             rm -f model/*.pre.onnx ) || echo "::warning::quantized model skipped"
           # ad/tracker host list (StevenBlack/hosts, MIT), bundled so blocking needs no network at runtime

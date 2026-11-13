@@ -491,11 +491,11 @@ class PlayerActivity : Activity() {
                         fun opts(dump: Boolean) = OrtSession.SessionOptions().apply {
                             setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
                             if (t.startsWith("npu")) {
-                                addConfigEntry("session.disable_cpu_ep_fallback", "1") // all-or-nothing on the NPU
+                                // the few layers the NPU cannot run (seen on the phone: the float model) run on the CPU instead of failing the whole model
                                 // first run compiles the graph for the NPU (slow) and saves it; later runs load the saved one
                                 if (dump) { addConfigEntry("ep.context_enable", "1"); addConfigEntry("ep.context_file_path", ctxFile.absolutePath) }
                                 addQnn(mapOf("backend_path" to "libQnnHtp.so", "htp_performance_mode" to "burst", "htp_graph_finalization_optimization_mode" to "3") + (if (t == "npu") mapOf("enable_htp_fp16_precision" to "1") else emptyMap()))
-                            } else addXnnpack(mapOf("intra_op_num_threads" to "4"))
+                            } else setIntraOpNumThreads(4) // this ORT build has no XNNPACK: plain CPU kernels
                         }
                         val t0 = System.currentTimeMillis()
                         val s = if (t.startsWith("npu") && ctxFile.exists() && ctxFile.length() > 0)
