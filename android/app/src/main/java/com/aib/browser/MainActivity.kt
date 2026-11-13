@@ -62,6 +62,10 @@ class MainActivity : Activity() {
     private lateinit var bottomBar: LinearLayout
     private lateinit var addressPill: FrameLayout
     private lateinit var addressText: TextView
+    private lateinit var lock: ImageView
+    /** hosts whose http address we switched to https: if https fails, they get the http page instead */
+    private val upgraded = HashSet<String>()
+    private val noHttps = HashSet<String>()
     private lateinit var urlEdit: EditText
     private lateinit var progress: ProgressBar
     private lateinit var backBtn: ImageView
@@ -317,7 +321,7 @@ class MainActivity : Activity() {
         // address pill: lock + domain (centered, like Safari); tap = edit; swipe left/right = forward/back
         addressPill = FrameLayout(this).apply { background = Ui.round(this@MainActivity, Ui.FIELD, 13) }
         val shown = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        val lock = Ui.icon(this, R.drawable.ic_lock, Ui.LABEL)
+        lock = Ui.icon(this, R.drawable.ic_lock, Ui.LABEL)
         addressText = Ui.text(this, "", 16f).apply { setSingleLine(); ellipsize = android.text.TextUtils.TruncateAt.END }
         shown.addView(lock, LinearLayout.LayoutParams(dp(14), dp(14)).apply { marginEnd = dp(6) })
         shown.addView(addressText)
@@ -375,6 +379,7 @@ class MainActivity : Activity() {
             u.host!!.contains("google.") && u.path == "/search" -> u.getQueryParameter("q") ?: u.host
             else -> u.host!!.removePrefix("www.")
         }
+        lock.visibility = if (u.scheme == "https") View.VISIBLE else View.GONE
         backBtn.alpha = if (web.canGoBack()) 1f else 0.35f
         fwdBtn.alpha = if (web.canGoForward()) 1f else 0.35f
     }
@@ -504,6 +509,13 @@ class MainActivity : Activity() {
         }
         override fun onReceivedError(view: WebView, req: WebResourceRequest, err: WebResourceError) {
             if (req.isForMainFrame || req.url.host == ASSET_HOST) addLog("[LOAD ERROR] ${req.url} -> ${err.description}")
+            // the site has no working https: open its plain http page (old sites, some movie mirrors)
+            val host = req.url.host
+            if (req.isForMainFrame && req.url.scheme == "https" && host != null && host in upgraded) {
+                upgraded.remove(host); noHttps.add(host)
+                addLog("[AIB] $host has no https, using http")
+                view.loadUrl(req.url.buildUpon().scheme("http").build().toString())
+            }
         }
         override fun onReceivedHttpError(view: WebView, req: WebResourceRequest, resp: WebResourceResponse) {
             if (req.url.host == ASSET_HOST || req.isForMainFrame) addLog("[HTTP ${resp.statusCode}] ${req.url}")
@@ -528,7 +540,7 @@ class MainActivity : Activity() {
             if (req.isForMainFrame && isAdult(req.url.host)) { blockedPage(req.url.host); return true }
             if (req.isForMainFrame && on("protect")) {
                 val clean = cleanUrl(req.url)
-                if (scheme == "http" && !req.isRedirect) { view.loadUrl((clean ?: req.url).buildUpon().scheme("https").build().toString()); return true }
+                if (scheme == "http" && !req.isRedirect && req.url.host !in noHttps) { req.url.host?.let { upgraded.add(it) }; view.loadUrl((clean ?: req.url).buildUpon().scheme("https").build().toString()); return true }
                 if (clean != null) { view.loadUrl(clean.toString()); return true }
             }
             // pop-under / redirect ads: a frame or the page jumping to an ad host is dropped
