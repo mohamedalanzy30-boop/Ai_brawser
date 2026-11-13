@@ -56,6 +56,12 @@ class PlayerActivity : Activity() {
         const val IN_W = 640; const val IN_H = 360; const val OUT_W = IN_W * 4; const val OUT_H = IN_H * 4
         val log = ArrayDeque<String>()
         fun addLog(s: String) = synchronized(log) { log.addLast(s); while (log.size > 60) log.removeFirst() }
+        /** Temporary stream cache on the phone (not a download you keep): the whole movie is fetched ahead while you watch,
+         *  oldest movies are thrown away automatically past 4 GB. */
+        private var cache: androidx.media3.datasource.cache.SimpleCache? = null
+        @Synchronized fun cache(c: Context): androidx.media3.datasource.cache.SimpleCache = cache ?: androidx.media3.datasource.cache.SimpleCache(
+            java.io.File(c.cacheDir, "stream"), androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor(4L shl 30),
+            androidx.media3.database.StandaloneDatabaseProvider(c)).also { cache = it }
     }
 
     private lateinit var player: ExoPlayer
@@ -73,6 +79,10 @@ class PlayerActivity : Activity() {
     private var renderer: Renderer? = null
     @Volatile private var aiWanted = true
     private var page = ""
+    private var cacheFactory: androidx.media3.datasource.cache.CacheDataSource.Factory? = null
+    @Volatile private var prefetcher: androidx.media3.exoplayer.offline.Downloader? = null
+    @Volatile private var prefetchPct = -1f
+    private var prefetchStarted = false
     private val startedAt = System.currentTimeMillis()
     private var retries = 0
     private var dragging = false
@@ -167,14 +177,18 @@ class PlayerActivity : Activity() {
             .setTargetBufferBytes(300 * 1024 * 1024).setPrioritizeTimeOverSizeThresholds(false)
             .setBackBuffer(2 * 60_000, true) // seeking back up to 2 minutes is instant
             .build()
-        player = ExoPlayer.Builder(this).setLoadControl(load).setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(http)).build()
+        val source: androidx.media3.datasource.DataSource.Factory = try {
+            androidx.media3.datasource.cache.CacheDataSource.Factory().setCache(cache(this)).setUpstreamDataSourceFactory(http)
+                .setFlags(androidx.media3.datasource.cache.CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR).also { cacheFactory = it }
+        } catch (e: Throwable) { addLog("[player] stream cache unavailable: ${e.message}"); http }
+        player = ExoPlayer.Builder(this).setLoadControl(load).setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(source)).build()
         setupSound()
         val item = MediaItem.Builder().setUri(url).apply { if (url.contains(".m3u8", true) || intent.getBooleanExtra("hls", false)) setMimeType(MimeTypes.APPLICATION_M3U8) }.build()
         player.setMediaItem(item, intent.getLongExtra("pos", 0L).coerceAtLeast(0L))
         player.prepare(); player.playWhenReady = true
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) { playBtn.text = if (isPlaying) "⏸" else "▶"; if (isPlaying) { retries = 0; everPlayed = true } }
-            override fun onRenderedFirstFrame() { everPlayed = true }
+            override fun onRenderedFirstFrame() { everPlayed = true; startPrefetch() }
             override fun onPlaybackStateChanged(state: Int) {
                 val buffering = state == Player.STATE_BUFFERING
                 spinner.visibility = if (buffering) View.VISIBLE else View.GONE
@@ -244,7 +258,8 @@ class PlayerActivity : Activity() {
         val d = player.duration
         if (d > 0 && !dragging) {
             seek.progress = (player.currentPosition * 1000 / d).toInt(); seek.secondaryProgress = (player.bufferedPosition * 1000 / d).toInt()
-            time.text = "  ${fmt(player.currentPosition)} / ${fmt(d)}"
+            val pf = prefetchPct
+            time.text = "  ${fmt(player.currentPosition)} / ${fmt(d)}" + (if (pf in 0f..99.5f) "  ⬇${pf.toInt()}%" else "")
         }
         if (autoQuality) { val h = player.videoSize.height; qualityBtn.text = if (h > 0) "تلقائي ${h}p" else "تلقائي" }
         // still nothing on screen after 30 s: this address does not work here, hand the video back to the page
@@ -384,7 +399,39 @@ class PlayerActivity : Activity() {
         } catch (e: Exception) { }
     }
     override fun onPictureInPictureModeChanged(inPip: Boolean, c: android.content.res.Configuration) { super.onPictureInPictureModeChanged(inPip, c); controls.visibility = if (inPip) View.GONE else View.VISIBLE }
+    /**
+     * Fetch the rest of the movie into the stream cache in the background (only the quality being played).
+     * The player then reads from the phone instead of the network, so the connection can drop for long stretches.
+     */
+    private fun startPrefetch() {
+        val f = cacheFactory ?: return
+        if (prefetchStarted) return
+        prefetchStarted = true
+        val item = player.currentMediaItem ?: return
+        val d = (try {
+            val hls = player.currentManifest as? androidx.media3.exoplayer.hls.HlsManifest
+            if (hls != null) {
+                val pl = hls.multivariantPlaylist
+                val vf = player.videoFormat
+                var vi = pl.variants.indexOfFirst { vf != null && it.format.height == vf.height && (it.format.bitrate == vf.bitrate || vf.bitrate <= 0) }
+                if (vi < 0) vi = 0
+                val keys = arrayListOf(androidx.media3.common.StreamKey(androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist.GROUP_INDEX_VARIANT, vi))
+                if (pl.audios.isNotEmpty()) keys.add(androidx.media3.common.StreamKey(androidx.media3.exoplayer.hls.playlist.HlsMultivariantPlaylist.GROUP_INDEX_AUDIO, 0))
+                if (pl.variants.isEmpty()) null
+                else androidx.media3.exoplayer.hls.offline.HlsDownloader(item.buildUpon().setStreamKeys(keys).build(), f)
+            } else androidx.media3.exoplayer.offline.ProgressiveDownloader(item, f)
+        } catch (e: Throwable) { addLog("[player] prefetch setup failed: ${e.message}"); null }) ?: return
+        prefetcher = d
+        Thread {
+            try {
+                d.download { _, _, pct -> prefetchPct = pct }
+                prefetchPct = 100f; addLog("[player] whole video fetched ahead")
+            } catch (e: InterruptedException) { /* closed */ } catch (e: Throwable) { addLog("[player] prefetch stopped: ${e.message?.take(120)}") }
+        }.apply { isDaemon = true; name = "prefetch" }.start()
+    }
+
     override fun onDestroy() {
+        try { prefetcher?.cancel() } catch (e: Throwable) { }
         ui.removeCallbacksAndMessages(null)
         saveResume()
         try { eq?.release(); loud?.release() } catch (e: Throwable) { }
