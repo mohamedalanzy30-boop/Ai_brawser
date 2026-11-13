@@ -488,9 +488,11 @@ class MainActivity : Activity() {
         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
             val u = request.url
             noteMedia(request)
+            // anti-adblock libraries are often served from the site itself: answer them with a stand-in that says "no blocker"
+            if (adblockOn && !request.isForMainFrame && antiAdblock.containsMatchIn(u.toString())) return fakeResponse(request)
             if (!request.isForMainFrame && ((adblockOn && isAd(u.host) && !isAd(pageHost)) || isAdult(u.host))) {
                 blocked++
-                return WebResourceResponse("text/plain", "utf-8", 204, "No Content", mapOf("Access-Control-Allow-Origin" to "*"), "".byteInputStream())
+                return fakeResponse(request)
             }
             if (u.host == "fonts.gstatic.com" && request.method == "GET") return proxyFont(request)
             if (u.host != ASSET_HOST) return null
@@ -566,6 +568,38 @@ class MainActivity : Activity() {
             if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
         }
         override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) { if (!urlEdit.hasFocus()) showAddress(url) }
+    }
+
+    /* ======================= stealth blocking: sites cannot tell that ads were blocked ======================= */
+    /** Known ad / tracking libraries are swapped for silent stand-ins that "work" (assets/surrogates). */
+    private val surrogates = listOf(
+        Regex("adsbygoogle\\.js") to "adsbygoogle.js",
+        Regex("/(gpt|pubads_impl[^/]*)\\.js|googletagservices\\.com/tag/js") to "gpt.js",
+        Regex("/ima3(_dai|_debug)?\\.js") to "ima3.js",
+        Regex("/(analytics|ga|gtag/js|gtm)(\\.js)?(\\?|$)") to "analytics.js",
+        Regex("(fuckadblock|blockadblock|sniffadblock)[^/]*\\.js", RegexOption.IGNORE_CASE) to "adblock-detect.js")
+    private val antiAdblock = Regex("(fuckadblock|blockadblock|sniffadblock)[^/]*\\.js", RegexOption.IGNORE_CASE)
+    private val gif1x1 = android.util.Base64.decode("R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7", 0)
+    /**
+     * A blocked request gets a normal-looking "200 OK" of the right kind instead of an error: scripts load (as harmless stand-ins
+     * or empty), images are a transparent pixel, frames are an empty page. Anti-adblock checks that watch for failed loads see nothing.
+     */
+    private fun fakeResponse(req: WebResourceRequest): WebResourceResponse {
+        val u = req.url.toString(); val path = (req.url.path ?: "").lowercase()
+        val accept = req.requestHeaders["Accept"] ?: ""
+        val h = mapOf("Access-Control-Allow-Origin" to (req.requestHeaders["Origin"] ?: "*"), "Access-Control-Allow-Credentials" to "true", "Cache-Control" to "no-store")
+        fun ok(mime: String, body: ByteArray) = WebResourceResponse(mime, "utf-8", 200, "OK", h, java.io.ByteArrayInputStream(body))
+        val sur = surrogates.firstOrNull { it.first.containsMatchIn(u) }?.second
+        if (sur != null) return try { ok("application/javascript", assets.open("surrogates/$sur").use { it.readBytes() }) } catch (e: Exception) { ok("application/javascript", ByteArray(0)) }
+        return when {
+            path.endsWith(".js") || accept.contains("javascript") -> ok("application/javascript", ByteArray(0))
+            Regex("\\.(gif|png|jpe?g|webp|svg|ico|bmp)$").containsMatchIn(path) || accept.startsWith("image/") -> ok("image/gif", gif1x1)
+            path.endsWith(".css") || accept.startsWith("text/css") -> ok("text/css", ByteArray(0))
+            accept.contains("text/html") -> ok("text/html", "<!doctype html><html><head></head><body></body></html>".toByteArray())
+            path.endsWith(".xml") || path.contains("vast") || path.contains("vmap") -> ok("text/xml", "<?xml version=\"1.0\"?><VAST version=\"3.0\"/>".toByteArray()) // "no ad" for video players
+            accept.contains("json") || path.endsWith(".json") -> ok("application/json", "{}".toByteArray())
+            else -> ok("text/plain", ByteArray(0))
+        }
     }
 
     private fun blockedPage(host: String?) {
