@@ -14,8 +14,8 @@
   /* Read-ahead for site players: hls.js and video.js normally fetch only ~30 s ahead; ask them to keep loading
      up to 10 minutes ahead (capped at ~200 MB), so a slow or dropping connection does not stall the movie. */
   ;(function bufferAhead () {
-    const tuneHls = (H) => { try { const c = H && H.DefaultConfig; if (c && !c.__aib) { c.__aib = 1; c.maxBufferLength = 600; c.maxMaxBufferLength = 1800; c.maxBufferSize = 200 * 1000 * 1000; c.backBufferLength = 120 } } catch (e) { /* ignore */ } }
-    const tuneVjs = (V) => { try { const v = V && (V.Vhs || V.Hls); if (v && !v.__aib) { v.__aib = 1; v.GOAL_BUFFER_LENGTH = 600; v.MAX_GOAL_BUFFER_LENGTH = 1800; v.GOAL_BUFFER_LENGTH_RATE = 1 } } catch (e) { /* ignore */ } }
+    const tuneHls = (H) => { try { const c = H && H.DefaultConfig; if (c && !c.__aib) { c.__aib = 1; c.maxBufferLength = 600; c.maxMaxBufferLength = 600; c.maxBufferSize = 200 * 1000 * 1000; c.backBufferLength = 120 } } catch (e) { /* ignore */ } }
+    const tuneVjs = (V) => { try { const v = V && (V.Vhs || V.Hls); if (v && !v.__aib) { v.__aib = 1; v.GOAL_BUFFER_LENGTH = 600; v.MAX_GOAL_BUFFER_LENGTH = 600; v.GOAL_BUFFER_LENGTH_RATE = 1 } } catch (e) { /* ignore */ } }
     const trap = (name, tune) => {
       if (window[name]) { tune(window[name]); return }
       let val

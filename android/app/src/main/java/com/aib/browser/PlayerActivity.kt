@@ -160,10 +160,10 @@ class PlayerActivity : Activity() {
 
         val http = DefaultHttpDataSource.Factory().setUserAgent(ua).setDefaultRequestProperties(headers).setAllowCrossProtocolRedirects(true)
             .setConnectTimeoutMs(15000).setReadTimeoutMs(20000)
-        // keep downloading ahead while you watch (up to 30 minutes or ~300 MB in memory, whichever comes first), so a weak or dropping
-        // connection does not stop the movie; playback starts as soon as 1.5 s is ready
+        // keep downloading continuously up to 10 minutes ahead of what you watch (min = max, so it never pauses loading),
+        // so a weak or dropping connection does not stop the movie; playback starts as soon as 1.5 s is ready
         val load = androidx.media3.exoplayer.DefaultLoadControl.Builder()
-            .setBufferDurationsMs(10 * 60_000, 30 * 60_000, 1_500, 3_000)
+            .setBufferDurationsMs(10 * 60_000, 10 * 60_000, 1_500, 3_000)
             .setTargetBufferBytes(300 * 1024 * 1024).setPrioritizeTimeOverSizeThresholds(false)
             .setBackBuffer(2 * 60_000, true) // seeking back up to 2 minutes is instant
             .build()
