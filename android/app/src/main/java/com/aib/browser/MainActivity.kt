@@ -105,7 +105,7 @@ class MainActivity : Activity() {
     private val defaults = mapOf(
         "enabled" to true, "neural" to true, "tone" to true, "images" to true,
         "autoNative" to true, "gestures" to true, "brightness" to false,
-        "adblock" to true, "popups" to true, "protect" to true, "adult" to false, "dark" to true
+        "adblock" to true, "popups" to true, "protect" to true, "adult" to false, "dark" to true, "cookies" to true, "noAutoplay" to true
     )
     private val targets = intArrayOf(0, 720, 1080, 1440, 2160)
     private val targetLabels = arrayOf("تلقائي", "720p", "1080p", "2K", "4K")
@@ -253,12 +253,14 @@ class MainActivity : Activity() {
 
     /* ======================= in-page engine ======================= */
     private fun asset(path: String): String = assets.open(path).bufferedReader().use { it.readText() }
+    private val cookieJs by lazy { asset("cookies.js") }
     private val bundle by lazy { asset("ort/ort.webgpu.min.js") + "\n;" + asset("engine.js") }
     /** Engine + ONNX Runtime injected at document start into EVERY frame (also embedded players in iframes). */
     private fun registerScript() {
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
         scriptHandler?.remove()
-        scriptHandler = WebViewCompat.addDocumentStartJavaScript(web, "window.__minCfg0=${config()};\n$bundle", setOf("*"))
+        val extra = if (on("cookies")) "\n;" + cookieJs else ""
+        scriptHandler = WebViewCompat.addDocumentStartJavaScript(web, "window.__minCfg0=${config()};\n$bundle$extra", setOf("*"))
     }
     private fun applyConfig() {
         registerScript()
@@ -381,7 +383,8 @@ class MainActivity : Activity() {
     private fun setupWebView() {
         web.settings.apply {
             javaScriptEnabled = true; domStorageEnabled = true; databaseEnabled = true
-            mediaPlaybackRequiresUserGesture = false
+            // data saver: videos start only when you tap play (pages cannot autoplay)
+            mediaPlaybackRequiresUserGesture = on("noAutoplay")
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
             setSupportZoom(true); builtInZoomControls = true; displayZoomControls = false
             useWideViewPort = true; loadWithOverviewMode = true
@@ -657,6 +660,8 @@ class MainActivity : Activity() {
             }
             Ui.Group(this, col, "عام").apply {
                 toggle("الوضع الداكن لكل المواقع", on("dark")) { set("dark", it); applyDark(); web.reload() }
+                toggle("إخفاء نوافذ الكوكيز", on("cookies")) { set("cookies", it); registerScript(); web.reload() }
+                toggle("لا تشغّل الفيديو تلقائياً (توفير البيانات)", on("noAutoplay")) { set("noAutoplay", it); web.settings.mediaPlaybackRequiresUserGesture = it }
                 link("السجل") { dlg.dismiss(); showHistory() }
                 link("سجل الأخطاء (للنسخ)") { dlg.dismiss(); showLog() }
             }
