@@ -479,7 +479,10 @@ void main(){
   const speedBtn = mkBtn('1×', 'speed', (b) => { if (!fsTarget) return; const i = (SPEEDS.indexOf(fsTarget.playbackRate) + 1) % SPEEDS.length; fsTarget.playbackRate = SPEEDS[i]; b.textContent = SPEEDS[i] + '×'; toast(fsTarget, '⏱ ' + SPEEDS[i] + '×') })
   const pipBtn = mkBtn('⧉', 'picture in picture', () => { if (NATIVE && NATIVE.pip) NATIVE.pip(); else if (fsTarget && fsTarget.requestPictureInPicture) fsTarget.requestPictureInPicture().catch(() => {}) })
   const lockBtn = mkBtn('🔒', 'lock', () => lockScreen(true))
-  ctl.append(fsBtn, pipBtn, speedBtn, lockBtn)
+  // native player: hardware decoding + neural upscaling on the phone's NPU
+  const nativeBtn = mkBtn('AI ▶', 'native AI player', () => { if (!fsTarget || !NATIVE || !NATIVE.openNative) return; const v = fsTarget; NATIVE.openNative(v.currentSrc || v.src || '', v.currentTime || 0); try { v.pause() } catch (e) { /* ignore */ } })
+  nativeBtn.style.background = 'rgba(124,92,255,.85)'
+  ctl.append(fsBtn, pipBtn, speedBtn, lockBtn, nativeBtn)
 
   const bubble = document.createElement('div')
   bubble.style.cssText = 'position:fixed;z-index:2147483647;pointer-events:none;padding:10px 18px;border-radius:24px;background:rgba(0,0,0,.65);color:#fff;font:600 18px sans-serif;display:none;transform:translate(-50%,-50%)'
@@ -608,6 +611,7 @@ void main(){
     const extra = cfg.gestures !== false
     speedBtn.style.display = pipBtn.style.display = extra ? 'block' : 'none'
     lockBtn.style.display = extra && inFs ? 'block' : 'none'
+    nativeBtn.style.display = NATIVE && NATIVE.openNative ? 'block' : 'none'
     speedBtn.textContent = best.playbackRate + '×'
     fsBtn.style.display = 'block'; ctl.style.display = 'flex'
     ctl.style.right = (window.innerWidth - right) + 'px'; ctl.style.top = top + 'px'

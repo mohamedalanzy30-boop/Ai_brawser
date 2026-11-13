@@ -82,7 +82,8 @@ class MainActivity : Activity() {
         val m = android.util.DisplayMetrics().also { d.getRealMetrics(it) }
         val disp = "display=${m.widthPixels}x${m.heightPixels} dpi=${m.densityDpi} refresh=${Math.round(d.refreshRate)}Hz modes=$rates hdr=$hdr wideGamut=${d.isWideColorGamut}"
         val head = "$disp\nAI Browser 0.1 | ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} | Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) | WebView ${wv?.versionName}\nconfig=${config()}\nadblock=${if (adblockOn) "on" else "off"} hosts=${adHosts.size} blocked=$blocked popups=$popupsBlocked\nurl=${web.url}\n"
-        return head + synchronized(logLines) { logLines.joinToString("\n") }
+        val pl = synchronized(PlayerActivity.log) { PlayerActivity.log.joinToString("\n") }
+        return head + synchronized(logLines) { logLines.joinToString("\n") } + (if (pl.isNotEmpty()) "\n--- native player ---\n$pl" else "")
     }
     private val prefs by lazy { getSharedPreferences("enhance", Context.MODE_PRIVATE) }
 
@@ -149,7 +150,35 @@ class MainActivity : Activity() {
     }
 
     /** Small bridge for the in-page player controls. Every method is harmless if a page calls it. */
+    /* ---------- native player: remember the real video addresses the page loads ---------- */
+    private data class Media(val url: String, val referer: String?, val hls: Boolean)
+    private val media = java.util.concurrent.CopyOnWriteArrayList<Media>()
+    private val mediaExt = Regex("\\.(mp4|m4v|webm|mkv|mov)$", RegexOption.IGNORE_CASE)
+    private fun noteMedia(req: WebResourceRequest) {
+        val u = req.url; val path = u.path ?: ""
+        val hls = path.endsWith(".m3u8", true) || path.endsWith(".m3u", true)
+        if (!hls && !mediaExt.containsMatchIn(path)) return
+        val s = u.toString()
+        if (media.none { it.url == s }) { media.add(Media(s, req.requestHeaders["Referer"], hls)); while (media.size > 30) media.removeAt(0) }
+    }
+    private fun openNative(src: String, posSec: Double) {
+        val direct = if (src.startsWith("http")) Media(src, web.url, src.contains(".m3u8", true)) else null
+        // HLS players request the master playlist first, so the first .m3u8 is the best choice
+        val m = direct ?: media.firstOrNull { it.hls } ?: media.lastOrNull()
+        if (m == null) {
+            addLog("[AIB] native player: no video address found (src=${src.take(40)}, seen=${media.size})")
+            android.widget.Toast.makeText(this, "لم أجد رابط الفيديو الحقيقي (قد يكون محمياً)", android.widget.Toast.LENGTH_LONG).show(); return
+        }
+        addLog("[AIB] native player: ${if (m.hls) "HLS" else "file"} ${m.url.take(120)}")
+        val i = android.content.Intent(this, PlayerActivity::class.java)
+            .putExtra("url", m.url).putExtra("hls", m.hls).putExtra("referer", m.referer ?: web.url ?: "")
+            .putExtra("ua", web.settings.userAgentString).putExtra("cookie", android.webkit.CookieManager.getInstance().getCookie(m.url) ?: "")
+            .putExtra("pos", (posSec * 1000).toLong()).putExtra("title", web.title ?: "")
+        startActivity(i)
+    }
+
     inner class Bridge {
+        @android.webkit.JavascriptInterface fun openNative(src: String, pos: Double) { ui.post { this@MainActivity.openNative(src, pos) } }
         @android.webkit.JavascriptInterface fun playing(on: Boolean, w: Int, h: Int) {
             videoPlaying = on
             if (w > 0 && h > 0) { val r = w.toDouble() / h; videoAspect = if (r > 2.39) android.util.Rational(239, 100) else if (r < 0.42) android.util.Rational(42, 100) else android.util.Rational(w, h) }
@@ -340,6 +369,7 @@ class MainActivity : Activity() {
         web.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                 val u = request.url
+                noteMedia(request)
                 if (adblockOn && !request.isForMainFrame && isAd(u.host) && !isAd(pageHost)) {
                     blocked++
                     return WebResourceResponse("text/plain", "utf-8", 204, "No Content", mapOf("Access-Control-Allow-Origin" to "*"), "".byteInputStream())
@@ -395,7 +425,7 @@ class MainActivity : Activity() {
                 return false
             }
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-                if (site(android.net.Uri.parse(url).host) != site(pageHost)) videoPlaying = false
+                if (site(android.net.Uri.parse(url).host) != site(pageHost)) { videoPlaying = false; media.clear() }
                 pageHost = android.net.Uri.parse(url).host
                 if (!urlBar.hasFocus()) urlBar.setText(url)
                 if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
