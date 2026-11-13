@@ -105,7 +105,7 @@ class MainActivity : Activity() {
     private val defaults = mapOf(
         "enabled" to true, "neural" to true, "tone" to true, "images" to true,
         "autoNative" to true, "gestures" to true, "brightness" to false,
-        "adblock" to true, "popups" to true, "protect" to true, "adult" to false
+        "adblock" to true, "popups" to true, "protect" to true, "adult" to false, "dark" to true
     )
     private val targets = intArrayOf(0, 720, 1080, 1440, 2160)
     private val targetLabels = arrayOf("تلقائي", "720p", "1080p", "2K", "4K")
@@ -394,6 +394,7 @@ class MainActivity : Activity() {
             allowFileAccess = false; allowContentAccess = false; setGeolocationEnabled(false)
             if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) WebSettingsCompat.setSafeBrowsingEnabled(this, true)
         }
+        applyDark()
         // third-party cookies stay allowed: embedded movie players and sign-in need them; trackers are cut by the host list
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
@@ -651,12 +652,58 @@ class MainActivity : Activity() {
             Ui.Group(this, col, "بدون إنترنت").apply {
                 link("حفظ هذه الصفحة") { dlg.dismiss(); savePage() }
                 media.lastOrNull { !it.hls }?.let { m -> link("تحميل الفيديو الحالي") { dlg.dismiss(); download(m.url, web.settings.userAgentString, null, "video/mp4") } }
+                link("التحميلات") { dlg.dismiss(); showDownloads() }
                 link("الصفحات المحفوظة", "${savedDir.listFiles()?.size ?: 0}") { dlg.dismiss(); showSaved() }
             }
             Ui.Group(this, col, "عام").apply {
+                toggle("الوضع الداكن لكل المواقع", on("dark")) { set("dark", it); applyDark(); web.reload() }
                 link("السجل") { dlg.dismiss(); showHistory() }
                 link("سجل الأخطاء (للنسخ)") { dlg.dismiss(); showLog() }
             }
+        }.show()
+    }
+
+    /** Dark mode for every site: sites with their own dark style use it, white sites are darkened by WebView. */
+    private fun applyDark() {
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) WebSettingsCompat.setAlgorithmicDarkeningAllowed(web.settings, on("dark"))
+    }
+
+    /* ======================= downloads list ======================= */
+    private fun showDownloads() {
+        val dm = getSystemService(Context.DOWNLOAD_SERVICE) as android.app.DownloadManager
+        Ui.sheet(this, "التحميلات") { col, dlg ->
+            data class D(val id: Long, val name: String, val status: Int, val done: Long, val total: Long)
+            val items = ArrayList<D>()
+            try {
+                dm.query(android.app.DownloadManager.Query()).use { c ->
+                    val iId = c.getColumnIndexOrThrow(android.app.DownloadManager.COLUMN_ID); val iT = c.getColumnIndexOrThrow(android.app.DownloadManager.COLUMN_TITLE)
+                    val iS = c.getColumnIndexOrThrow(android.app.DownloadManager.COLUMN_STATUS); val iD = c.getColumnIndexOrThrow(android.app.DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR)
+                    val iZ = c.getColumnIndexOrThrow(android.app.DownloadManager.COLUMN_TOTAL_SIZE_BYTES)
+                    while (c.moveToNext()) items.add(D(c.getLong(iId), c.getString(iT) ?: "", c.getInt(iS), c.getLong(iD), c.getLong(iZ)))
+                }
+            } catch (e: Exception) { addLog("[AIB] downloads query failed: $e") }
+            items.sortByDescending { it.id }
+            val g = Ui.Group(this, col, null, if (items.isEmpty()) "ما حمّلته من المواقع يظهر هنا." else "اضغط لفتح الملف، ومطولاً لإلغائه أو حذفه من القائمة.")
+            for (d in items) {
+                val mb = { b: Long -> "%.1f MB".format(b / 1048576.0) }
+                val state = when (d.status) {
+                    android.app.DownloadManager.STATUS_SUCCESSFUL -> mb(d.total)
+                    android.app.DownloadManager.STATUS_FAILED -> "فشل"
+                    android.app.DownloadManager.STATUS_PAUSED -> "متوقف مؤقتاً"
+                    else -> if (d.total > 0) "${d.done * 100 / d.total}%" else mb(d.done)
+                }
+                g.link(d.name.take(40), state) {
+                    if (d.status != android.app.DownloadManager.STATUS_SUCCESSFUL) return@link
+                    val uri = dm.getUriForDownloadedFile(d.id) ?: return@link
+                    try { startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, dm.getMimeTypeForDownloadedFile(d.id)).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)) }
+                    catch (e: Exception) { Toast.makeText(this, "لا يوجد تطبيق يفتح هذا الملف", Toast.LENGTH_SHORT).show() }
+                }
+            }
+            val card = col.getChildAt(col.childCount - 2) as? LinearLayout
+            var i = 0
+            card?.let { c -> for (k in 0 until c.childCount) { val r = c.getChildAt(k); if (r is LinearLayout) { val d = items.getOrNull(i++) ?: continue; r.setOnLongClickListener { dm.remove(d.id); dlg.dismiss(); showDownloads(); true } } } }
+            // live progress while the sheet is open
+            col.postDelayed({ if (dlg.isShowing && items.any { it.status == android.app.DownloadManager.STATUS_RUNNING || it.status == android.app.DownloadManager.STATUS_PENDING }) { dlg.dismiss(); showDownloads() } }, 2000)
         }.show()
     }
 

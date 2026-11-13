@@ -77,6 +77,7 @@ class PlayerActivity : Activity() {
     private lateinit var directView: SurfaceView
     private var hdrDirect = false
     private lateinit var eqBtn: TextView
+    private lateinit var qualityBtn: TextView
     private var eq: android.media.audiofx.Equalizer? = null
     private var loud: android.media.audiofx.LoudnessEnhancer? = null
 
@@ -114,6 +115,7 @@ class PlayerActivity : Activity() {
         playBtn = btn("⏸") { player.playWhenReady = !player.playWhenReady }.apply { textSize = 28f }
         val SPEEDS = floatArrayOf(1f, 1.25f, 1.5f, 2f, 0.75f)
         speedBtn = btn("1×") { val i = (SPEEDS.indexOfFirst { it == player.playbackParameters.speed } + 1) % SPEEDS.size; player.setPlaybackSpeed(SPEEDS[i]); speedBtn.text = "${SPEEDS[i]}×" }
+        qualityBtn = btn("تلقائي") { pickQuality() }
         eqBtn = btn(SOUND_LABELS[0]) { setSound((soundMode + 1) % SOUND_LABELS.size) }
         aiBtn = btn("AI ✓") { aiWanted = !aiWanted; renderer?.aiWanted = aiWanted; aiBtn.text = if (aiWanted) "AI ✓" else "AI ✗" }
         seek = SeekBar(this).apply {
@@ -129,6 +131,7 @@ class PlayerActivity : Activity() {
         val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(12), dp(16), 0) }
         top.addView(btn("‹") { finish() }.apply { textSize = 24f }, LinearLayout.LayoutParams(dp(48), dp(44)))
         top.addView(title, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(12), 0, dp(12), 0) })
+        top.addView(qualityBtn, LinearLayout.LayoutParams(-2, dp(40)).apply { setMargins(0, 0, dp(8), 0) })
         top.addView(eqBtn, LinearLayout.LayoutParams(-2, dp(40)).apply { setMargins(0, 0, dp(8), 0) })
         top.addView(aiBtn, LinearLayout.LayoutParams(-2, dp(40)).apply { setMargins(0, 0, dp(8), 0) })
         top.addView(speedBtn, LinearLayout.LayoutParams(-2, dp(40)))
@@ -269,6 +272,29 @@ class PlayerActivity : Activity() {
         var w = root.width; var hh = (w / a).toInt()
         if (hh > root.height) { hh = root.height; w = (hh * a).toInt() }
         directView.layoutParams = FrameLayout.LayoutParams(w, hh, Gravity.CENTER)
+    }
+
+    /* ---------- stream quality: automatic, or a fixed height when the site offers several ---------- */
+    private fun pickQuality() {
+        val opts = ArrayList<Pair<String, (() -> Unit)>>()
+        opts.add("تلقائي" to {
+            player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().clearOverridesOfType(C.TRACK_TYPE_VIDEO).build()
+            qualityBtn.text = "تلقائي"
+        })
+        for (g in player.currentTracks.groups) {
+            if (g.type != C.TRACK_TYPE_VIDEO) continue
+            val idx = (0 until g.length).filter { g.isTrackSupported(it) }.sortedByDescending { g.getTrackFormat(it).height }
+            for (i in idx) {
+                val h = g.getTrackFormat(i).height; if (h <= 0 || opts.any { it.first == "${h}p" }) continue
+                opts.add("${h}p" to {
+                    player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+                        .setOverrideForType(androidx.media3.common.TrackSelectionOverride(g.mediaTrackGroup, i)).build()
+                    qualityBtn.text = "${h}p"
+                })
+            }
+        }
+        if (opts.size == 1) { flash("الموقع يوفّر جودة واحدة فقط"); return }
+        android.app.AlertDialog.Builder(this).setTitle("الجودة").setItems(opts.map { it.first }.toTypedArray()) { _, w -> opts[w].second() }.show()
     }
 
     /* ---------- sound: normal / clear dialogue / night (quiet explosions, loud voices) ---------- */
