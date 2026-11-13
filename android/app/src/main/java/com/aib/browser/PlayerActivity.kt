@@ -84,6 +84,8 @@ class PlayerActivity : Activity() {
     private var hdrDirect = false
     private lateinit var eqBtn: TextView
     private lateinit var qualityBtn: TextView
+    private lateinit var ccBtn: TextView
+    private lateinit var subView: TextView
     private var eq: android.media.audiofx.Equalizer? = null
     private var loud: android.media.audiofx.LoudnessEnhancer? = null
 
@@ -122,6 +124,7 @@ class PlayerActivity : Activity() {
         val SPEEDS = floatArrayOf(1f, 1.25f, 1.5f, 2f, 0.75f)
         speedBtn = btn("1×") { val i = (SPEEDS.indexOfFirst { it == player.playbackParameters.speed } + 1) % SPEEDS.size; player.setPlaybackSpeed(SPEEDS[i]); speedBtn.text = "${SPEEDS[i]}×" }
         qualityBtn = btn("تلقائي") { pickQuality() }
+        ccBtn = btn("CC") { pickSubtitles() }
         eqBtn = btn(SOUND_LABELS[0]) { setSound((soundMode + 1) % SOUND_LABELS.size) }
         aiBtn = btn("AI ✓") { aiWanted = !aiWanted; renderer?.aiWanted = aiWanted; aiBtn.text = if (aiWanted) "AI ✓" else "AI ✗" }
         seek = SeekBar(this).apply {
@@ -138,6 +141,7 @@ class PlayerActivity : Activity() {
         val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(12), dp(16), 0) }
         top.addView(btn("‹") { finish() }.apply { textSize = 24f }, LinearLayout.LayoutParams(dp(48), dp(44)))
         top.addView(title, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(12), 0, dp(12), 0) })
+        top.addView(ccBtn, LinearLayout.LayoutParams(-2, dp(40)).apply { setMargins(0, 0, dp(8), 0) })
         top.addView(qualityBtn, LinearLayout.LayoutParams(-2, dp(40)).apply { setMargins(0, 0, dp(8), 0) })
         top.addView(eqBtn, LinearLayout.LayoutParams(-2, dp(40)).apply { setMargins(0, 0, dp(8), 0) })
         top.addView(aiBtn, LinearLayout.LayoutParams(-2, dp(40)).apply { setMargins(0, 0, dp(8), 0) })
@@ -156,6 +160,11 @@ class PlayerActivity : Activity() {
         root.addView(spinner, FrameLayout.LayoutParams(dp(56), dp(56), Gravity.CENTER))
         toast = TextView(this).apply { textSize = 20f; setTextColor(Color.WHITE); background = pill(0xAA000000.toInt()); setPadding(dp(18), dp(10), dp(18), dp(10)); visibility = View.GONE }
         root.addView(toast, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+        subView = TextView(this).apply {
+            textSize = 20f; setTextColor(Color.WHITE); gravity = Gravity.CENTER; setShadowLayer(6f, 0f, 2f, Color.BLACK)
+            setBackgroundColor(0x66000000); setPadding(dp(10), dp(3), dp(10), dp(3)); visibility = View.GONE
+        }
+        root.addView(subView, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(28); marginStart = dp(40); marginEnd = dp(40) })
         setContentView(root)
 
         val http = DefaultHttpDataSource.Factory().setUserAgent(ua).setDefaultRequestProperties(headers).setAllowCrossProtocolRedirects(true)
@@ -169,11 +178,30 @@ class PlayerActivity : Activity() {
             .build()
         player = ExoPlayer.Builder(this).setLoadControl(load).setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(http)).build()
         setupSound()
-        val item = MediaItem.Builder().setUri(url).apply { if (url.contains(".m3u8", true) || intent.getBooleanExtra("hls", false)) setMimeType(MimeTypes.APPLICATION_M3U8) }.build()
+        // subtitle files found on the page; Arabic is preferred, then whatever the site marked
+        val subUrls = intent.getStringArrayListExtra("subs") ?: arrayListOf()
+        val isAr = { u: String -> Regex("(?i)(^|[^a-z])(ar|ara|arabic|عربي)([^a-z]|$)").containsMatchIn(Uri.decode(u)) }
+        val firstPick = subUrls.firstOrNull(isAr) ?: subUrls.firstOrNull()
+        val subConfigs = subUrls.map { u ->
+            val name = Uri.decode(Uri.parse(u).lastPathSegment ?: "subtitle")
+            MediaItem.SubtitleConfiguration.Builder(Uri.parse(u))
+                .setMimeType(if (u.substringBefore('?').endsWith(".srt", true)) MimeTypes.APPLICATION_SUBRIP else MimeTypes.TEXT_VTT)
+                .setLanguage(if (isAr(u)) "ar" else null).setLabel(name.substringBeforeLast('.'))
+                .setSelectionFlags(if (u == firstPick) C.SELECTION_FLAG_DEFAULT else 0).build()
+        }
+        if (subUrls.isNotEmpty()) addLog("[player] subtitles from page: ${subUrls.size}")
+        val item = MediaItem.Builder().setUri(url).setSubtitleConfigurations(subConfigs)
+            .apply { if (url.contains(".m3u8", true) || intent.getBooleanExtra("hls", false)) setMimeType(MimeTypes.APPLICATION_M3U8) }.build()
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setPreferredTextLanguage("ar").setSelectUndeterminedTextLanguage(true).build()
         player.setMediaItem(item, intent.getLongExtra("pos", 0L).coerceAtLeast(0L))
         player.prepare(); player.playWhenReady = true
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) { playBtn.text = if (isPlaying) "⏸" else "▶"; if (isPlaying) { retries = 0; everPlayed = true } }
+            override fun onCues(cueGroup: androidx.media3.common.text.CueGroup) {
+                val t = cueGroup.cues.mapNotNull { it.text?.toString()?.trim() }.filter { it.isNotEmpty() }.joinToString("\n")
+                subView.text = t; subView.visibility = if (t.isEmpty()) View.GONE else View.VISIBLE
+            }
             override fun onRenderedFirstFrame() { everPlayed = true }
             override fun onPlaybackStateChanged(state: Int) {
                 val buffering = state == Player.STATE_BUFFERING
@@ -318,6 +346,28 @@ class PlayerActivity : Activity() {
         var w = root.width; var hh = (w / a).toInt()
         if (hh > root.height) { hh = root.height; w = (hh * a).toInt() }
         directView.layoutParams = FrameLayout.LayoutParams(w, hh, Gravity.CENTER)
+    }
+
+    /* ---------- subtitles: from the page (.vtt/.srt) or inside the stream ---------- */
+    private fun pickSubtitles() {
+        val names = arrayListOf("بدون ترجمة"); val acts = arrayListOf<() -> Unit>({
+            player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
+            ccBtn.text = "CC ✗"
+        })
+        for (g in player.currentTracks.groups) {
+            if (g.type != C.TRACK_TYPE_TEXT) continue
+            for (i in 0 until g.length) {
+                val f = g.getTrackFormat(i)
+                names.add(listOfNotNull(f.label, f.language?.let { java.util.Locale(it).displayLanguage }).distinct().joinToString(" · ").ifBlank { "ترجمة ${names.size}" })
+                acts.add {
+                    player.trackSelectionParameters = player.trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_TEXT, false)
+                        .setOverrideForType(androidx.media3.common.TrackSelectionOverride(g.mediaTrackGroup, i)).build()
+                    ccBtn.text = "CC"
+                }
+            }
+        }
+        if (names.size == 1) { flash("لم أجد ترجمة لهذا الفيديو. شغّل الترجمة في مشغّل الموقع أولاً ثم افتح AI ▶"); return }
+        android.app.AlertDialog.Builder(this).setTitle("الترجمة").setItems(names.toTypedArray()) { _, w -> acts[w]() }.show()
     }
 
     /* ---------- stream quality: automatic, or a fixed height when the site offers several ---------- */

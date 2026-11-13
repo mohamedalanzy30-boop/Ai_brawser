@@ -169,8 +169,17 @@ class MainActivity : Activity() {
     private val mediaExt = Regex("\\.(mp4|m4v|webm|mkv|mov)$", RegexOption.IGNORE_CASE)
     @Volatile private var videoPlaying = false
     @Volatile private var videoAspect = android.util.Rational(16, 9)
+    /** subtitle files the page loaded (.vtt / .srt): handed to the native player */
+    private val subs = java.util.concurrent.CopyOnWriteArrayList<String>()
+    private val subExt = Regex("\\.(vtt|webvtt|srt)$", RegexOption.IGNORE_CASE)
+    private val subSegment = Regex("(?i)(seg|segment|chunk|frag)[^/]*$|[_-]\\d{1,5}\\.(vtt|webvtt)$") // pieces of an HLS subtitle stream, not whole files
     private fun noteMedia(req: WebResourceRequest) {
         val u = req.url; val path = u.path ?: ""
+        if (subExt.containsMatchIn(path)) {
+            val s = u.toString()
+            if (!subSegment.containsMatchIn(path) && s !in subs) { subs.add(s); while (subs.size > 8) subs.removeAt(0) }
+            return
+        }
         val hls = path.endsWith(".m3u8", true) || path.endsWith(".m3u", true)
         if (!hls && !mediaExt.containsMatchIn(path)) return
         val s = u.toString()
@@ -193,6 +202,7 @@ class MainActivity : Activity() {
         addLog("[AIB] native player: ${if (m.hls) "HLS" else "file"} ${m.url.take(120)} from ${pos / 1000}s")
         nativeHost = pageHost
         startActivityForResult(Intent(this, PlayerActivity::class.java)
+            .putStringArrayListExtra("subs", ArrayList(subs))
             .putExtra("url", m.url).putExtra("hls", m.hls).putExtra("referer", m.referer ?: page)
             .putExtra("ua", web.settings.userAgentString).putExtra("cookie", CookieManager.getInstance().getCookie(m.url) ?: "")
             .putExtra("pos", pos).putExtra("title", web.title ?: "").putExtra("page", page), PLAYER_REQ)
@@ -574,7 +584,7 @@ class MainActivity : Activity() {
         }
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
             val host = Uri.parse(url).host
-            if (site(host) != site(pageHost)) { videoPlaying = false; media.clear(); keepScreenOn(false) }
+            if (site(host) != site(pageHost)) { videoPlaying = false; media.clear(); subs.clear(); keepScreenOn(false) }
             pageHost = host
             if (!url.startsWith("file:")) view.settings.allowFileAccess = false
             if (!urlEdit.hasFocus()) showAddress(url)
