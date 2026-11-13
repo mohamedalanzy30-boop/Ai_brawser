@@ -297,7 +297,7 @@ void main(){
       state.stats.active = Array.from(state.videos.values()).filter(x => x.canvas.style.display === 'block').length
       try {
         st.R.resize(vw, vh); st.R.upload(video); st.frame++
-        if (cfg.tone && st.frame % 2 === 1) analyseTone(st, video) // every other frame: reacts within ~1 frame on scene cuts
+        if (cfg.tone && st.frame % 3 === 1) analyseTone(st, video) // every 3rd frame (each read copies the video frame to the CPU): scene cuts still snap within ~0.1 s
         const tone = cfg.tone ? st.tone : { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }
         const dt = st.lastT ? (now - st.lastT) : 33; st.lastT = now; st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
         const nnLiveOk = vh <= 480 // 480p and below get the neural 4x path (the result is scaled to the screen); bigger sources use the shader path

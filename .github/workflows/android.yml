@@ -42,7 +42,7 @@ jobs:
                        https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_5MB.mp4 \
                        https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_480p_h264.mov; do
               "$FFMPEG" -loglevel error -y -i "$SRC" -t 600 \
-                -vf "select='not(mod(n\,300))',scale=640:360:flags=bicubic" -fps_mode vfr -frames:v 24 -f rawvideo -pix_fmt rgb24 "$RUNNER_TEMP/calib.rgb" \
+                -vf "select='not(mod(n\,25))',scale=640:360:flags=bicubic" -fps_mode vfr -frames:v 24 -f rawvideo -pix_fmt rgb24 "$RUNNER_TEMP/calib.rgb" \
                 && [ -s "$RUNNER_TEMP/calib.rgb" ] && echo "calibration frames from $SRC" && break
             done && [ -s "$RUNNER_TEMP/calib.rgb" ] &&
             python3 "$GITHUB_WORKSPACE/tools/quantize_qnn.py" model/realesr-x4v3-640x360.onnx "$RUNNER_TEMP/calib.rgb" model/realesr-x4v3-640x360-a16w8.onnx &&

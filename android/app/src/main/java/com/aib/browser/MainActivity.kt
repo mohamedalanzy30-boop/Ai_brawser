@@ -188,6 +188,7 @@ class MainActivity : Activity() {
     /** sites where the native player could not play the video: they stay in the page player for this session */
     private val noNative = java.util.Collections.synchronizedSet(HashSet<String?>())
     private var nativeHost: String? = null
+    private var nativeOpen = false
     private fun openNative(src: String, posSec: Double) {
         val direct = if (src.startsWith("http")) Media(src, web.url, src.contains(".m3u8", true)) else null
         // HLS players request the master playlist first, so the first .m3u8 is the best choice
@@ -200,7 +201,7 @@ class MainActivity : Activity() {
         val saved = Resume.position(this, page)
         val pos = if (posSec < 5 && saved > 0) saved else (posSec * 1000).toLong()
         addLog("[AIB] native player: ${if (m.hls) "HLS" else "file"} ${m.url.take(120)} from ${pos / 1000}s")
-        nativeHost = pageHost
+        nativeHost = pageHost; nativeOpen = true
         startActivityForResult(Intent(this, PlayerActivity::class.java)
             .putStringArrayListExtra("subs", ArrayList(subs))
             .putExtra("url", m.url).putExtra("hls", m.hls).putExtra("referer", m.referer ?: page)
@@ -551,7 +552,9 @@ class MainActivity : Activity() {
         override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
             addLog("[CRASH] WebView renderer gone, didCrash=${detail.didCrash()}")
             // the page engine died (out of memory or a crash): reopen the same page in a fresh screen instead of staying blank
-            prefs.edit().putString("restoreUrl", view.url ?: HOME).apply()
+            // a page that kills the renderer again right after a restore is not reopened (no endless crash loop)
+            val again = System.currentTimeMillis() - prefs.getLong("restoreAt", 0) < 15_000
+            prefs.edit().putString("restoreUrl", if (again) HOME else (view.url ?: HOME)).putLong("restoreAt", System.currentTimeMillis()).apply()
             ui.post { recreate() }
             return true
         }
@@ -670,6 +673,7 @@ class MainActivity : Activity() {
     @Deprecated("plain Activity API")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         if (requestCode == PLAYER_REQ) {
+            nativeOpen = false
             val failed = data?.getBooleanExtra("failed", false) == true
             val pos = (data?.getLongExtra("pos", 0L) ?: 0L) / 1000.0
             if (failed) {
@@ -933,5 +937,9 @@ class MainActivity : Activity() {
     @Deprecated("handled through onKeyDown")
     override fun onBackPressed() { if (!goBackOnce()) @Suppress("DEPRECATION") super.onBackPressed() }
 
+    /** The browser is fully hidden (native player on top, or the app in the background but not in PiP): page timers stop,
+     *  so site players stop buffering and scripts stop using battery and data. */
+    override fun onStop() { super.onStop(); if (!isInPictureInPictureMode && (nativeOpen || !videoPlaying)) { web.onPause(); web.pauseTimers() } }
+    override fun onStart() { super.onStart(); web.onResume(); web.resumeTimers() }
     override fun onDestroy() { ui.removeCallbacksAndMessages(null); try { (web.parent as? ViewGroup)?.removeView(web); web.destroy() } catch (e: Exception) { }; super.onDestroy() }
 }

@@ -177,10 +177,13 @@ class PlayerActivity : Activity() {
             .setBackBuffer(2 * 60_000, true) // seeking back up to 2 minutes is instant
             .build()
         player = ExoPlayer.Builder(this).setLoadControl(load).setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(http)).build()
+        // behave like a real media app: pause for calls / other audio, pause when headphones are unplugged
+        player.setAudioAttributes(androidx.media3.common.AudioAttributes.Builder().setUsage(C.USAGE_MEDIA).setContentType(C.AUDIO_CONTENT_TYPE_MOVIE).build(), true)
+        player.setHandleAudioBecomingNoisy(true)
         setupSound()
         // subtitle files found on the page; Arabic is preferred, then whatever the site marked
         val subUrls = intent.getStringArrayListExtra("subs") ?: arrayListOf()
-        val isAr = { u: String -> Regex("(?i)(^|[^a-z])(ar|ara|arabic|عربي)([^a-z]|$)").containsMatchIn(Uri.decode(u)) }
+        val isAr = { u: String -> Regex("(?i)(^|[^a-z])(ar|ara|arabic|عربي)([^a-z]|$)").containsMatchIn(Uri.decode(u).substringBefore("?").substringAfterLast("/")) }
         val firstPick = subUrls.firstOrNull(isAr) ?: subUrls.firstOrNull()
         val subConfigs = subUrls.map { u ->
             val name = Uri.decode(Uri.parse(u).lastPathSegment ?: "subtitle")
@@ -462,6 +465,9 @@ class PlayerActivity : Activity() {
         private var inBuf: FloatBuffer? = null; private var outBuf: FloatBuffer? = null
         private var inTensor: OnnxTensor? = null; private var outTensor: OnnxTensor? = null
         private val pixels: ByteBuffer = ByteBuffer.allocateDirect(IN_W * IN_H * 4).order(ByteOrder.nativeOrder())
+        private val rgba = IntArray(IN_W * IN_H)
+        private val planes = FloatArray(3 * IN_W * IN_H)
+        private val LUT = FloatArray(256) { it / 255f }
         private var backend = "loading"; private var emaMs = 0.0; private var slowSince = 0L; private var disabledReason = ""
         private var lastFrameNs = 0L; private var fpsEma = 30.0; private var frames = 0
         private val content = FloatArray(4) // content rect inside the 640x360 model input (u0,v0,u1,v1)
@@ -551,11 +557,18 @@ class PlayerActivity : Activity() {
                 GLES30.glReadPixels(0, 0, IN_W, IN_H, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, pixels.rewind())
                 GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
                 // 2) RGBA bytes -> NCHW float planes
+                // bulk copy into plain arrays first: per-pixel buffer calls cost ~10x more on every frame
                 val inb = inBuf!!; val px = IN_W * IN_H; pixels.rewind()
+                pixels.asIntBuffer().get(rgba); pixels.rewind()
+                val pl = planes; val little = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN
                 for (i in 0 until px) {
-                    val j = i * 4
-                    inb.put(i, (pixels.get(j).toInt() and 255) / 255f); inb.put(px + i, (pixels.get(j + 1).toInt() and 255) / 255f); inb.put(2 * px + i, (pixels.get(j + 2).toInt() and 255) / 255f)
+                    val c = rgba[i]
+                    val r = if (little) c and 255 else (c ushr 24) and 255
+                    val g = (if (little) c ushr 8 else c ushr 16) and 255
+                    val b = (if (little) c ushr 16 else c ushr 8) and 255
+                    pl[i] = LUT[r]; pl[px + i] = LUT[g]; pl[2 * px + i] = LUT[b]
                 }
+                inb.position(0); inb.put(pl); inb.position(0)
                 // 3) NPU inference into the pinned output buffer
                 s!!.run(mapOf(s.inputNames.first() to inTensor!!), mapOf(s.outputNames.first() to outTensor!!)).close()
                 // 4) planes -> GPU (3 x R32F), shader converts and draws
