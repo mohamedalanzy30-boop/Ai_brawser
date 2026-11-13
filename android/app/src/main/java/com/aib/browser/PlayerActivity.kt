@@ -503,7 +503,8 @@ class PlayerActivity : Activity() {
                 val tries = listOf("npu-a16w8" to "realesr-x4v3-640x360-a16w8.onnx", "npu" to "realesr-x4v3-640x360.onnx")
                 for ((t, file) in tries) {
                     val bytes = model(file) ?: continue
-                    val ctxFile = java.io.File(ctx.filesDir, "sr_ctx_$t.onnx")
+                    val ctxFile = java.io.File(ctx.filesDir, "sr_ctx_${t}_${bytes.size}.onnx") // new model in an update = new compiled copy
+                    ctx.filesDir.listFiles { f -> (f.name.startsWith("sr_ctx_${t}_") || f.name == "sr_ctx_$t.onnx") && f.name != ctxFile.name }?.forEach { it.delete() }
                     try {
                         fun opts(dump: Boolean) = OrtSession.SessionOptions().apply {
                             setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
