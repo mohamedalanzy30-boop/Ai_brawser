@@ -9,7 +9,7 @@
   const HOST = 'https://appassets.min.local/'
   const cfg = {
     enabled: true, target: 1440, sharpness: 0.6, neural: true, denoise: 0.35,
-    tone: true, temporal: true, interp: false, interpNeural: true, images: true, gestures: true
+    tone: true, temporal: false, interp: false, interpNeural: true, images: true, gestures: true
   }
   Object.assign(cfg, window.__minCfg0 || {})
   const nativeShort = () => Math.round(Math.min(screen.width, screen.height) * (window.devicePixelRatio || 1))
@@ -63,7 +63,7 @@ precision highp float; uniform sampler2D cur, prev; uniform float amt; in vec2 u
 void main(){ vec2 t=1.0/vec2(textureSize(cur,0)); vec3 c=texture(cur,uv).rgb;
   vec3 mn=c, mx=c;
   for(int j=-1;j<=1;j++) for(int i=-1;i<=1;i++){ vec3 n=texture(cur,uv+vec2(float(i),float(j))*t).rgb; mn=min(mn,n); mx=max(mx,n); }
-  vec3 p=clamp(texture(prev,uv).rgb, mn-0.035, mx+0.035);
+  vec3 p=clamp(texture(prev,uv).rgb, mn, mx);
   float d=length(c-texture(prev,uv).rgb); float a=amt*(1.0-smoothstep(0.06,0.2,d)); o=vec4(mix(c,p,a),1.); }`
 
   // flow: block matching at reduced resolution, output = displacement (source uv units) + sad
@@ -199,7 +199,7 @@ void main(){
       if (which === 'nn') { src = R.texNN; sw = vw * 4; sh = vh * 4 } else if (which === 'raw') { src = R.texNN } else {
         if (cfg.temporal && R.hasPrev) {
           // recursive filter: blend the new frame with the previous *filtered* frame (stronger than a 2-frame blend)
-          R.pass(R.stab, R.texStab, vw, vh, u => { R.bind(0, R.texCur); R.bind(1, R.hasStab ? R.texStabPrev : R.texPrev); gl.uniform1i(u.cur, 0); gl.uniform1i(u.prev, 1); gl.uniform1f(u.amt, 0.78) })
+          R.pass(R.stab, R.texStab, vw, vh, u => { R.bind(0, R.texCur); R.bind(1, R.texPrev); gl.uniform1i(u.cur, 0); gl.uniform1i(u.prev, 1); gl.uniform1f(u.amt, 0.5) })
           src = R.texStab
           const sw2 = R.texStab; R.texStab = R.texStabPrev; R.texStabPrev = sw2; R.hasStab = true
         }

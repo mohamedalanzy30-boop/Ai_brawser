@@ -91,7 +91,7 @@ class MainActivity : Activity() {
         "enabled" to "تفعيل التحسين على كل المواقع",
         "neural" to "رفع الدقة العصبي (Real-ESRGAN)",
         "tone" to "تباين HDR تكيفي",
-        "temporal" to "استقرار زمني (يقلل الوميض)",
+        "temporal2" to "استقرار زمني (قد يترك أثراً خفيفاً للحركة)",
         "interp" to "توليد الإطارات (ثقيل)",
         "images" to "تحسين الصور",
         "adblock" to "حظر الإعلانات والمتتبعات (أسرع وأخف)",
@@ -101,7 +101,7 @@ class MainActivity : Activity() {
         "refresh" to "مطابقة معدل تحديث الشاشة للفيديو (حتى 120Hz)",
         "brightness" to "سطوع أعلى في ملء الشاشة"
     )
-    private val defaults = mapOf("enabled" to true, "neural" to true, "temporal" to true, "tone" to true, "interp" to false, "images" to true, "adblock" to true, "popups" to true, "gestures" to true, "protect" to true, "refresh" to true, "brightness" to false)
+    private val defaults = mapOf("enabled" to true, "neural" to true, "temporal2" to false, "tone" to true, "interp" to false, "images" to true, "adblock" to true, "popups" to true, "gestures" to true, "protect" to true, "refresh" to true, "brightness" to false)
     private val targets = intArrayOf(0, 720, 1080, 1440, 2160)
     private val targetLabels = arrayOf("تلقائي", "720p", "1080p", "2K", "4K")
     private val denoise = floatArrayOf(0f, 0.2f, 0.35f, 0.6f)
@@ -112,7 +112,7 @@ class MainActivity : Activity() {
 
     private fun config(): JSONObject {
         val o = JSONObject()
-        for ((k, d) in defaults) o.put(k, prefs.getBoolean(k, d))
+        for ((k, d) in defaults) o.put(if (k == "temporal2") "temporal" else k, prefs.getBoolean(k, d))
         o.put("target", prefs.getInt("target", 0))
         o.put("denoise", prefs.getFloat("denoise", 0.35f).toDouble())
         return o
