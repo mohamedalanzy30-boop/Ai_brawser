@@ -160,16 +160,31 @@ void main(){
   /* ---------------- adaptive tone analysis ---------------- */
   const toneCanvas = document.createElement('canvas'); toneCanvas.width = 32; toneCanvas.height = 18
   const toneCtx = toneCanvas.getContext('2d', { willReadFrequently: true })
+  /**
+   * Dynamic per-scene tone (the idea behind HDR10+): black/white points and gamma follow every scene.
+   * A scene cut is detected from the brightness histogram and the new values apply at once (no slow fade);
+   * inside a scene they follow quickly (~150 ms) but ignore tiny changes, so the picture does not pump or flicker.
+   */
   function analyseTone (st, video) {
     toneCtx.drawImage(video, 0, 0, 32, 18)
-    const d = toneCtx.getImageData(0, 0, 32, 18).data; const ls = []
-    for (let i = 0; i < d.length; i += 4) ls.push((0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) / 255)
+    const d = toneCtx.getImageData(0, 0, 32, 18).data; const ls = []; const hist = new Float32Array(8)
+    for (let i = 0; i < d.length; i += 4) { const l = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) / 255; ls.push(l); hist[Math.min(7, l * 8 | 0)]++ }
     ls.sort((a, b) => a - b)
-    const lo = ls[Math.floor(ls.length * 0.02)]; const hi = ls[Math.floor(ls.length * 0.98)]
-    const mean = ls.reduce((a, b) => a + b, 0) / ls.length
+    const n = ls.length; for (let i = 0; i < 8; i++) hist[i] /= n
+    const lo = ls[Math.floor(n * 0.02)]; const hi = ls[Math.floor(n * 0.98)]
+    const mean = ls.reduce((a, b) => a + b, 0) / n
     const gamma = Math.min(1.25, Math.max(0.8, Math.log(0.45) / Math.log(Math.min(0.9, Math.max(0.1, (mean - lo) / Math.max(hi - lo, 0.05))))))
-    const t = st.tone; const k = 0.12 // smooth to avoid flicker
-    t.lo += (lo * 0.9 - t.lo) * k; t.hi += (Math.max(hi, lo + 0.2) - t.hi) * k; t.gamma += (gamma - t.gamma) * k
+    const t = st.tone
+    let diff = 0; if (st.toneHist) for (let i = 0; i < 8; i++) diff += Math.abs(hist[i] - st.toneHist[i])
+    st.toneHist = hist
+    const now = performance.now(); const dt = Math.min(500, now - (st.toneT || now)); st.toneT = now
+    const cut = !st.toneHist0 || diff > 0.45; st.toneHist0 = true
+    const k = cut ? 1 : 1 - Math.exp(-dt / 150)
+    const tlo = lo * 0.9; const thi = Math.max(hi, lo + 0.2)
+    const dead = cut ? 0 : 0.008 // ignore noise-level changes inside a scene
+    if (Math.abs(tlo - t.lo) > dead) t.lo += (tlo - t.lo) * k
+    if (Math.abs(thi - t.hi) > dead) t.hi += (thi - t.hi) * k
+    if (Math.abs(gamma - t.gamma) > dead) t.gamma += (gamma - t.gamma) * k
   }
 
   /* ---------------- neural 4x via ONNX Runtime Web (in page) ---------------- */
@@ -268,7 +283,7 @@ void main(){
       state.stats.active = Array.from(state.videos.values()).filter(x => x.canvas.style.display === 'block').length
       try {
         st.R.resize(vw, vh); st.R.upload(video); st.frame++
-        if (cfg.tone && st.frame % 6 === 1) analyseTone(st, video)
+        if (cfg.tone && st.frame % 2 === 1) analyseTone(st, video) // every other frame: reacts within ~1 frame on scene cuts
         const tone = cfg.tone ? st.tone : { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }
         const dt = st.lastT ? (now - st.lastT) : 33; st.lastT = now; st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
         const nnLiveOk = vh * 4 <= Math.min(effTarget(), nativeShort()) * 1.1 // <=396p on a 1440p screen; bigger sources use the shader path

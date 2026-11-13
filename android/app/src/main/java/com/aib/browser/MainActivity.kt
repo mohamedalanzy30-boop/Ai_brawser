@@ -681,7 +681,7 @@ class MainActivity : Activity() {
             Ui.Group(this, col, "تحسين الفيديو والصور بالذكاء الاصطناعي", "يعمل على جهازك بدون إنترنت إضافي.").apply {
                 toggle("تفعيل التحسين على كل المواقع", on("enabled")) { set("enabled", it); applyConfig() }
                 toggle("رفع الدقة العصبي (Real-ESRGAN)", on("neural")) { set("neural", it); applyConfig() }
-                toggle("تباين HDR تكيفي", on("tone")) { set("tone", it); applyConfig() }
+                toggle("HDR ديناميكي لكل مشهد (فكرة HDR10+)", on("tone")) { set("tone", it); applyConfig() }
                 toggle("تحسين الصور", on("images")) { set("images", it); applyConfig() }
             }
             Ui.Group(this, col, "الدقة المستهدفة").segmented(targetLabels, targets.indexOf(prefs.getInt("target", 0)).coerceAtLeast(0)) { i -> prefs.edit().putInt("target", targets[i]).apply(); applyConfig() }
