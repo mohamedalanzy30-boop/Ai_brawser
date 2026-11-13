@@ -483,7 +483,8 @@ class PlayerActivity : Activity() {
                 val e = OrtEnvironment.getEnvironment(); env = e
                 fun model(n: String) = try { ctx.assets.open("model/$n").use { it.readBytes() } } catch (x: Exception) { null }
                 // fastest first: 16-bit/8-bit quantized model on the NPU, then the float model on the NPU, then CPU
-                val tries = listOf("npu-a16w8" to "realesr-x4v3-640x360-a16w8.onnx", "npu" to "realesr-x4v3-640x360.onnx", "cpu" to "realesr-x4v3-640x360.onnx")
+                // NPU only: on the CPU this model takes seconds per frame, which froze the picture
+                val tries = listOf("npu-a16w8" to "realesr-x4v3-640x360-a16w8.onnx", "npu" to "realesr-x4v3-640x360.onnx")
                 for ((t, file) in tries) {
                     val bytes = model(file) ?: continue
                     val ctxFile = java.io.File(ctx.filesDir, "sr_ctx_$t.onnx")
@@ -506,6 +507,15 @@ class PlayerActivity : Activity() {
                         outBuf = ByteBuffer.allocateDirect(3 * OUT_W * OUT_H * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
                         inTensor = OnnxTensor.createTensor(e, inBuf, longArrayOf(1, 3, IN_H.toLong(), IN_W.toLong()))
                         outTensor = OnnxTensor.createTensor(e, outBuf, longArrayOf(1, 3, OUT_H.toLong(), OUT_W.toLong()))
+                        // test it before the video ever waits for it: two runs on a blank frame (the first one warms the NPU up)
+                        var testMs = 0L
+                        for (k in 0 until 2) { val w0 = System.currentTimeMillis(); s.run(mapOf(s.inputNames.first() to inTensor!!), mapOf(s.outputNames.first() to outTensor!!)).close(); testMs = System.currentTimeMillis() - w0 }
+                        addLog("[player] SR test run on $t: ${testMs}ms per frame")
+                        if (testMs > 60) { // cannot keep up with a 24 fps movie: keep the smooth GPU path instead of stuttering
+                            addLog("[player] SR on $t too slow for real time, not used"); s.close(); inTensor?.close(); outTensor?.close(); inTensor = null; outTensor = null
+                            disabledReason = "slow"; continue
+                        }
+                        disabledReason = ""
                         backend = t; session = s
                         break
                     } catch (x: Throwable) { addLog("[player] SR on $t failed: ${x.message?.take(200)}"); if (t.startsWith("npu")) ctxFile.delete() }
@@ -560,7 +570,7 @@ class PlayerActivity : Activity() {
                 emaMs = if (emaMs == 0.0) ms else emaMs * 0.85 + ms * 0.15
                 // NPU too slow for this video's frame rate for 3 s -> stay smooth, fall back to the GPU shader
                 val budget = 1000.0 / Math.max(fpsEma, 1.0)
-                if (emaMs > budget * 1.15 && ++frames > 20) { if (slowSince == 0L) slowSince = now else if (now - slowSince > 3_000_000_000L) { disabledReason = "slow"; addLog("[player] SR too slow (${emaMs.toInt()}ms > ${budget.toInt()}ms), using GPU shader") } } else slowSince = 0L
+                if (emaMs > budget * 1.15 && ++frames > 5) { if (slowSince == 0L) slowSince = now else if (now - slowSince > 1_000_000_000L || ms > budget * 4) { disabledReason = "slow"; addLog("[player] SR too slow (${emaMs.toInt()}ms > ${budget.toInt()}ms), using GPU shader") } } else slowSince = 0L
             } else drawToScreen(progDirect, dispAspect)
             EGL14.eglSwapBuffers(egl, eglSurf)
             if (frames % 15 == 0) onStatus(statusText(vw, vh, useAi))
