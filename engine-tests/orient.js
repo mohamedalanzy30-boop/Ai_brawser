@@ -27,7 +27,7 @@ const ENGINE = path.resolve(__dirname, '../android/app/src/main/assets/engine.js
     const top = x.getImageData(c.width / 2, 20, 1, 1).data, bot = x.getImageData(c.width / 2, c.height - 20, 1, 1).data
     return 'top=' + Array.from(top).slice(0, 3) + ' bottom=' + Array.from(bot).slice(0, 3)
   })
-  for (const [name, c] of [['cur no-temporal', { neural: false, temporal: false, tone: false }], ['cur + temporal', { neural: false, temporal: true, tone: false }], ['neural SR (nn)', { neural: true, temporal: false, tone: false, interp: false }], ['neural RIFE (raw)', { neural: false, temporal: false, tone: false, interp: true, interpNeural: true }], ['interp shader (mid)', { neural: false, temporal: false, interp: true, interpNeural: false, tone: false }]]) {
+  for (const [name, c] of [['current frame', { neural: false, tone: false }], ['neural SR (nn)', { neural: true, tone: false }]]) {
     await page.evaluate(c => window.__minEnhanceSet(Object.assign({ enabled: true, target: 1080 }, c)), c)
     await page.waitForTimeout(name.startsWith('neural') ? 9000 : 2000); console.log(name.padEnd(22), await probe(), name.startsWith('neural SR') ? await page.evaluate(() => { const n = window.__minEnhance.state.nn; const c = document.querySelector('canvas[style*="fixed"]'); const gl = c.getContext('webgl2'); return ' planes=' + (n && n.last && n.last.planes && n.last.planes.constructor.name) + ' glError=' + (gl ? gl.getError() : 'n/a') }) : '')
   }

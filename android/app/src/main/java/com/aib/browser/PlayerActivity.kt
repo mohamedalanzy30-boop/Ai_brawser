@@ -72,6 +72,13 @@ class PlayerActivity : Activity() {
     private val ui = Handler(Looper.getMainLooper())
     private var renderer: Renderer? = null
     @Volatile private var aiWanted = true
+    private var page = ""
+    private var retries = 0
+    private lateinit var directView: SurfaceView
+    private var hdrDirect = false
+    private lateinit var eqBtn: TextView
+    private var eq: android.media.audiofx.Equalizer? = null
+    private var loud: android.media.audiofx.LoudnessEnhancer? = null
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
     private fun pill(c: Int, r: Int = 22) = GradientDrawable().apply { setColor(c); cornerRadius = dp(r).toFloat() }
@@ -94,15 +101,20 @@ class PlayerActivity : Activity() {
         intent.getStringExtra("referer")?.takeIf { it.isNotEmpty() }?.let { headers["Referer"] = it; headers["Origin"] = Uri.parse(it).let { u -> "${u.scheme}://${u.host}" } }
         intent.getStringExtra("cookie")?.takeIf { it.isNotEmpty() }?.let { headers["Cookie"] = it }
 
+        page = intent.getStringExtra("page") ?: ""
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         surfaceView = SurfaceView(this)
         root.addView(surfaceView, FrameLayout.LayoutParams(-1, -1))
+        // HDR videos go straight from the decoder to the screen (keeps real HDR); shown only when such a video plays
+        directView = SurfaceView(this).apply { visibility = View.GONE }
+        root.addView(directView, FrameLayout.LayoutParams(-1, -1, Gravity.CENTER))
 
         status = TextView(this).apply { textSize = 12f; setTextColor(0xFFB9A8FF.toInt()); setPadding(dp(10), dp(4), dp(10), dp(4)); background = pill(0x88000000.toInt(), 12) }
         title = TextView(this).apply { textSize = 15f; setTextColor(Color.WHITE); setSingleLine(); text = intent.getStringExtra("title") ?: Uri.parse(url).host }
         playBtn = btn("⏸") { player.playWhenReady = !player.playWhenReady }.apply { textSize = 28f }
         val SPEEDS = floatArrayOf(1f, 1.25f, 1.5f, 2f, 0.75f)
         speedBtn = btn("1×") { val i = (SPEEDS.indexOfFirst { it == player.playbackParameters.speed } + 1) % SPEEDS.size; player.setPlaybackSpeed(SPEEDS[i]); speedBtn.text = "${SPEEDS[i]}×" }
+        eqBtn = btn(SOUND_LABELS[0]) { setSound((soundMode + 1) % SOUND_LABELS.size) }
         aiBtn = btn("AI ✓") { aiWanted = !aiWanted; renderer?.aiWanted = aiWanted; aiBtn.text = if (aiWanted) "AI ✓" else "AI ✗" }
         seek = SeekBar(this).apply {
             max = 1000
@@ -117,6 +129,7 @@ class PlayerActivity : Activity() {
         val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(12), dp(16), 0) }
         top.addView(btn("‹") { finish() }.apply { textSize = 24f }, LinearLayout.LayoutParams(dp(48), dp(44)))
         top.addView(title, LinearLayout.LayoutParams(0, -2, 1f).apply { setMargins(dp(12), 0, dp(12), 0) })
+        top.addView(eqBtn, LinearLayout.LayoutParams(-2, dp(40)).apply { setMargins(0, 0, dp(8), 0) })
         top.addView(aiBtn, LinearLayout.LayoutParams(-2, dp(40)).apply { setMargins(0, 0, dp(8), 0) })
         top.addView(speedBtn, LinearLayout.LayoutParams(-2, dp(40)))
         val bottom = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), 0, dp(16), dp(14)) }
@@ -136,17 +149,38 @@ class PlayerActivity : Activity() {
         val http = DefaultHttpDataSource.Factory().setUserAgent(ua).setDefaultRequestProperties(headers).setAllowCrossProtocolRedirects(true)
             .setConnectTimeoutMs(15000).setReadTimeoutMs(20000)
         player = ExoPlayer.Builder(this).setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(http)).build()
+        setupSound()
         val item = MediaItem.Builder().setUri(url).apply { if (url.contains(".m3u8", true) || intent.getBooleanExtra("hls", false)) setMimeType(MimeTypes.APPLICATION_M3U8) }.build()
         player.setMediaItem(item, intent.getLongExtra("pos", 0L).coerceAtLeast(0L))
         player.prepare(); player.playWhenReady = true
         player.addListener(object : Player.Listener {
-            override fun onIsPlayingChanged(isPlaying: Boolean) { playBtn.text = if (isPlaying) "⏸" else "▶" }
-            override fun onPlayerError(error: PlaybackException) { status.text = "خطأ في التشغيل: ${error.errorCodeName}"; addLog("[player] error ${error.errorCodeName} ${error.message}") }
-            override fun onVideoSizeChanged(size: VideoSize) { renderer?.setVideoSize(size.width, size.height, size.pixelWidthHeightRatio) }
+            override fun onIsPlayingChanged(isPlaying: Boolean) { playBtn.text = if (isPlaying) "⏸" else "▶"; if (isPlaying) retries = 0 }
+            override fun onPlayerError(error: PlaybackException) {
+                addLog("[player] error ${error.errorCodeName} ${error.message}")
+                // network dropped or the server hiccuped: try again from the same second, waiting a bit longer each time
+                val net = error.errorCode in 2000..2999
+                if ((net || error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW) && retries < 8) {
+                    val wait = 2000L * (1 shl Math.min(retries, 4)); retries++
+                    status.text = "انقطع الاتصال، إعادة المحاولة خلال ${wait / 1000} ث…"
+                    ui.postDelayed({
+                        if (isFinishing) return@postDelayed
+                        if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW) player.seekToDefaultPosition()
+                        player.prepare(); player.playWhenReady = true
+                    }, wait)
+                } else status.text = "خطأ في التشغيل: ${error.errorCodeName}"
+            }
+            override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
+                val f = tracks.groups.firstOrNull { it.type == C.TRACK_TYPE_VIDEO && it.isSelected }?.let { g -> (0 until g.length).firstOrNull { g.isTrackSelected(it) }?.let { g.getTrackFormat(it) } }
+                val tr = f?.colorInfo?.colorTransfer
+                val hdr = tr == C.COLOR_TRANSFER_ST2084 || tr == C.COLOR_TRANSFER_HLG
+                if (hdr && !hdrDirect && displayHdr()) useDirectHdr()
+            }
+            override fun onVideoSizeChanged(size: VideoSize) { renderer?.setVideoSize(size.width, size.height, size.pixelWidthHeightRatio); if (hdrDirect) fitDirect() }
         })
 
         surfaceView.holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(h: SurfaceHolder) {
+                if (hdrDirect) return
                 renderer = Renderer(this@PlayerActivity, h.surface) { s -> ui.post { status.text = s } }.also {
                     it.aiWanted = aiWanted
                     it.start { videoSurface -> ui.post { player.setVideoSurface(videoSurface) } }
@@ -154,7 +188,7 @@ class PlayerActivity : Activity() {
                 }
             }
             override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) { renderer?.setViewSize(w, hh) }
-            override fun surfaceDestroyed(h: SurfaceHolder) { player.clearVideoSurface(); renderer?.stop(); renderer = null }
+            override fun surfaceDestroyed(h: SurfaceHolder) { if (!hdrDirect) player.clearVideoSurface(); renderer?.stop(); renderer = null }
         })
         setupGestures(root)
         tickUi(); showControls()
@@ -209,7 +243,66 @@ class PlayerActivity : Activity() {
         }
     }
 
-    override fun onPause() { super.onPause(); if (!isInPictureInPictureMode) player.pause() }
+    override fun onPause() { super.onPause(); saveResume(); if (!isInPictureInPictureMode) player.pause() }
+    private fun saveResume() { if (::player.isInitialized && player.duration > 0) Resume.save(this, page, title.text.toString(), player.currentPosition, player.duration) }
+
+    /* ---------- HDR: the decoder draws straight to the screen, so HDR10/HLG/Dolby Vision stay real HDR ---------- */
+    @Suppress("DEPRECATION")
+    private fun displayHdr(): Boolean = try { windowManager.defaultDisplay.hdrCapabilities?.supportedHdrTypes?.isNotEmpty() == true } catch (e: Exception) { false }
+    private fun useDirectHdr() {
+        hdrDirect = true
+        addLog("[player] HDR video: direct output (AI upscaling not needed for HDR sources)")
+        try { window.colorMode = android.content.pm.ActivityInfo.COLOR_MODE_HDR } catch (e: Exception) { }
+        directView.holder.addCallback(object : SurfaceHolder.Callback {
+            override fun surfaceCreated(h: SurfaceHolder) { player.setVideoSurfaceHolder(h); renderer?.stop(); renderer = null; surfaceView.visibility = View.GONE; status.text = "HDR ✓" }
+            override fun surfaceChanged(h: SurfaceHolder, f: Int, w: Int, hh: Int) {}
+            override fun surfaceDestroyed(h: SurfaceHolder) {}
+        })
+        directView.visibility = View.VISIBLE
+        fitDirect()
+    }
+    /** keep the real picture shape on the direct surface */
+    private fun fitDirect() {
+        val vs = player.videoSize; val root = directView.parent as View
+        if (vs.width <= 0 || root.width <= 0) { root.post { if (player.videoSize.width > 0) fitDirect() }; return }
+        val a = vs.width * vs.pixelWidthHeightRatio / vs.height
+        var w = root.width; var hh = (w / a).toInt()
+        if (hh > root.height) { hh = root.height; w = (hh * a).toInt() }
+        directView.layoutParams = FrameLayout.LayoutParams(w, hh, Gravity.CENTER)
+    }
+
+    /* ---------- sound: normal / clear dialogue / night (quiet explosions, loud voices) ---------- */
+    private val SOUND_LABELS = arrayOf("🎧 عادي", "🗣 حوار", "🌙 ليلي")
+    private var soundMode = 0
+    private fun setupSound() {
+        try {
+            val id = (getSystemService(Context.AUDIO_SERVICE) as AudioManager).generateAudioSessionId()
+            player.audioSessionId = id
+            eq = android.media.audiofx.Equalizer(0, id)
+            loud = android.media.audiofx.LoudnessEnhancer(id)
+        } catch (e: Throwable) { addLog("[player] audio effects unavailable: ${e.message}") }
+        setSound(getSharedPreferences("enhance", Context.MODE_PRIVATE).getInt("sound", 0))
+    }
+    private fun setSound(m: Int) {
+        soundMode = m.coerceIn(0, SOUND_LABELS.size - 1); eqBtn.text = SOUND_LABELS[soundMode]
+        getSharedPreferences("enhance", Context.MODE_PRIVATE).edit().putInt("sound", soundMode).apply()
+        try {
+            eq?.let { e ->
+                val range = e.bandLevelRange // millibels
+                for (b in 0 until e.numberOfBands) {
+                    val hz = e.getCenterFreq(b.toShort()) / 1000
+                    val mb = when (soundMode) {
+                        1 -> when { hz < 150 -> -600; hz < 400 -> -200; hz < 1000 -> 200; hz < 5000 -> 600; else -> 200 } // voices forward
+                        2 -> when { hz < 150 -> -900; hz < 400 -> -400; hz < 1000 -> 200; hz < 5000 -> 500; else -> 0 }   // night: less boom
+                        else -> 0
+                    }
+                    e.setBandLevel(b.toShort(), mb.coerceIn(range[0].toInt(), range[1].toInt()).toShort())
+                }
+                e.setEnabled(soundMode != 0)
+            }
+            loud?.let { it.setTargetGain(when (soundMode) { 1 -> 400; 2 -> 900; else -> 0 }); it.setEnabled(soundMode != 0) }
+        } catch (e: Throwable) { addLog("[player] sound mode failed: ${e.message}") }
+    }
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
         if (player.isPlaying) try { enterPictureInPictureMode(android.app.PictureInPictureParams.Builder().setAspectRatio(android.util.Rational(16, 9)).build()) } catch (e: Exception) { }
@@ -217,6 +310,8 @@ class PlayerActivity : Activity() {
     override fun onPictureInPictureModeChanged(inPip: Boolean, c: android.content.res.Configuration) { super.onPictureInPictureModeChanged(inPip, c); controls.visibility = if (inPip) View.GONE else View.VISIBLE }
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
+        saveResume()
+        try { eq?.release(); loud?.release() } catch (e: Throwable) { }
         if (::player.isInitialized) { setResult(RESULT_OK, Intent().putExtra("pos", player.currentPosition)); player.release() }
         renderer?.stop(); renderer = null
         super.onDestroy()

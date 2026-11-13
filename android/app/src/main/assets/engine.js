@@ -1,7 +1,6 @@
 /* On-device video/image enhancement engine (runs inside the page, no network needed).
    Pipeline per video frame, all on the GPU (WebGL2):
      [optional] neural 4x super-resolution (Real-ESRGAN general-x4v3 via ONNX Runtime Web, WebGPU)
-     temporal stabilisation -> frame interpolation (block-matching flow) ->
      Catmull-Rom resample -> denoise/deblock -> contrast-adaptive sharpen -> adaptive tone mapping.
    Native code sets configuration with window.__minEnhanceSet({...}). */
 ;(function () {
@@ -9,7 +8,7 @@
   const HOST = 'https://appassets.min.local/'
   const cfg = {
     enabled: true, target: 1440, sharpness: 0.6, neural: true, denoise: 0.35,
-    tone: true, temporal: false, interp: false, interpNeural: true, images: true, gestures: true, autoNative: true
+    tone: true, images: true, gestures: true, autoNative: true
   }
   Object.assign(cfg, window.__minCfg0 || {})
   const nativeShort = () => Math.round(Math.min(screen.width, screen.height) * (window.devicePixelRatio || 1))
@@ -17,10 +16,9 @@
   try { // WebView: screen.orientation.lock() rejects, which breaks many players' fullscreen; native code rotates instead
     if (screen.orientation) { screen.orientation.lock = () => Promise.resolve(); screen.orientation.unlock = () => {} }
   } catch (e) { /* ignore */ }
-  // Performance guard: watches main-thread long tasks while a video plays and sheds the heaviest
-  // feature first. Each repeated overload pauses it longer (20s, 60s, 3min); the 4th time it stays
+  // Performance guard: watches main-thread long tasks while a video plays and pauses neural upscaling. Each repeated overload pauses it longer (20s, 60s, 3min); the 4th time it stays
   // off until the page is reloaded, so the phone never stays overloaded.
-  const guard = { noInterp: false, noNeural: false, strikes: 0, retryAt: 0, off: false }
+  const guard = { noNeural: false, strikes: 0, retryAt: 0, off: false }
   const longTasks = []
   try { new PerformanceObserver(l => { for (const e of l.getEntries()) longTasks.push([e.startTime, e.duration]) }).observe({ entryTypes: ['longtask'] }) } catch (e) { /* unsupported */ }
   setInterval(() => {
@@ -28,18 +26,14 @@
     while (longTasks.length && now - longTasks[0][0] > 3000) longTasks.shift()
     const busy = longTasks.reduce((a, t) => a + t[1], 0)
     const playing = Array.from(state.videos.keys()).some(v => !v.paused)
-    if (guard.retryAt && now > guard.retryAt && !guard.off) { guard.noInterp = false; guard.noNeural = false; guard.retryAt = 0; longTasks.length = 0; log('performance guard: retrying heavy features') }
+    if (guard.retryAt && now > guard.retryAt && !guard.off) { guard.noNeural = false; guard.retryAt = 0; longTasks.length = 0; log('performance guard: retrying heavy features') }
     if (!playing || busy < 450) return
-    const what = (cfg.interp && !guard.noInterp) ? 'interp' : (cfg.neural && !guard.noNeural) ? 'neural' : null
-    if (!what) return
-    if (what === 'interp') guard.noInterp = true; else guard.noNeural = true
-    // turning off interpolation alone counts as a light step; a neural overload is a strike
-    if (what === 'neural') guard.strikes++
-    longTasks.length = 0
-    if (guard.strikes >= 4) { guard.off = true; guard.noInterp = guard.noNeural = true; log('performance guard: heavy features off for this page (busy ' + Math.round(busy) + 'ms/3s)'); return }
-    const secs = what === 'interp' ? 30 : [0, 20, 60, 180][guard.strikes]
+    if (!cfg.neural || guard.noNeural) return
+    guard.noNeural = true; guard.strikes++; longTasks.length = 0
+    if (guard.strikes >= 4) { guard.off = true; log('performance guard: neural upscaling off for this page (busy ' + Math.round(busy) + 'ms/3s)'); return }
+    const secs = [0, 20, 60, 180][guard.strikes]
     guard.retryAt = now + secs * 1000
-    log('performance guard:', what === 'interp' ? 'frame interpolation' : 'neural upscaling', 'paused ' + secs + 's (busy ' + Math.round(busy) + 'ms/3s)')
+    log('performance guard: neural upscaling paused ' + secs + 's (busy ' + Math.round(busy) + 'ms/3s)')
   }, 1500)
   const log = (...a) => { try { console.warn('[AIB]', ...a) } catch (e) { /* ignore */ } }
   const state = { videos: new Map(), failed: false, nn: null, stats: { nn: 'idle', fps: 0, ms: 0 } }
@@ -54,38 +48,6 @@ void main(){ uv = p*0.5+0.5; uv.y = 1.0-uv.y; gl_Position = vec4(p,0.,1.); }`
   const VS_FBO = `#version 300 es
 in vec2 p; out vec2 uv;
 void main(){ uv = p*0.5+0.5; gl_Position = vec4(p,0.,1.); }`
-
-  // stabilise: motion-adaptive temporal blend of previous and current source frame
-  const FS_STAB = `#version 300 es
-precision highp float; uniform sampler2D cur, prev; uniform float amt; in vec2 uv; out vec4 o;
-// history is clamped to the colour range of the current 3x3 neighbourhood (as in TAA), so moving
-// edges and bright highlights can never leave a trail ("ghost") behind; only static flicker is smoothed
-void main(){ vec2 t=1.0/vec2(textureSize(cur,0)); vec3 c=texture(cur,uv).rgb;
-  vec3 mn=c, mx=c;
-  for(int j=-1;j<=1;j++) for(int i=-1;i<=1;i++){ vec3 n=texture(cur,uv+vec2(float(i),float(j))*t).rgb; mn=min(mn,n); mx=max(mx,n); }
-  vec3 p=clamp(texture(prev,uv).rgb, mn, mx);
-  float d=length(c-texture(prev,uv).rgb); float a=amt*(1.0-smoothstep(0.06,0.2,d)); o=vec4(mix(c,p,a),1.); }`
-
-  // flow: block matching at reduced resolution, output = displacement (source uv units) + sad
-  const FS_FLOW = `#version 300 es
-precision highp float; uniform sampler2D cur, prev; uniform vec2 srcSize; in vec2 uv; out vec4 o;
-float lum(vec3 c){ return dot(c, vec3(.299,.587,.114)); }
-void main(){
-  vec2 px = 4.0/srcSize; float best=1e9; vec2 bd=vec2(0.);
-  for(int y=-6;y<=6;y++) for(int x=-6;x<=6;x++){
-    vec2 d=vec2(float(x),float(y))*px*0.5; float s=0.;
-    for(int j=-1;j<=1;j++) for(int i=-1;i<=1;i++){
-      vec2 o2=vec2(float(i),float(j))*px*0.5;
-      s+=abs(lum(texture(cur,uv+o2).rgb)-lum(texture(prev,uv+o2+d).rgb)); }
-    s+=0.002*length(vec2(x,y)); // prefer small motion
-    if(s<best){best=s;bd=d;} }
-  o=vec4(bd,best,1.); }`
-
-  // midpoint frame between prev and cur using the flow field
-  const FS_MID = `#version 300 es
-precision highp float; uniform sampler2D cur, prev, flow; in vec2 uv; out vec4 o;
-void main(){ vec4 f=texture(flow,uv); vec2 d=f.xy; float ok=1.0-smoothstep(0.35,0.9,f.z);
-  vec3 a=texture(cur,uv-d*0.5*ok).rgb, b=texture(prev,uv+d*0.5*ok).rgb; o=vec4(mix(a,b,0.5),1.); }`
 
   const FS_PLANES = `#version 300 es
 precision highp float; uniform sampler2D pr, pg, pb; in vec2 uv; out vec4 o;
@@ -152,30 +114,20 @@ void main(){
     const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance' })
     if (!gl) return null
     const R = { gl, canvas, w: 0, h: 0 }
-    R.stab = program(gl, FS_STAB, VS_FBO); R.flowP = program(gl, FS_FLOW, VS_FBO); R.mid = program(gl, FS_MID, VS_FBO); R.planesP = program(gl, FS_PLANES, VS_FBO); R.main = program(gl, FS_MAIN)
+    R.planesP = program(gl, FS_PLANES, VS_FBO); R.main = program(gl, FS_MAIN)
     const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf)
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW)
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
-    R.texCur = texture(gl); R.texPrev = texture(gl); R.texNN = texture(gl)
-    R.fbo = gl.createFramebuffer(); R.hasPrev = false
-    R.resize = function (w, h) { // source-sized intermediates
-      if (R.w === w && R.h === h) return
-      R.w = w; R.h = h
-      R.texStab = texture(gl, w, h); R.texStabPrev = texture(gl, w, h); R.hasStab = false; R.texMid = texture(gl, w, h)
-      R.fw = Math.max(8, Math.round(w / 4)); R.fh = Math.max(8, Math.round(h / 4))
-      R.texFlow = texture(gl, R.fw, R.fh, gl.NEAREST)
-      gl.bindTexture(gl.TEXTURE_2D, R.texFlow)
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, R.fw, R.fh, 0, gl.RGBA, gl.FLOAT, null)
-      R.hasPrev = false
-    }
+    R.texCur = texture(gl); R.texNN = texture(gl)
+    R.fbo = gl.createFramebuffer()
+    R.resize = function (w, h) { R.w = w; R.h = h }
     R.bind = function (unit, tex) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex) }
     R.pass = function (prog, target, w, h, setup) {
       gl.bindFramebuffer(gl.FRAMEBUFFER, target ? R.fbo : null)
       if (target) gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, target, 0)
       gl.viewport(0, 0, w, h); gl.useProgram(prog.p); setup(prog.u); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4)
     }
-    R.upload = function (source) { // rotate cur -> prev, upload new frame into cur (throws on tainted media)
-      const t = R.texPrev; R.texPrev = R.texCur; R.texCur = t
+    R.upload = function (source) { // upload the new frame (throws on tainted media)
       R.bind(0, R.texCur)
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source)
     }
@@ -189,32 +141,16 @@ void main(){
       for (let i = 0; i < 3; i++) { R.bind(i, R.texP[i]); gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, w, h, 0, gl.RED, gl.FLOAT, data.subarray(i * n, (i + 1) * n)) }
       R.pass(R.planesP, R.texNN, w, h, u => { gl.uniform1i(u.pr, 0); gl.uniform1i(u.pg, 1); gl.uniform1i(u.pb, 2) })
     }
-    R.uploadRaw = function (bytes, w, h) {
-      R.bind(0, R.texNN); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, bytes)
-    }
-    // which: 'cur' | 'mid' | 'nn'
+    // which: 'cur' (current video frame) | 'nn' (neural 4x output). Only the current frame is ever shown:
+    // nothing is blended with earlier frames, so motion can never leave a trail.
     R.draw = function (which, vw, vh, tone, sharp) {
       let src = R.texCur; let sw = vw; let sh = vh
-      if (which === 'nn') { src = R.texNN; sw = vw * 4; sh = vh * 4 } else if (which === 'raw') { src = R.texNN } else {
-        if (cfg.temporal && R.hasPrev) {
-          // recursive filter: blend the new frame with the previous *filtered* frame (stronger than a 2-frame blend)
-          R.pass(R.stab, R.texStab, vw, vh, u => { R.bind(0, R.texCur); R.bind(1, R.texPrev); gl.uniform1i(u.cur, 0); gl.uniform1i(u.prev, 1); gl.uniform1f(u.amt, 0.5) })
-          src = R.texStab
-          const sw2 = R.texStab; R.texStab = R.texStabPrev; R.texStabPrev = sw2; R.hasStab = true
-        }
-        if (which === 'mid' && R.hasPrev) {
-          R.pass(R.flowP, R.texFlow, R.fw, R.fh, u => { R.bind(0, R.texCur); R.bind(1, R.texPrev); gl.uniform1i(u.cur, 0); gl.uniform1i(u.prev, 1); gl.uniform2f(u.srcSize, vw, vh) })
-          R.pass(R.mid, R.texMid, vw, vh, u => { R.bind(0, R.texCur); R.bind(1, R.texPrev); R.bind(2, R.texFlow); gl.uniform1i(u.cur, 0); gl.uniform1i(u.prev, 1); gl.uniform1i(u.flow, 2) })
-          src = R.texMid
-        }
-      }
+      if (which === 'nn') { src = R.texNN; sw = vw * 4; sh = vh * 4 }
       R.pass(R.main, null, R.canvas.width, R.canvas.height, u => {
         R.bind(0, src); gl.uniform1i(u.tex, 0); gl.uniform2f(u.texSize, sw, sh)
         gl.uniform1f(u.sharp, sharp); gl.uniform1f(u.denoise, which === 'nn' ? cfg.denoise * 0.3 : cfg.denoise)
         gl.uniform4f(u.tone, tone.lo, tone.hi, tone.contrast, tone.sat); gl.uniform1f(u.gammaV, tone.gamma)
       })
-      R.hasPrev = true
     }
     R.dispose = function () { const e = gl.getExtension('WEBGL_lose_context'); if (e) e.loseContext() }
     gl.getExtension('EXT_color_buffer_float')
@@ -255,10 +191,6 @@ void main(){
     })().catch((e) => { state.stats.nn = 'error'; log('neural SR load failed:', String(e)) })
   }
   const grab = document.createElement('canvas'); const grabCtx = grab.getContext('2d', { willReadFrequently: true })
-  function grabBytes (video, vw, vh) {
-    grab.width = vw; grab.height = vh; grabCtx.drawImage(video, 0, 0, vw, vh)
-    return grabCtx.getImageData(0, 0, vw, vh).data
-  }
   async function nnRun (video, vw, vh) {
     const nn = state.nn; nn.busy = true
     try {
@@ -271,48 +203,6 @@ void main(){
       const o = out[nn.session.outputNames[0]].data; const ow = vw * 4; const oh = vh * 4 // Float32 NCHW, converted on the GPU
       nn.last = { mediaTime: mt, w: ow, h: oh, planes: o, id: ++nn.rid }
     } catch (e) { state.stats.nn = 'error'; log('SR inference failed:', String(e)) } finally { nn.busy = false }
-  }
-
-  /* ---------------- neural frame interpolation: RIFE 4.25 lite (MIT) ---------------- */
-  const rife = { session: null, loading: false, busy: false, ms: 0, backend: null }
-  function rifeInit () {
-    if (rife.session || rife.loading || !window.ort) return
-    rife.loading = true
-    const ort = window.ort
-    ort.env.wasm.wasmPaths = HOST + 'ort/'; ort.env.wasm.numThreads = 1
-    ;(async () => {
-      const bytes = new Uint8Array(await (await fetch(HOST + 'model/rife_v425lite.onnx')).arrayBuffer())
-      let hasGpu = false
-      try { hasGpu = !!(navigator.gpu && await navigator.gpu.requestAdapter()) } catch (e) { /* none */ }
-      for (const ep of hasGpu ? ['webgpu', 'wasm'] : ['wasm']) {
-        try { rife.session = await ort.InferenceSession.create(bytes, { executionProviders: [ep], graphOptimizationLevel: 'all' }); rife.backend = ep; break } catch (e) { log('RIFE backend', ep, 'failed:', String(e)) }
-      }
-      state.stats.rife = rife.session ? 'ready:' + rife.backend : 'error'
-      log('RIFE model', state.stats.rife)
-    })().catch((e) => { state.stats.rife = 'error'; rife.loading = false; log('RIFE load failed:', String(e)) })
-  }
-  function toPlanes (rgba, w, h, pw, ph) { // RGBA bytes -> padded NCHW float32
-    const pl = pw * ph; const out = new Float32Array(3 * pl)
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-      const i = y * w + x; const j = i * 4; const o = y * pw + x
-      out[o] = rgba[j] / 255; out[pl + o] = rgba[j + 1] / 255; out[2 * pl + o] = rgba[j + 2] / 255
-    }
-    return out
-  }
-  async function rifeMid (prev, cur, w, h) {
-    const pw = Math.ceil(w / 64) * 64; const ph = Math.ceil(h / 64) * 64; const t0 = performance.now(); const ort = window.ort
-    const out = await rife.session.run({
-      img0: new ort.Tensor('float32', toPlanes(prev, w, h, pw, ph), [1, 3, ph, pw]),
-      img1: new ort.Tensor('float32', toPlanes(cur, w, h, pw, ph), [1, 3, ph, pw]),
-      timestep: new ort.Tensor('float32', new Float32Array([0.5]), [1, 1, 1, 1])
-    })
-    rife.ms = rife.ms ? rife.ms * 0.7 + (performance.now() - t0) * 0.3 : performance.now() - t0
-    const d = out[rife.session.outputNames[0]].data; const pl = pw * ph; const res = new Uint8Array(w * h * 4)
-    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-      const o = y * pw + x; const j = (y * w + x) * 4
-      res[j] = d[o] * 255 + 0.5; res[j + 1] = d[pl + o] * 255 + 0.5; res[j + 2] = d[2 * pl + o] * 255 + 0.5; res[j + 3] = 255
-    }
-    return res
   }
 
   /* ---------------- video ---------------- */
@@ -381,11 +271,8 @@ void main(){
         if (cfg.tone && st.frame % 6 === 1) analyseTone(st, video)
         const tone = cfg.tone ? st.tone : { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }
         const dt = st.lastT ? (now - st.lastT) : 33; st.lastT = now; st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
-        const nnWins = cfg.neural && !guard.noNeural && vh * 4 <= Math.min(effTarget(), nativeShort()) * 1.1 && state.nn && state.nn.ms > 0 && state.nn.ms < 0.6 * (1000 / Math.max(st.fpsEMA, 1))
-        const wantInterp = cfg.interp && !guard.noInterp && !video.paused && st.fpsEMA < 40 && !nnWins
-        if (wantInterp && cfg.interpNeural && vh <= 540 && !(rife.session && st.prevBytes && rife.ms < 0.9 * (1000 / st.fpsEMA))) st.prevBytes = grabBytes(video, vw, vh)
         const nnLiveOk = vh * 4 <= Math.min(effTarget(), nativeShort()) * 1.1 // <=396p on a 1440p screen; bigger sources use the shader path
-        const wantNN = cfg.neural && (video.paused || (!guard.noNeural && nnLiveOk)) && !wantInterp && vh <= 540 && state.nn && state.nn.session && state.stats.nn !== 'error'
+        const wantNN = cfg.neural && (video.paused || (!guard.noNeural && nnLiveOk)) && vh <= 540 && state.nn && state.nn.session && state.stats.nn !== 'error'
         if (cfg.neural && vh <= 540) nnInit()
         // Neural frames are only shown when they are consistent: exact frame while paused, or when the
         // model keeps up with the video (always one steady frame late). Never mix stale and live frames.
@@ -397,20 +284,6 @@ void main(){
         if (fresh) {
           if (st.nnId !== r.id) { st.R.uploadPlanes(r.planes, r.w, r.h); st.nnId = r.id }
           st.R.draw('nn', vw, vh, tone, cfg.sharpness * 0.3)
-        } else if (wantInterp && cfg.interpNeural && vh <= 540 && (rifeInit(), rife.session) && st.prevBytes &&
-                   rife.ms < 0.9 * (1000 / st.fpsEMA)) {
-          // neural midpoint: present it first, then the real frame half an interval later
-          const cur = grabBytes(video, vw, vh); const prevB = st.prevBytes; st.prevBytes = cur
-          if (!rife.busy) {
-            rife.busy = true
-            rifeMid(prevB, cur, vw, vh).then(mid => {
-              st.R.uploadRaw(mid, vw, vh); st.nnId = -1; st.R.draw('raw', vw, vh, tone, cfg.sharpness)
-              setTimeout(() => { if (state.videos.has(video)) { try { st.R.draw('cur', vw, vh, tone, cfg.sharpness) } catch (e) { /* ignore */ } } }, Math.max(8, 500 / st.fpsEMA))
-            }).catch((e) => { rife.ms = 1e9; log('RIFE inference failed:', String(e)) }).finally(() => { rife.busy = false })
-          } else st.R.draw('cur', vw, vh, tone, cfg.sharpness)
-        } else if (wantInterp && st.R.hasPrev) {
-          st.R.draw('mid', vw, vh, tone, cfg.sharpness) // midpoint now, real frame half an interval later
-          setTimeout(() => { if (state.videos.has(video)) { try { st.R.draw('cur', vw, vh, tone, cfg.sharpness) } catch (e) { /* ignore */ } } }, Math.max(8, 500 / st.fpsEMA))
         } else st.R.draw('cur', vw, vh, tone, cfg.sharpness)
         video.style.opacity = '0'; st.errors = 0
       } catch (e) { if (++st.errors > 3) { log('video disabled (', String(e), ') src=', (video.currentSrc || '').slice(0, 80)); detach(video); st.running = false; return } }
@@ -654,7 +527,7 @@ void main(){
   let timer = null
   new window.MutationObserver(() => { clearTimeout(timer); timer = setTimeout(scan, 400) }).observe(document, { childList: true, subtree: true })
   document.addEventListener('visibilitychange', () => { if (!document.hidden) state.videos.forEach((_, v) => loop(v)) })
-  const CFG_KEYS = ['enabled', 'target', 'sharpness', 'neural', 'denoise', 'tone', 'temporal', 'interp', 'interpNeural', 'images', 'gestures', 'autoNative']
+  const CFG_KEYS = ['enabled', 'target', 'sharpness', 'neural', 'denoise', 'tone', 'images', 'gestures', 'autoNative']
   function forward (c) { // push the config into every child frame (players live in iframes)
     for (let i = 0; i < window.frames.length; i++) { try { window.frames[i].postMessage({ __aibCfg: c }, '*') } catch (e) { /* ignore */ } }
   }
@@ -664,7 +537,6 @@ void main(){
     window.__minEnhanceSet(c)
   })
   window.__minEnhanceSet = function (c) {
-    if (c && c.interp === true) guard.noInterp = false
     if (c && c.neural === true) { guard.noNeural = false; guard.off = false; guard.strikes = 0 }
     Object.assign(cfg, c || {}); forward(c || {})
     if (cfg.enabled) { scan(); state.videos.forEach((_, v) => loop(v)) } else Array.from(state.videos.keys()).forEach(detach)

@@ -31,9 +31,6 @@ jobs:
           rm -rf package onnxruntime-web-*.tgz
           curl -fL -o model/realesr-general-x4v3.onnx \
             https://huggingface.co/CoderViking/realesr-general-x4v3-onnx/resolve/main/realesr-general-x4v3.onnx
-          curl -fL -o model/rife_v425lite.onnx \
-            https://huggingface.co/t9749/rife-4.25-lite-onnx/resolve/main/rife_v425lite.onnx
-          echo "702802d0862ab78f2d72133c6bc3768e7e89b81756f7cd51d1055a2fe3d06577  model/rife_v425lite.onnx" | sha256sum -c -
           # fixed-size copy of the SR model for the NPU (native player)
           pip install --quiet --only-binary=:all: onnx
           python3 "$GITHUB_WORKSPACE/tools/fix_model.py" model/realesr-general-x4v3.onnx model/realesr-x4v3-640x360.onnx 360 640
@@ -42,7 +39,7 @@ jobs:
           ( pip install --quiet --only-binary=:all: onnxruntime imageio-ffmpeg &&
             FFMPEG=$(python3 -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())") &&
             "$FFMPEG" -loglevel error -i https://download.blender.org/peach/bigbuckbunny_movies/BigBuckBunny_320x180.mp4 \
-              -vf "select='not(mod(n\,600))',scale=640:360:flags=bicubic" -vsync vfr -frames:v 24 -f rawvideo -pix_fmt rgb24 "$RUNNER_TEMP/calib.rgb" &&
+              -vf "select='not(mod(n\,600))',scale=640:360:flags=bicubic" -fps_mode vfr -frames:v 24 -f rawvideo -pix_fmt rgb24 "$RUNNER_TEMP/calib.rgb" &&
             python3 "$GITHUB_WORKSPACE/tools/quantize_qnn.py" model/realesr-x4v3-640x360.onnx "$RUNNER_TEMP/calib.rgb" model/realesr-x4v3-640x360-a16w8.onnx &&
             rm -f model/*.pre.onnx ) || echo "::warning::quantized model skipped"
           # ad/tracker host list (StevenBlack/hosts, MIT), bundled so blocking needs no network at runtime
@@ -52,7 +49,11 @@ jobs:
             curl -fsSL https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt \
               | grep -v '^#' | tr 'A-Z' 'a-z'; } | grep -E '^[a-z0-9.-]+$' | sort -u > adhosts.txt
           test "$(wc -l < adhosts.txt)" -gt 10000
-          ls -la ort model adhosts.txt
+          # optional adult-content filter (off by default in the app): HaGeZi NSFW (GPL-3.0)
+          curl -fsSL https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/nsfw-onlydomains.txt \
+            | grep -v '^#' | tr 'A-Z' 'a-z' | grep -E '^[a-z0-9.-]+$' | sort -u > adulthosts.txt \
+            || { echo "::warning::adult list skipped"; : > adulthosts.txt; }
+          ls -la ort model adhosts.txt adulthosts.txt
       - uses: gradle/actions/setup-gradle@v4
         with: { gradle-version: '8.10.2' }
       - name: Build debug APK

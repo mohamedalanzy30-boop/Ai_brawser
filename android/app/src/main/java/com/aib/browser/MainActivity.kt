@@ -6,23 +6,29 @@ import android.app.Dialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Color
-import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowInsets
+import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
 import android.webkit.ConsoleMessage
+import android.webkit.CookieManager
 import android.webkit.RenderProcessGoneDetail
-import android.webkit.WebResourceError
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -30,116 +36,112 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
-import android.widget.Switch
 import android.widget.TextView
+import android.widget.Toast
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 import androidx.webkit.ScriptHandler
+import androidx.webkit.WebSettingsCompat
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.FileNotFoundException
 
 private const val ASSET_HOST = "appassets.min.local"
 private const val HOME = "https://www.google.com"
-private const val BG = 0xFF0F0F0F.toInt()
-private const val SURFACE = 0xFF1F1F1F.toInt()
-private const val ACCENT = 0xFF7C5CFF.toInt()
+private const val FILE_REQ = 41
 
 class MainActivity : Activity() {
     private lateinit var web: WebView
-    private lateinit var urlBar: EditText
-    private lateinit var progress: ProgressBar
-    private lateinit var badge: TextView
+    private lateinit var refresher: SwipeRefreshLayout
     private lateinit var content: FrameLayout
-    private lateinit var bottomBar: View
+    private lateinit var bottomBar: LinearLayout
+    private lateinit var addressPill: FrameLayout
+    private lateinit var addressText: TextView
+    private lateinit var urlEdit: EditText
+    private lateinit var progress: ProgressBar
+    private lateinit var backBtn: ImageView
+    private lateinit var fwdBtn: ImageView
+    private lateinit var aiBtn: ImageView
     private var customView: View? = null
     private var customCallback: WebChromeClient.CustomViewCallback? = null
     private var scriptHandler: ScriptHandler? = null
+    private var fileCallback: ValueCallback<Array<Uri>>? = null
     private val ui = Handler(Looper.getMainLooper())
+    private val prefs by lazy { getSharedPreferences("enhance", Context.MODE_PRIVATE) }
+    private fun dp(v: Int) = Ui.dp(this, v)
+    private fun on(k: String) = prefs.getBoolean(k, defaults[k] == true)
+
+    /* ======================= diagnostics log ======================= */
     private val logLines = ArrayDeque<String>()
     private val timeFmt = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US)
-
-    private fun addLog(line: String) {
-        synchronized(logLines) {
-            val last = logLines.lastOrNull()
-            if (last != null && last.substringAfter(' ').replace(Regex(" ×\\d+$"), "") == line) {
-                val n = Regex(" ×(\\d+)$").find(last)?.groupValues?.get(1)?.toInt() ?: 1
-                logLines.removeLast(); logLines.addLast("${timeFmt.format(java.util.Date())} $line ×${n + 1}")
-                return
-            }
+    private fun addLog(line: String) = synchronized(logLines) {
+        val last = logLines.lastOrNull()
+        if (last != null && last.substringAfter(' ').replace(Regex(" ×\\d+$"), "") == line) {
+            val n = Regex(" ×(\\d+)$").find(last)?.groupValues?.get(1)?.toInt() ?: 1
+            logLines.removeLast(); logLines.addLast("${timeFmt.format(java.util.Date())} $line ×${n + 1}")
+        } else {
             logLines.addLast("${timeFmt.format(java.util.Date())} $line")
             while (logLines.size > 400) logLines.removeFirst()
         }
     }
-
     private fun logText(): String {
         val wv = WebViewCompat.getCurrentWebViewPackage(this)
         val d = windowManager.defaultDisplay
         val hdr = d.hdrCapabilities?.supportedHdrTypes?.joinToString { when (it) { 1 -> "DolbyVision"; 2 -> "HDR10"; 3 -> "HLG"; 4 -> "HDR10+"; else -> "$it" } } ?: "none"
-        val rates = d.supportedModes.map { Math.round(it.refreshRate) }.distinct().sorted().joinToString("/")
         val m = android.util.DisplayMetrics().also { d.getRealMetrics(it) }
-        val disp = "display=${m.widthPixels}x${m.heightPixels} dpi=${m.densityDpi} refresh=${Math.round(d.refreshRate)}Hz modes=$rates hdr=$hdr wideGamut=${d.isWideColorGamut}"
-        val head = "$disp\nAI Browser 0.1 | ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} | Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) | WebView ${wv?.versionName}\nconfig=${config()}\nadblock=${if (adblockOn) "on" else "off"} hosts=${adHosts.size} blocked=$blocked popups=$popupsBlocked\nurl=${web.url}\n"
+        val head = "display=${m.widthPixels}x${m.heightPixels} dpi=${m.densityDpi} refresh=${Math.round(d.refreshRate)}Hz hdr=$hdr\n" +
+            "AI Browser ${packageManager.getPackageInfo(packageName, 0).versionName} | ${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL} | Android ${android.os.Build.VERSION.RELEASE} (API ${android.os.Build.VERSION.SDK_INT}) | WebView ${wv?.versionName}\n" +
+            "config=${config()}\nadblock=${if (adblockOn) "on" else "off"} hosts=${adHosts.size} adult=${adultHosts.size} blocked=$blocked popups=$popupsBlocked\nurl=${web.url}\n"
         val pl = synchronized(PlayerActivity.log) { PlayerActivity.log.joinToString("\n") }
         return head + synchronized(logLines) { logLines.joinToString("\n") } + (if (pl.isNotEmpty()) "\n--- native player ---\n$pl" else "")
     }
-    private val prefs by lazy { getSharedPreferences("enhance", Context.MODE_PRIVATE) }
 
-    private val toggles = linkedMapOf(
-        "enabled" to "تفعيل التحسين على كل المواقع",
-        "neural" to "رفع الدقة العصبي (Real-ESRGAN)",
-        "tone" to "تباين HDR تكيفي",
-        "temporal2" to "استقرار زمني (قد يترك أثراً خفيفاً للحركة)",
-        "interp" to "توليد الإطارات (ثقيل)",
-        "images" to "تحسين الصور",
-        "adblock" to "حظر الإعلانات والمتتبعات (أسرع وأخف)",
-        "popups" to "منع النوافذ المنبثقة والتحويلات الإعلانية",
-        "autoNative" to "فتح الأفلام تلقائياً في المشغّل الأصلي (AI)",
-        "gestures" to "تحكم المشغّل: نقر مزدوج ±10ث، سحب للسطوع والصوت",
-        "protect" to "حماية متقدمة: تصفح آمن، HTTPS إجباري، إزالة روابط التتبع، منع الكاميرا والموقع",
-        "refresh" to "مطابقة معدل تحديث الشاشة للفيديو (حتى 120Hz)",
-        "brightness" to "سطوع أعلى في ملء الشاشة"
+    /* ======================= settings ======================= */
+    private val defaults = mapOf(
+        "enabled" to true, "neural" to true, "tone" to true, "images" to true,
+        "autoNative" to true, "gestures" to true, "brightness" to false,
+        "adblock" to true, "popups" to true, "protect" to true, "adult" to false
     )
-    private val defaults = mapOf("enabled" to true, "neural" to true, "temporal2" to false, "tone" to true, "interp" to false, "images" to true, "adblock" to true, "popups" to true, "gestures" to true, "autoNative" to true, "protect" to true, "refresh" to true, "brightness" to false)
     private val targets = intArrayOf(0, 720, 1080, 1440, 2160)
     private val targetLabels = arrayOf("تلقائي", "720p", "1080p", "2K", "4K")
     private val denoise = floatArrayOf(0f, 0.2f, 0.35f, 0.6f)
     private val denoiseLabels = arrayOf("بدون", "خفيف", "متوسط", "قوي")
 
-    private fun dp(v: Int) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), resources.displayMetrics).toInt()
-    private fun pill(color: Int, r: Int = 24) = GradientDrawable().apply { setColor(color); cornerRadius = dp(r).toFloat() }
-
-    private fun config(): JSONObject {
-        val o = JSONObject()
-        for ((k, d) in defaults) o.put(if (k == "temporal2") "temporal" else k, prefs.getBoolean(k, d))
-        o.put("target", prefs.getInt("target", 0))
-        o.put("denoise", prefs.getFloat("denoise", 0.35f).toDouble())
-        return o
+    /** What the in-page engine needs (keys must match engine.js cfg). */
+    private fun config(): JSONObject = JSONObject().apply {
+        for (k in listOf("enabled", "neural", "tone", "images", "gestures", "autoNative")) put(k, on(k))
+        put("target", prefs.getInt("target", 0)); put("denoise", prefs.getFloat("denoise", 0.35f).toDouble())
     }
 
-    /* ---------- ad / tracker blocking: bundled host list, no network needed ---------- */
+    /* ======================= blocking: ads, trackers, adult (bundled lists, no network) ======================= */
     @Volatile private var adHosts: Set<String> = emptySet()
+    @Volatile private var adultHosts: Set<String> = emptySet()
     @Volatile private var blocked = 0
-    private fun loadAdHosts() = Thread {
-        adHosts = try { assets.open("adhosts.txt").bufferedReader().useLines { l -> l.filter { it.isNotBlank() }.toHashSet() } } catch (e: Exception) { emptySet() }
-        addLog("[AIB] ad blocker: ${adHosts.size} hosts loaded")
+    @Volatile private var popupsBlocked = 0
+    @Volatile private var adblockOn = true
+    @Volatile private var adultOn = false
+    private fun loadList(name: String): Set<String> = try { assets.open(name).bufferedReader().useLines { l -> l.filter { it.isNotBlank() }.toHashSet() } } catch (e: Exception) { emptySet() }
+    private fun loadLists() = Thread {
+        adHosts = loadList("adhosts.txt"); addLog("[AIB] ad blocker: ${adHosts.size} hosts")
+        if (adultOn) { adultHosts = loadList("adulthosts.txt"); addLog("[AIB] adult filter: ${adultHosts.size} hosts") }
     }.start()
-    private fun isAd(host: String?): Boolean {
-        if (host == null || adHosts.isEmpty()) return false
-        var h: String = host.lowercase()
+    private fun inList(list: Set<String>, host: String?): Boolean {
+        if (host == null || list.isEmpty()) return false
+        var h = host.lowercase()
         while (true) { // also matches subdomains (x.ads.example.com -> ads.example.com)
-            if (h in adHosts) return true
+            if (h in list) return true
             val i = h.indexOf('.'); if (i < 0 || h.indexOf('.', i + 1) < 0) return false
             h = h.substring(i + 1)
         }
     }
-    @Volatile private var adblockOn = true
+    private fun isAd(host: String?) = inList(adHosts, host)
+    private fun isAdult(host: String?) = adultOn && inList(adultHosts, host)
     @Volatile private var pageHost: String? = null
-    @Volatile private var popupsBlocked = 0
-    @Volatile private var videoPlaying = false
-    @Volatile private var videoAspect = android.util.Rational(16, 9)
 
     /** Registrable domain, good enough to tell "same site" from "another site". */
     private fun site(host: String?): String {
@@ -149,12 +151,16 @@ class MainActivity : Activity() {
         val n = if (sld.length <= 3 && sld in setOf("co", "com", "net", "org", "gov", "edu", "ac", "or", "ne")) 3 else 2
         return p.takeLast(n).joinToString(".")
     }
+    /** Sign-in pages that must open as a real pop-up window (they talk back to the page that opened them). */
+    private val authHosts = setOf("accounts.google.com", "appleid.apple.com", "www.facebook.com", "m.facebook.com", "login.microsoftonline.com",
+        "login.live.com", "github.com", "api.twitter.com", "twitter.com", "x.com", "discord.com", "www.linkedin.com", "accounts.spotify.com")
 
-    /** Small bridge for the in-page player controls. Every method is harmless if a page calls it. */
-    /* ---------- native player: remember the real video addresses the page loads ---------- */
+    /* ======================= native player hand-off ======================= */
     private data class Media(val url: String, val referer: String?, val hls: Boolean)
     private val media = java.util.concurrent.CopyOnWriteArrayList<Media>()
     private val mediaExt = Regex("\\.(mp4|m4v|webm|mkv|mov)$", RegexOption.IGNORE_CASE)
+    @Volatile private var videoPlaying = false
+    @Volatile private var videoAspect = android.util.Rational(16, 9)
     private fun noteMedia(req: WebResourceRequest) {
         val u = req.url; val path = u.path ?: ""
         val hls = path.endsWith(".m3u8", true) || path.endsWith(".m3u", true)
@@ -168,37 +174,38 @@ class MainActivity : Activity() {
         val m = direct ?: media.firstOrNull { it.hls } ?: media.lastOrNull()
         if (m == null) {
             addLog("[AIB] native player: no video address found (src=${src.take(40)}, seen=${media.size})")
-            android.widget.Toast.makeText(this, "لم أجد رابط الفيديو الحقيقي (قد يكون محمياً)", android.widget.Toast.LENGTH_LONG).show(); return
+            Toast.makeText(this, "لم أجد رابط الفيديو الحقيقي (قد يكون محمياً)", Toast.LENGTH_LONG).show(); return
         }
-        addLog("[AIB] native player: ${if (m.hls) "HLS" else "file"} ${m.url.take(120)}")
-        val i = android.content.Intent(this, PlayerActivity::class.java)
-            .putExtra("url", m.url).putExtra("hls", m.hls).putExtra("referer", m.referer ?: web.url ?: "")
-            .putExtra("ua", web.settings.userAgentString).putExtra("cookie", android.webkit.CookieManager.getInstance().getCookie(m.url) ?: "")
-            .putExtra("pos", (posSec * 1000).toLong()).putExtra("title", web.title ?: "")
-        startActivity(i)
+        val page = web.url ?: ""
+        val saved = Resume.position(this, page)
+        val pos = if (posSec < 5 && saved > 0) saved else (posSec * 1000).toLong()
+        addLog("[AIB] native player: ${if (m.hls) "HLS" else "file"} ${m.url.take(120)} from ${pos / 1000}s")
+        startActivity(Intent(this, PlayerActivity::class.java)
+            .putExtra("url", m.url).putExtra("hls", m.hls).putExtra("referer", m.referer ?: page)
+            .putExtra("ua", web.settings.userAgentString).putExtra("cookie", CookieManager.getInstance().getCookie(m.url) ?: "")
+            .putExtra("pos", pos).putExtra("title", web.title ?: "").putExtra("page", page))
     }
 
+    /** Small bridge for the in-page player controls. Every method is harmless if a page calls it. */
     inner class Bridge {
         @android.webkit.JavascriptInterface fun openNative(src: String, pos: Double) { ui.post { this@MainActivity.openNative(src, pos) } }
         /** auto mode: only switches when a real video address is known; otherwise the page keeps playing */
         @android.webkit.JavascriptInterface fun autoNative(src: String, pos: Double): Boolean {
-            if (!prefs.getBoolean("autoNative", true)) return false
+            if (!on("autoNative")) return false
             if (!src.startsWith("http") && media.isEmpty()) return false
             ui.post { this@MainActivity.openNative(src, pos) }
             return true
         }
-        @android.webkit.JavascriptInterface fun playing(on: Boolean, w: Int, h: Int) {
-            videoPlaying = on
+        @android.webkit.JavascriptInterface fun playing(playing: Boolean, w: Int, h: Int) {
+            videoPlaying = playing
             if (w > 0 && h > 0) { val r = w.toDouble() / h; videoAspect = if (r > 2.39) android.util.Rational(239, 100) else if (r < 0.42) android.util.Rational(42, 100) else android.util.Rational(w, h) }
-            ui.post { updatePipParams() }
+            ui.post { keepScreenOn(playing); updatePipParams() }
         }
         @android.webkit.JavascriptInterface fun brightness(delta: Float): Float {
-            var v = 0f
-            ui.post {
-                val lp = window.attributes
-                val cur = if (lp.screenBrightness < 0) try { android.provider.Settings.System.getInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS) / 255f } catch (e: Exception) { 0.5f } else lp.screenBrightness
-                lp.screenBrightness = (cur + delta).coerceIn(0.02f, 1f); v = lp.screenBrightness; window.attributes = lp
-            }
+            val lp = window.attributes
+            val cur = if (lp.screenBrightness < 0) try { android.provider.Settings.System.getInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS) / 255f } catch (e: Exception) { 0.5f } else lp.screenBrightness
+            val v = (cur + delta).coerceIn(0.02f, 1f)
+            ui.post { window.attributes = window.attributes.also { it.screenBrightness = v } }
             return v
         }
         @android.webkit.JavascriptInterface fun volume(delta: Float): Float {
@@ -212,245 +219,342 @@ class MainActivity : Activity() {
         @android.webkit.JavascriptInterface fun pip() { ui.post { enterPip() } }
     }
 
-    private fun pipParams(): android.app.PictureInPictureParams? {
-        if (android.os.Build.VERSION.SDK_INT < 26) return null
+    /** The screen must not go dark while a video plays (the phone's sleep timer ignores web video). */
+    private fun keepScreenOn(keep: Boolean) {
+        if (keep) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    /* ======================= picture in picture ======================= */
+    private fun pipParams(): android.app.PictureInPictureParams {
         val b = android.app.PictureInPictureParams.Builder().setAspectRatio(videoAspect)
-        if (android.os.Build.VERSION.SDK_INT >= 31) b.setAutoEnterEnabled(videoPlaying && prefs.getBoolean("gestures", true)).setSeamlessResizeEnabled(true)
+        if (android.os.Build.VERSION.SDK_INT >= 31) b.setAutoEnterEnabled(videoPlaying && on("gestures")).setSeamlessResizeEnabled(true)
         return b.build()
     }
-    private fun updatePipParams() { try { pipParams()?.let { setPictureInPictureParams(it) } } catch (e: Exception) { /* ignore */ } }
-    private fun enterPip() {
-        if (!videoPlaying) return
-        try { pipParams()?.let { enterPictureInPictureMode(it) } } catch (e: Exception) { addLog("[AIB] PiP failed: $e") }
-    }
-    override fun onUserLeaveHint() {
-        super.onUserLeaveHint()
-        if (android.os.Build.VERSION.SDK_INT < 31 && videoPlaying && prefs.getBoolean("gestures", true)) enterPip()
-    }
+    private fun updatePipParams() { try { setPictureInPictureParams(pipParams()) } catch (e: Exception) { } }
+    private fun enterPip() { if (videoPlaying) try { enterPictureInPictureMode(pipParams()) } catch (e: Exception) { addLog("[AIB] PiP failed: $e") } }
+    override fun onUserLeaveHint() { super.onUserLeaveHint(); if (android.os.Build.VERSION.SDK_INT < 31 && videoPlaying && on("gestures")) enterPip() }
     override fun onPictureInPictureModeChanged(inPip: Boolean, newConfig: android.content.res.Configuration) {
         super.onPictureInPictureModeChanged(inPip, newConfig)
         bottomBar.visibility = if (inPip) View.GONE else View.VISIBLE
-        progress.visibility = View.GONE
         if (inPip) content.setPadding(0, 0, 0, 0) else content.requestApplyInsets()
         web.evaluateJavascript("window.__aibPip&&window.__aibPip($inPip)", null)
     }
 
-    /* ---------- protection ---------- */
-    private val trackingParams = Regex("^(utm_.*|fbclid|gclid|dclid|gbraid|wbraid|msclkid|yclid|mc_eid|mc_cid|igshid|_hsenc|_hsmi|ref_src|si)$")
+    /* ======================= protection ======================= */
+    private val trackingParams = Regex("^(utm_.*|fbclid|gclid|dclid|gbraid|wbraid|msclkid|yclid|mc_eid|mc_cid|igshid|_hsenc|_hsmi|ref_src)$")
     /** Removes tracking parameters (utm_*, fbclid, gclid...) from a URL; returns null if nothing changed. */
-    private fun cleanUrl(u: android.net.Uri): android.net.Uri? {
+    private fun cleanUrl(u: Uri): Uri? {
         val names = try { u.queryParameterNames } catch (e: Exception) { return null }
         if (names.none { trackingParams.matches(it) }) return null
         val b = u.buildUpon().clearQuery()
         for (n in names) if (!trackingParams.matches(n)) for (v in u.getQueryParameters(n)) b.appendQueryParameter(n, v)
         return b.build()
     }
-    private fun applyProtection() {
-        // third-party cookies stay allowed: embedded movie players need them; trackers are cut by the host list instead
-        android.webkit.CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
-        web.settings.apply {
-            if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) androidx.webkit.WebSettingsCompat.setSafeBrowsingEnabled(this, true)
-            allowFileAccess = false; allowContentAccess = false; setGeolocationEnabled(false)
-        }
-    }
 
+    /* ======================= in-page engine ======================= */
     private fun asset(path: String): String = assets.open(path).bufferedReader().use { it.readText() }
     private val bundle by lazy { asset("ort/ort.webgpu.min.js") + "\n;" + asset("engine.js") }
-
     /** Engine + ONNX Runtime injected at document start into EVERY frame (also embedded players in iframes). */
     private fun registerScript() {
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
         scriptHandler?.remove()
-        scriptHandler = WebViewCompat.addDocumentStartJavaScript(
-            web, "window.__minCfg0=${config()};\n$bundle", setOf("*")
-        )
+        scriptHandler = WebViewCompat.addDocumentStartJavaScript(web, "window.__minCfg0=${config()};\n$bundle", setOf("*"))
     }
-
     private fun applyConfig() {
         registerScript()
         web.evaluateJavascript("window.__minEnhanceSet&&window.__minEnhanceSet(${config()})", null)
     }
+    private fun injectFallback() { // main frame only, used if document-start scripts are unsupported
+        web.evaluateJavascript("if(!window.__minEnhance){window.__minCfg0=${config()};$bundle\n}", null)
+    }
 
+    /* ======================= UI ======================= */
     @SuppressLint("SetJavaScriptEnabled", "ClickableViewAccessibility")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window.statusBarColor = BG
-        window.navigationBarColor = BG
-        window.decorView.systemUiVisibility = 0
+        window.statusBarColor = Ui.BG
+        window.navigationBarColor = 0xFF1C1C1E.toInt()
+        adblockOn = on("adblock"); adultOn = on("adult")
 
-        content = FrameLayout(this).apply { setBackgroundColor(BG) }
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(BG) }
-
-        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-            max = 100; visibility = View.GONE
-            progressDrawable.setTint(ACCENT)
+        content = FrameLayout(this).apply { setBackgroundColor(Ui.BG) }
+        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        web = WebView(this).apply { setBackgroundColor(Ui.BG) }
+        refresher = SwipeRefreshLayout(this).apply {
+            addView(web)
+            setColorSchemeColors(Ui.BLUE); setProgressBackgroundColorSchemeColor(0xFF2C2C2E.toInt())
+            setOnRefreshListener { web.reload() }
+            // only when the page itself is scrolled to the top (pages with their own scrolling area keep working)
+            setOnChildScrollUpCallback { _, _ -> web.scrollY > 0 || customView != null }
         }
-        web = WebView(this).apply { setBackgroundColor(BG) }
-
-        // bottom bar (thumb friendly): back | address | enhance
-        val back = iconButton("‹", 30) { goBackOnce() }.apply { setOnLongClickListener { showHistory(); true } }
-        urlBar = EditText(this).apply {
-            setSingleLine(); hint = "ابحث أو اكتب عنوان"; setHintTextColor(0xFF8A8A8A.toInt()); setTextColor(Color.WHITE)
-            textSize = 15f; background = pill(SURFACE, 22); setPadding(dp(16), 0, dp(16), 0)
-            imeOptions = EditorInfo.IME_ACTION_GO; textDirection = View.TEXT_DIRECTION_LTR
-            setOnEditorActionListener { _, _, _ -> go(text.toString()); clearFocus(); true }
-            setOnFocusChangeListener { _, f -> if (f) post { selectAll() } }
-        }
-        badge = TextView(this).apply {
-            text = "✨"; textSize = 20f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
-            background = pill(SURFACE, 22); setOnClickListener { showSettings() }
-        }
-        val bar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-            setBackgroundColor(BG); setPadding(dp(8), dp(6), dp(8), dp(6))
-        }
-        bar.addView(back, LinearLayout.LayoutParams(dp(44), dp(44)))
-        bar.addView(urlBar, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
-        bar.addView(badge, LinearLayout.LayoutParams(dp(56), dp(44)))
-
-        root.addView(progress, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(2)))
-        root.addView(web, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-        bottomBar = bar
-        root.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        content.addView(root, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        column.addView(refresher, LinearLayout.LayoutParams(-1, 0, 1f))
+        bottomBar = buildBottomBar()
+        column.addView(bottomBar, LinearLayout.LayoutParams(-1, -2))
+        content.addView(column, FrameLayout.LayoutParams(-1, -1))
         setContentView(content)
 
-        // Android 15 draws edge-to-edge: keep content clear of the system bars
+        // Android 15 draws edge-to-edge: keep content clear of the system bars; the bar colour runs under the nav bar
         content.setOnApplyWindowInsetsListener { v, insets ->
             val b = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
-            v.setPadding(b.left, b.top, b.right, b.bottom)
+            v.setPadding(b.left, b.top, b.right, 0)
+            bottomBar.setPadding(dp(12), dp(8), dp(12), b.bottom + dp(2))
             WindowInsets.CONSUMED
         }
 
+        setupWebView()
+        loadLists()
+        registerScript()
+        pollBadge()
+        go(intent?.dataString ?: HOME)
+    }
+
+    private fun buildBottomBar(): LinearLayout {
+        val bar = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(0xFF1C1C1E.toInt()) }
+        // hairline on top
+        bar.addView(View(this).apply { setBackgroundColor(0x33FFFFFF) }, LinearLayout.LayoutParams(-1, 1).apply { bottomMargin = dp(8) })
+
+        // address pill: lock + domain (centered, like Safari); tap = edit; swipe left/right = forward/back
+        addressPill = FrameLayout(this).apply { background = Ui.round(this@MainActivity, Ui.FIELD, 13) }
+        val shown = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
+        val lock = Ui.icon(this, R.drawable.ic_lock, Ui.LABEL)
+        addressText = Ui.text(this, "", 16f).apply { setSingleLine(); ellipsize = android.text.TextUtils.TruncateAt.END }
+        shown.addView(lock, LinearLayout.LayoutParams(dp(14), dp(14)).apply { marginEnd = dp(6) })
+        shown.addView(addressText)
+        urlEdit = EditText(this).apply {
+            setSingleLine(); hint = "ابحث أو اكتب عنواناً"; setHintTextColor(Ui.SECONDARY); setTextColor(Ui.LABEL); textSize = 16f
+            background = null; setPadding(dp(14), 0, dp(14), 0); visibility = View.GONE
+            imeOptions = EditorInfo.IME_ACTION_GO; textDirection = View.TEXT_DIRECTION_LTR
+            setOnEditorActionListener { _, _, _ -> go(text.toString()); endEdit(); true }
+            setOnFocusChangeListener { _, f -> if (!f) endEdit() }
+        }
+        progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100; visibility = View.GONE; progressTintList = ColorStateList.valueOf(Ui.BLUE); progressBackgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
+        }
+        addressPill.addView(shown, FrameLayout.LayoutParams(-1, -1))
+        addressPill.addView(urlEdit, FrameLayout.LayoutParams(-1, -1))
+        addressPill.addView(progress, FrameLayout.LayoutParams(-1, dp(3), Gravity.BOTTOM).apply { setMargins(dp(10), 0, dp(10), 0) })
+        var x0 = 0f; var swiped = false
+        addressPill.setOnTouchListener { _, e ->
+            when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN -> { x0 = e.x; swiped = false }
+                MotionEvent.ACTION_MOVE -> if (!swiped && Math.abs(e.x - x0) > dp(60)) {
+                    swiped = true
+                    if (e.x > x0) goBackOnce() else if (web.canGoForward()) web.goForward()
+                }
+                MotionEvent.ACTION_UP -> if (!swiped) startEdit()
+            }
+            true
+        }
+        bar.addView(addressPill, LinearLayout.LayoutParams(-1, dp(46)))
+
+        // toolbar: back · forward · AI · history · reload
+        val tools = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+        backBtn = Ui.icon(this, R.drawable.ic_back, Ui.BLUE) { goBackOnce() }.apply { setOnLongClickListener { showHistory(); true } }
+        fwdBtn = Ui.icon(this, R.drawable.ic_forward, Ui.BLUE) { if (web.canGoForward()) web.goForward() }
+        aiBtn = Ui.icon(this, R.drawable.ic_sparkle, Ui.BLUE) { showSettings() }
+        val hist = Ui.icon(this, R.drawable.ic_history, Ui.BLUE) { showHistory() }
+        val reload = Ui.icon(this, R.drawable.ic_reload, Ui.BLUE) { web.reload() }
+        for (v in listOf(backBtn, fwdBtn, aiBtn, hist, reload)) tools.addView(v, LinearLayout.LayoutParams(0, dp(46), 1f))
+        bar.addView(tools, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
+        return bar
+    }
+    private fun startEdit() {
+        urlEdit.setText(web.url ?: ""); urlEdit.visibility = View.VISIBLE; addressText.parent.let { (it as View).visibility = View.INVISIBLE }
+        urlEdit.requestFocus(); urlEdit.selectAll()
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(urlEdit, InputMethodManager.SHOW_IMPLICIT)
+    }
+    private fun endEdit() {
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(urlEdit.windowToken, 0)
+        urlEdit.visibility = View.GONE; (addressText.parent as View).visibility = View.VISIBLE; urlEdit.clearFocus()
+    }
+    private fun showAddress(url: String?) {
+        val u = Uri.parse(url ?: "")
+        addressText.text = when {
+            u.host == null -> url ?: ""
+            u.host!!.contains("google.") && u.path == "/search" -> u.getQueryParameter("q") ?: u.host
+            else -> u.host!!.removePrefix("www.")
+        }
+        backBtn.alpha = if (web.canGoBack()) 1f else 0.35f
+        fwdBtn.alpha = if (web.canGoForward()) 1f else 0.35f
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun setupWebView() {
         web.settings.apply {
-            javaScriptEnabled = true; domStorageEnabled = true
+            javaScriptEnabled = true; domStorageEnabled = true; databaseEnabled = true
             mediaPlaybackRequiresUserGesture = false
             mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
             setSupportZoom(true); builtInZoomControls = true; displayZoomControls = false
             useWideViewPort = true; loadWithOverviewMode = true
-            // use the phone's system font (e.g. Samsung One UI font) for pages that do not ship their own
             standardFontFamily = "sans-serif"; sansSerifFontFamily = "sans-serif"; fixedFontFamily = "monospace"; serifFontFamily = "serif"
             textZoom = 100
             setSupportMultipleWindows(true); javaScriptCanOpenWindowsAutomatically = false
+            offscreenPreRaster = true
+            // look like Chrome, not like an embedded WebView: Google sign-in and some sites refuse WebViews
+            userAgentString = userAgentString.replace("; wv", "").replace(Regex("Version/\\d+\\.\\d+ "), "")
+            allowFileAccess = false; allowContentAccess = false; setGeolocationEnabled(false)
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) WebSettingsCompat.setSafeBrowsingEnabled(this, true)
         }
-        web.addJavascriptInterface(Bridge(), "AIBNative")
-        web.webChromeClient = object : WebChromeClient() {
-            override fun onProgressChanged(view: WebView, p: Int) {
-                progress.progress = p; progress.visibility = if (p in 1..99) View.VISIBLE else View.GONE
-            }
-            override fun onShowCustomView(view: View, cb: CustomViewCallback) { // fullscreen video
-                customView = view; customCallback = cb
-                content.addView(view, FrameLayout.LayoutParams(-1, -1))
-                content.setPadding(0, 0, 0, 0)
-                window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
-                requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-                if (prefs.getBoolean("brightness", false)) { val lp = window.attributes; lp.screenBrightness = 1f; window.attributes = lp }
-            }
-            override fun onHideCustomView() { exitFullscreen() }
-            override fun onPermissionRequest(request: android.webkit.PermissionRequest) { request.deny() } // no camera/mic for pages
-            override fun onGeolocationPermissionsShowPrompt(origin: String, cb: android.webkit.GeolocationPermissions.Callback) { cb.invoke(origin, false, false) }
-            override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message): Boolean {
-                // pop-ups: catch the URL in a throw-away WebView, then decide. Ads and pop-unders to other
-                // sites are dropped; a real link to the same site opens in this tab (single-tab browser).
-                val strict = prefs.getBoolean("popups", true)
-                if (strict && !isUserGesture) { popupsBlocked++; addLog("[AIB] blocked pop-up (no tap)"); return false }
-                val tmp = WebView(this@MainActivity)
-                tmp.webViewClient = object : WebViewClient() {
-                    override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
-                        val host = r.url.host
-                        val ad = isAd(host) || (strict && site(host) != site(pageHost))
-                        if (ad && strict) { popupsBlocked++; addLog("[AIB] blocked pop-up -> $host") } else web.loadUrl(r.url.toString())
-                        v.destroy(); return true
-                    }
-                }
-                (resultMsg.obj as WebView.WebViewTransport).webView = tmp
-                resultMsg.sendToTarget()
-                return true
-            }
-            override fun onConsoleMessage(m: ConsoleMessage): Boolean {
-                val noise = m.message().startsWith("Permissions policy violation") || m.message().contains("VerifyEachNodeIsAssignedToAnEp") || m.message().startsWith("ResizeObserver loop")
-                val interesting = !noise && (m.message().startsWith("[AIB]") || m.messageLevel() == ConsoleMessage.MessageLevel.ERROR)
-                if (interesting) addLog("[${m.messageLevel()}] ${m.message()} (${m.sourceId().substringAfterLast('/')}:${m.lineNumber()})")
-                return true
-            }
-        }
-        web.webViewClient = object : WebViewClient() {
-            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
-                val u = request.url
-                noteMedia(request)
-                if (adblockOn && !request.isForMainFrame && isAd(u.host) && !isAd(pageHost)) {
-                    blocked++
-                    return WebResourceResponse("text/plain", "utf-8", 204, "No Content", mapOf("Access-Control-Allow-Origin" to "*"), "".byteInputStream())
-                }
-                if (u.host == "fonts.gstatic.com" && request.method == "GET") return proxyFont(request)
-                if (u.host != ASSET_HOST) return null
-                val path = u.path.orEmpty().trimStart('/')
-                val cors = mapOf("Access-Control-Allow-Origin" to "*")
-                return try {
-                    val mime = when {
-                        path.endsWith(".wasm") -> "application/wasm"
-                        path.endsWith(".js") || path.endsWith(".mjs") -> "text/javascript"
-                        else -> "application/octet-stream"
-                    }
-                    WebResourceResponse(mime, null, 200, "OK", cors, assets.open(path))
-                } catch (e: FileNotFoundException) {
-                    WebResourceResponse("text/plain", "utf-8", 404, "Not Found", cors, "".byteInputStream())
-                }
-            }
-            override fun onReceivedError(view: WebView, req: WebResourceRequest, err: WebResourceError) {
-                if (req.isForMainFrame || req.url.host == ASSET_HOST) addLog("[LOAD ERROR] ${req.url} -> ${err.description}")
-            }
-            override fun onReceivedHttpError(view: WebView, req: WebResourceRequest, resp: WebResourceResponse) {
-                if (req.url.host == ASSET_HOST || req.isForMainFrame) addLog("[HTTP ${resp.statusCode}] ${req.url}")
-            }
-            override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
-                addLog("[CRASH] WebView renderer gone, didCrash=${detail.didCrash()}")
-                return true
-            }
-            override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean {
-                val scheme = req.url.scheme ?: ""
-                if (scheme != "http" && scheme != "https" && scheme != "about" && scheme != "data" && scheme != "blob") {
-                    // intent://, market:// ... : ads use these to throw you into Chrome or the Play Store
-                    if (prefs.getBoolean("popups", true) && (!req.hasGesture() || req.url.toString().contains("package=com.android.chrome"))) {
-                        popupsBlocked++; addLog("[AIB] blocked app redirect ${scheme}://${req.url.host}"); return true
-                    }
-                    return try {
-                        val it = android.content.Intent.parseUri(req.url.toString(), android.content.Intent.URI_INTENT_SCHEME)
-                        it.addCategory(android.content.Intent.CATEGORY_BROWSABLE); it.component = null; it.selector = null
-                        startActivity(it); true
-                    } catch (e: Exception) { true }
-                }
-                if (req.isForMainFrame && prefs.getBoolean("protect", true)) {
-                    val clean = cleanUrl(req.url)
-                    if (req.url.scheme == "http" && !req.isRedirect) { view.loadUrl((clean ?: req.url).buildUpon().scheme("https").build().toString()); return true }
-                    if (clean != null) { view.loadUrl(clean.toString()); return true }
-                }
-                // pop-under / redirect ads: a frame or the page jumping to an ad host is dropped
-                if (adblockOn && isAd(req.url.host) && !isAd(pageHost)) { blocked++; addLog("[AIB] blocked ad redirect ${req.url.host}"); return true }
-                // while a video page is open, a jump to another site that nobody tapped is an ad redirect
-                if (prefs.getBoolean("popups", true) && req.isForMainFrame && !req.hasGesture() && !req.isRedirect && videoPlaying &&
-                    site(req.url.host) != site(pageHost)) { popupsBlocked++; addLog("[AIB] blocked redirect -> ${req.url.host}"); return true }
-                return false
-            }
-            override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
-                if (site(android.net.Uri.parse(url).host) != site(pageHost)) { videoPlaying = false; media.clear() }
-                pageHost = android.net.Uri.parse(url).host
-                if (!urlBar.hasFocus()) urlBar.setText(url)
-                if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
-            }
-            override fun onPageFinished(view: WebView, url: String) {
-                recordHistory(url, view.title)
-                if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
-            }
-        }
-        // keep the page's renderer (video decoding + audio) at high priority so playback does not crackle
+        // third-party cookies stay allowed: embedded movie players and sign-in need them; trackers are cut by the host list
+        CookieManager.getInstance().setAcceptCookie(true)
+        CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
         web.setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_IMPORTANT, false)
-        adblockOn = prefs.getBoolean("adblock", true)
-        loadAdHosts()
-        applyProtection()
-        registerScript()
-        pollBadge()
-        go(intent?.dataString ?: HOME)
+        web.addJavascriptInterface(Bridge(), "AIBNative")
+        web.setDownloadListener { url, ua, disposition, mime, _ -> download(url, ua, disposition, mime) }
+        web.webChromeClient = Chrome()
+        web.webViewClient = Client()
+    }
+
+    private inner class Chrome : WebChromeClient() {
+        override fun onProgressChanged(view: WebView, p: Int) {
+            progress.progress = p; progress.visibility = if (p in 1..99) View.VISIBLE else View.GONE
+            if (p == 100) refresher.isRefreshing = false
+        }
+        override fun onShowCustomView(view: View, cb: CustomViewCallback) { // fullscreen video
+            customView = view; customCallback = cb
+            content.addView(view, FrameLayout.LayoutParams(-1, -1))
+            content.setPadding(0, 0, 0, 0)
+            @Suppress("DEPRECATION")
+            window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            keepScreenOn(true)
+            if (on("brightness")) window.attributes = window.attributes.also { it.screenBrightness = 1f }
+        }
+        override fun onHideCustomView() { exitFullscreen() }
+        override fun onPermissionRequest(request: android.webkit.PermissionRequest) { request.deny() } // no camera/mic for pages
+        override fun onGeolocationPermissionsShowPrompt(origin: String, cb: android.webkit.GeolocationPermissions.Callback) { cb.invoke(origin, false, false) }
+        override fun onShowFileChooser(view: WebView, cb: ValueCallback<Array<Uri>>, params: FileChooserParams): Boolean {
+            fileCallback?.onReceiveValue(null); fileCallback = cb
+            return try { startActivityForResult(params.createIntent().apply { if (params.mode == FileChooserParams.MODE_OPEN_MULTIPLE) putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true) }, FILE_REQ); true }
+            catch (e: Exception) { fileCallback = null; false }
+        }
+        override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message): Boolean {
+            // Pop-ups: a tap-less pop-up is always an ad. Otherwise catch the first address in a hidden window and decide:
+            // sign-in pages open as a real window, same-site links open here, ads and pop-unders to other sites are dropped.
+            val strict = on("popups")
+            if (strict && !isUserGesture) { popupsBlocked++; addLog("[AIB] blocked pop-up (no tap)"); return false }
+            val pw = WebView(this@MainActivity)
+            pw.settings.apply { javaScriptEnabled = true; domStorageEnabled = true; userAgentString = web.settings.userAgentString; setSupportMultipleWindows(false) }
+            CookieManager.getInstance().setAcceptThirdPartyCookies(pw, true)
+            var decided = false
+            pw.webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
+                    if (decided) return false
+                    decided = true
+                    val host = r.url.host
+                    return when {
+                        host in authHosts -> { showPopup(pw); false }
+                        isAd(host) || isAdult(host) || (strict && site(host) != site(pageHost)) -> { popupsBlocked++; addLog("[AIB] blocked pop-up -> $host"); ui.post { v.destroy() }; true }
+                        else -> { web.loadUrl(r.url.toString()); ui.post { v.destroy() }; true }
+                    }
+                }
+            }
+            (resultMsg.obj as WebView.WebViewTransport).webView = pw
+            resultMsg.sendToTarget()
+            return true
+        }
+        override fun onConsoleMessage(m: ConsoleMessage): Boolean {
+            val msg = m.message()
+            val noise = msg.startsWith("Permissions policy violation") || msg.contains("VerifyEachNodeIsAssignedToAnEp") || msg.startsWith("ResizeObserver loop")
+            if (!noise && (msg.startsWith("[AIB]") || m.messageLevel() == ConsoleMessage.MessageLevel.ERROR)) addLog("[${m.messageLevel()}] $msg (${m.sourceId().substringAfterLast('/')}:${m.lineNumber()})")
+            return true
+        }
+    }
+
+    /** A real pop-up window (sign-in with Google/Apple/...): shown as a sheet, closes itself when the page calls window.close(). */
+    private fun showPopup(pw: WebView) {
+        val dlg = Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar)
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Ui.SHEET) }
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(10), dp(8), dp(10)) }
+        head.addView(Ui.text(this, "تسجيل الدخول", 17f, bold = true), LinearLayout.LayoutParams(0, -2, 1f))
+        head.addView(Ui.text(this, "إغلاق", 17f, Ui.BLUE).apply { setPadding(dp(8), dp(4), dp(8), dp(4)); setOnClickListener { dlg.dismiss() } })
+        col.addView(head)
+        (pw.parent as? ViewGroup)?.removeView(pw)
+        col.addView(pw, LinearLayout.LayoutParams(-1, 0, 1f))
+        pw.webChromeClient = object : WebChromeClient() { override fun onCloseWindow(w: WebView) { dlg.dismiss() } }
+        dlg.setOnDismissListener { pw.destroy() }
+        dlg.setContentView(col); dlg.show()
+    }
+
+    private inner class Client : WebViewClient() {
+        override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+            val u = request.url
+            noteMedia(request)
+            if (!request.isForMainFrame && ((adblockOn && isAd(u.host) && !isAd(pageHost)) || isAdult(u.host))) {
+                blocked++
+                return WebResourceResponse("text/plain", "utf-8", 204, "No Content", mapOf("Access-Control-Allow-Origin" to "*"), "".byteInputStream())
+            }
+            if (u.host == "fonts.gstatic.com" && request.method == "GET") return proxyFont(request)
+            if (u.host != ASSET_HOST) return null
+            val path = u.path.orEmpty().trimStart('/')
+            val cors = mapOf("Access-Control-Allow-Origin" to "*")
+            return try {
+                val mime = when {
+                    path.endsWith(".wasm") -> "application/wasm"
+                    path.endsWith(".js") || path.endsWith(".mjs") -> "text/javascript"
+                    else -> "application/octet-stream"
+                }
+                WebResourceResponse(mime, null, 200, "OK", cors, assets.open(path))
+            } catch (e: FileNotFoundException) {
+                WebResourceResponse("text/plain", "utf-8", 404, "Not Found", cors, "".byteInputStream())
+            }
+        }
+        override fun onReceivedError(view: WebView, req: WebResourceRequest, err: WebResourceError) {
+            if (req.isForMainFrame || req.url.host == ASSET_HOST) addLog("[LOAD ERROR] ${req.url} -> ${err.description}")
+        }
+        override fun onReceivedHttpError(view: WebView, req: WebResourceRequest, resp: WebResourceResponse) {
+            if (req.url.host == ASSET_HOST || req.isForMainFrame) addLog("[HTTP ${resp.statusCode}] ${req.url}")
+        }
+        override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
+            addLog("[CRASH] WebView renderer gone, didCrash=${detail.didCrash()}")
+            return true
+        }
+        override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean {
+            val scheme = req.url.scheme ?: ""
+            if (scheme != "http" && scheme != "https" && scheme != "about" && scheme != "data" && scheme != "blob" && scheme != "javascript") {
+                // intent://, market:// ... : ads use these to throw you into Chrome or the Play Store
+                if (on("popups") && (!req.hasGesture() || req.url.toString().contains("package=com.android.chrome"))) {
+                    popupsBlocked++; addLog("[AIB] blocked app redirect $scheme://${req.url.host}"); return true
+                }
+                return try {
+                    val it = Intent.parseUri(req.url.toString(), Intent.URI_INTENT_SCHEME)
+                    it.addCategory(Intent.CATEGORY_BROWSABLE); it.component = null; it.selector = null
+                    startActivity(it); true
+                } catch (e: Exception) { true }
+            }
+            if (req.isForMainFrame && isAdult(req.url.host)) { blockedPage(req.url.host); return true }
+            if (req.isForMainFrame && on("protect")) {
+                val clean = cleanUrl(req.url)
+                if (scheme == "http" && !req.isRedirect) { view.loadUrl((clean ?: req.url).buildUpon().scheme("https").build().toString()); return true }
+                if (clean != null) { view.loadUrl(clean.toString()); return true }
+            }
+            // pop-under / redirect ads: a frame or the page jumping to an ad host is dropped
+            if (adblockOn && isAd(req.url.host) && !isAd(pageHost)) { blocked++; addLog("[AIB] blocked ad redirect ${req.url.host}"); return true }
+            // while a video page is open, a jump to another site that nobody tapped is an ad redirect
+            if (on("popups") && req.isForMainFrame && !req.hasGesture() && !req.isRedirect && videoPlaying && site(req.url.host) != site(pageHost)) {
+                popupsBlocked++; addLog("[AIB] blocked redirect -> ${req.url.host}"); return true
+            }
+            return false
+        }
+        override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+            val host = Uri.parse(url).host
+            if (site(host) != site(pageHost)) { videoPlaying = false; media.clear(); keepScreenOn(false) }
+            pageHost = host
+            if (!url.startsWith("file:")) view.settings.allowFileAccess = false
+            if (!urlEdit.hasFocus()) showAddress(url)
+            if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
+        }
+        override fun onPageFinished(view: WebView, url: String) {
+            refresher.isRefreshing = false
+            if (!urlEdit.hasFocus()) showAddress(url)
+            recordHistory(url, view.title)
+            if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
+        }
+        override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) { if (!urlEdit.hasFocus()) showAddress(url) }
+    }
+
+    private fun blockedPage(host: String?) {
+        web.loadDataWithBaseURL(null, "<html><body style='background:#000;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:90vh;text-align:center'>" +
+            "<div><div style='font-size:48px'>🛡️</div><p style='font-size:18px'>هذا الموقع محجوب</p><p style='color:#8e8e93'>${host ?: ""}</p></div></body></html>", "text/html", "utf-8", null)
     }
 
     /** Some Google font files are served without CORS headers, so pages cannot use them. Same download, plus the header. */
@@ -468,39 +572,39 @@ class MainActivity : Activity() {
             mapOf("Access-Control-Allow-Origin" to "*", "Cache-Control" to "public, max-age=31536000"), c.inputStream)
     } catch (e: Exception) { null }
 
-    private fun injectFallback() { // main frame only, used if document-start scripts are unsupported
-        web.evaluateJavascript("if(!window.__minEnhance){window.__minCfg0=${config()};$bundle\n}", null)
+    /* ======================= downloads & uploads ======================= */
+    private fun download(url: String, ua: String, disposition: String?, mime: String?) {
+        if (!url.startsWith("http")) { Toast.makeText(this, "لا يمكن تحميل هذا الملف", Toast.LENGTH_SHORT).show(); return }
+        try {
+            val name = android.webkit.URLUtil.guessFileName(url, disposition, mime)
+            val r = android.app.DownloadManager.Request(Uri.parse(url))
+                .addRequestHeader("User-Agent", ua).addRequestHeader("Cookie", CookieManager.getInstance().getCookie(url) ?: "")
+                .addRequestHeader("Referer", web.url ?: "")
+                .setMimeType(mime).setTitle(name)
+                .setNotificationVisibility(android.app.DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                .setDestinationInExternalPublicDir(android.os.Environment.DIRECTORY_DOWNLOADS, name)
+            (getSystemService(Context.DOWNLOAD_SERVICE) as android.app.DownloadManager).enqueue(r)
+            Toast.makeText(this, "بدأ التحميل: $name", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) { addLog("[AIB] download failed: $e"); Toast.makeText(this, "فشل التحميل", Toast.LENGTH_SHORT).show() }
+    }
+    @Deprecated("plain Activity API")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == FILE_REQ) { fileCallback?.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data)); fileCallback = null; return }
+        @Suppress("DEPRECATION") super.onActivityResult(requestCode, resultCode, data)
     }
 
-    private fun iconButton(label: String, size: Int, onClick: () -> Unit) = TextView(this).apply {
-        text = label; textSize = size.toFloat(); gravity = Gravity.CENTER; setTextColor(Color.WHITE)
-        setOnClickListener { onClick() }
-    }
-
-    /** Picks the lowest supported refresh rate that is an integer multiple of the video fps (24->48, 30->60, 60->60/120). */
-    private fun matchRefresh(fps: Int) {
-        val lp = window.attributes
-        val rate = if (fps <= 0 || !prefs.getBoolean("refresh", true)) 0f else {
-            val rates = windowManager.defaultDisplay.supportedModes.map { it.refreshRate }.distinct().sorted()
-            rates.firstOrNull { r -> r >= fps - 1 && Math.abs(r / fps - Math.round(r / fps)) < 0.04f } ?: (rates.maxOrNull() ?: 0f)
-        }
-        if (lp.preferredRefreshRate != rate) { lp.preferredRefreshRate = rate; window.attributes = lp }
-    }
-
-    private fun pollBadge() { // shows ✨ with a violet ring while a video is being enhanced
-        web.evaluateJavascript("(function(){var s=window.__minEnhance&&window.__minEnhance.state.stats;return JSON.stringify({a:(s&&s.active)||0,f:(s&&s.fps)||0})})()") { raw ->
+    /* ======================= AI badge ======================= */
+    private fun pollBadge() { // the ✨ turns purple while a video is being enhanced
+        web.evaluateJavascript("(function(){var s=window.__minEnhance&&window.__minEnhance.state.stats;return JSON.stringify({a:(s&&s.active)||0})})()") { raw ->
             val j = try { JSONObject(org.json.JSONTokener(raw).nextValue() as String) } catch (e: Exception) { JSONObject() }
-            val on = j.optInt("a") > 0
-            matchRefresh(if (on) j.optInt("f") else 0)
-            badge.background = pill(if (on) ACCENT else SURFACE, 22)
-            badge.text = if (on) "✨ ON" else "✨"
-            badge.textSize = if (on) 13f else 20f
+            aiBtn.imageTintList = ColorStateList.valueOf(if (j.optInt("a") > 0) Ui.AI else Ui.BLUE)
         }
         ui.postDelayed({ pollBadge() }, 2000)
     }
 
     private fun go(input: String) {
         val t = input.trim()
+        if (t.isEmpty()) return
         val url = when {
             t.startsWith("http://") || t.startsWith("https://") -> t
             t.contains(".") && !t.contains(" ") -> "https://$t"
@@ -513,80 +617,95 @@ class MainActivity : Activity() {
         customView?.let { content.removeView(it) }
         customView = null
         customCallback?.onCustomViewHidden(); customCallback = null
-        window.decorView.systemUiVisibility = 0
-        window.attributes = window.attributes.also { it.screenBrightness = android.view.WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE }
+        @Suppress("DEPRECATION") window.decorView.systemUiVisibility = 0
+        window.attributes = window.attributes.also { it.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE }
         requestedOrientation = android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+        keepScreenOn(videoPlaying)
         content.requestApplyInsets()
     }
 
-    private fun chips(labels: Array<String>, selected: Int, onPick: (Int) -> Unit): LinearLayout {
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val views = ArrayList<TextView>()
-        fun paint(sel: Int) = views.forEachIndexed { i, v ->
-            v.background = pill(if (i == sel) ACCENT else SURFACE, 18); v.setTextColor(Color.WHITE)
-        }
-        labels.forEachIndexed { i, l ->
-            val v = TextView(this).apply {
-                text = l; textSize = 14f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
-                setOnClickListener { paint(i); onPick(i) }
-            }
-            views.add(v)
-            row.addView(v, LinearLayout.LayoutParams(0, dp(38), 1f).apply { setMargins(dp(3), 0, dp(3), 0) })
-        }
-        paint(selected)
-        return row
-    }
-
-    private fun label(t: String) = TextView(this).apply {
-        text = t; textSize = 13f; setTextColor(0xFF9A9A9A.toInt()); setPadding(dp(4), dp(16), dp(4), dp(6))
-    }
-
+    /* ======================= settings sheet ======================= */
     private fun showSettings() {
-        val dlg = Dialog(this)
-        dlg.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(18), dp(20), dp(18)); background = pill(BG, 24) }
-        col.addView(TextView(this).apply { text = "✨ تحسين الفيديو والصور"; textSize = 19f; setTextColor(Color.WHITE) })
-        col.addView(TextView(this).apply { text = "يعمل على جهازك بدون إنترنت إضافي"; textSize = 12f; setTextColor(0xFF9A9A9A.toInt()); setPadding(0, dp(2), 0, dp(8)) })
-        for ((k, title) in toggles) {
-            val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(8), 0, dp(8)) }
-            row.addView(TextView(this).apply { text = title; textSize = 15f; setTextColor(Color.WHITE) }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            row.addView(Switch(this).apply {
-                isChecked = prefs.getBoolean(k, defaults[k] == true)
-                setOnCheckedChangeListener { _, c -> prefs.edit().putBoolean(k, c).apply(); adblockOn = prefs.getBoolean("adblock", true)
-                    if (k == "protect") applyProtection()
-                    applyConfig() }
-            })
-            col.addView(row)
-        }
-        col.addView(label("الدقة المستهدفة"))
-        col.addView(chips(targetLabels, targets.indexOf(prefs.getInt("target", 0)).coerceAtLeast(0)) { i -> prefs.edit().putInt("target", targets[i]).apply(); applyConfig() })
-        col.addView(label("إزالة الضوضاء وتكسّر الضغط"))
-        col.addView(chips(denoiseLabels, denoise.indexOfFirst { it == prefs.getFloat("denoise", 0.35f) }.coerceAtLeast(2)) { i -> prefs.edit().putFloat("denoise", denoise[i]).apply(); applyConfig() })
-        col.addView(label("التصفح"))
-        col.addView(TextView(this).apply {
-            text = "🕘 السجل"; textSize = 15f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
-            background = pill(SURFACE, 18); setOnClickListener { dlg.dismiss(); showHistory() }
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)))
-        col.addView(label("التشخيص"))
-        col.addView(TextView(this).apply {
-            text = "📋 سجل الأخطاء (للنسخ)"; textSize = 15f; gravity = Gravity.CENTER; setTextColor(Color.WHITE)
-            background = pill(SURFACE, 18); setOnClickListener { dlg.dismiss(); showLog() }
-        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(44)))
-        dlg.setContentView(ScrollView(this).apply { addView(col) })
-        dlg.window?.apply {
-            setBackgroundDrawable(pill(BG, 24)); setGravity(Gravity.BOTTOM)
-            setLayout(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        }
-        dlg.show()
+        Ui.sheet(this, "✨ الإعدادات") { col, dlg ->
+            fun set(k: String, v: Boolean) { prefs.edit().putBoolean(k, v).apply() }
+            Ui.Group(this, col, "تحسين الفيديو والصور بالذكاء الاصطناعي", "يعمل على جهازك بدون إنترنت إضافي.").apply {
+                toggle("تفعيل التحسين على كل المواقع", on("enabled")) { set("enabled", it); applyConfig() }
+                toggle("رفع الدقة العصبي (Real-ESRGAN)", on("neural")) { set("neural", it); applyConfig() }
+                toggle("تباين HDR تكيفي", on("tone")) { set("tone", it); applyConfig() }
+                toggle("تحسين الصور", on("images")) { set("images", it); applyConfig() }
+            }
+            Ui.Group(this, col, "الدقة المستهدفة").segmented(targetLabels, targets.indexOf(prefs.getInt("target", 0)).coerceAtLeast(0)) { i -> prefs.edit().putInt("target", targets[i]).apply(); applyConfig() }
+            Ui.Group(this, col, "إزالة الضوضاء وتكسّر الضغط").segmented(denoiseLabels, denoise.indexOfFirst { it == prefs.getFloat("denoise", 0.35f) }.let { if (it < 0) 2 else it }) { i -> prefs.edit().putFloat("denoise", denoise[i]).apply(); applyConfig() }
+            Ui.Group(this, col, "المشغّل", "المشغّل الأصلي يرفع الدقة على المعالج العصبي في جوالك.").apply {
+                toggle("فتح الأفلام تلقائياً في المشغّل الأصلي", on("autoNative")) { set("autoNative", it); applyConfig() }
+                toggle("أزرار وإيماءات المشغّل في الصفحات", on("gestures")) { set("gestures", it); applyConfig() }
+                toggle("سطوع أعلى في ملء الشاشة", on("brightness")) { set("brightness", it) }
+                link("أكمل المشاهدة", "${Resume.list(this@MainActivity).size}") { dlg.dismiss(); showContinue() }
+            }
+            Ui.Group(this, col, "الخصوصية والحماية").apply {
+                toggle("حظر الإعلانات والمتتبعات", on("adblock")) { set("adblock", it); adblockOn = it }
+                toggle("منع النوافذ المنبثقة والتحويلات", on("popups")) { set("popups", it) }
+                toggle("حماية متقدمة: تصفح آمن، HTTPS، إزالة روابط التتبع", on("protect")) { set("protect", it) }
+                toggle("حجب المحتوى غير اللائق", on("adult")) { set("adult", it); adultOn = it; if (it && adultHosts.isEmpty()) Thread { adultHosts = loadList("adulthosts.txt") }.start() }
+            }
+            Ui.Group(this, col, "بدون إنترنت").apply {
+                link("حفظ هذه الصفحة") { dlg.dismiss(); savePage() }
+                media.lastOrNull { !it.hls }?.let { m -> link("تحميل الفيديو الحالي") { dlg.dismiss(); download(m.url, web.settings.userAgentString, null, "video/mp4") } }
+                link("الصفحات المحفوظة", "${savedDir.listFiles()?.size ?: 0}") { dlg.dismiss(); showSaved() }
+            }
+            Ui.Group(this, col, "عام").apply {
+                link("السجل") { dlg.dismiss(); showHistory() }
+                link("سجل الأخطاء (للنسخ)") { dlg.dismiss(); showLog() }
+            }
+        }.show()
     }
 
-    /* ---------- browsing history (on the phone only) ---------- */
+    /* ======================= offline pages (web archives on the phone) ======================= */
+    private val savedDir by lazy { java.io.File(filesDir, "saved").apply { mkdirs() } }
+    private fun savePage() {
+        val url = web.url ?: return
+        if (!url.startsWith("http")) return
+        val name = (web.title ?: Uri.parse(url).host ?: "page").replace(Regex("[\\/:*?\"<>|\n]"), " ").trim().take(60) + "_" + System.currentTimeMillis() + ".mht"
+        web.saveWebArchive(java.io.File(savedDir, name).absolutePath, false) { path ->
+            Toast.makeText(this, if (path != null) "حُفظت الصفحة، تفتحها بدون إنترنت" else "تعذّر حفظ الصفحة", Toast.LENGTH_SHORT).show()
+        }
+    }
+    private fun showSaved() {
+        Ui.sheet(this, "الصفحات المحفوظة") { col, dlg ->
+            val files = savedDir.listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
+            val g = Ui.Group(this, col, null, if (files.isEmpty()) "احفظ أي صفحة من ✨ ← حفظ هذه الصفحة." else "اضغط مطولاً للحذف.")
+            for (f in files) {
+                g.link(f.name.substringBeforeLast('_')) {
+                    dlg.dismiss()
+                    web.settings.allowFileAccess = true // only for saved pages; switched off again on the next web page
+                    web.loadUrl(Uri.fromFile(f).toString())
+                }
+            }
+            // long press = delete (rows are added in the same order as files)
+            val card = col.getChildAt(col.childCount - (if (files.isEmpty()) 2 else 2)) as? LinearLayout
+            var i = 0
+            card?.let { c -> for (k in 0 until c.childCount) { val r = c.getChildAt(k); if (r is LinearLayout) { val f = files.getOrNull(i++) ?: continue; r.setOnLongClickListener { f.delete(); dlg.dismiss(); showSaved(); true } } } }
+        }.show()
+    }
+
+    /* ======================= continue watching ======================= */
+    private fun showContinue() {
+        Ui.sheet(this, "أكمل المشاهدة") { col, dlg ->
+            val items = Resume.list(this)
+            val g = Ui.Group(this, col, null, if (items.isEmpty()) "الأفلام التي لم تكملها في المشغّل الأصلي تظهر هنا." else "افتح الفيلم وسيكمل من حيث توقفت.")
+            for (it in items) {
+                val left = (it.durMs - it.posMs) / 60000
+                g.link(it.title.ifBlank { Uri.parse(it.page).host ?: it.page }, "باقي $left د") { dlg.dismiss(); web.loadUrl(it.page) }
+            }
+        }.show()
+    }
+
+    /* ======================= browsing history (on the phone only) ======================= */
     private val histFile by lazy { java.io.File(filesDir, "history.json") }
-    private val history: org.json.JSONArray by lazy { try { org.json.JSONArray(histFile.readText()) } catch (e: Exception) { org.json.JSONArray() } }
+    private val history: JSONArray by lazy { try { JSONArray(histFile.readText()) } catch (e: Exception) { JSONArray() } }
     private fun saveHistory() { val txt = history.toString(); Thread { try { histFile.writeText(txt) } catch (e: Exception) { } }.start() }
     private fun recordHistory(url: String, title: String?) {
-        val host = android.net.Uri.parse(url).host
-        if (!url.startsWith("http") || isAd(host)) return
+        if (!url.startsWith("http") || isAd(Uri.parse(url).host)) return
         val n = history.length()
         val last = if (n > 0) history.getJSONObject(n - 1) else null
         if (last != null && last.optString("u") == url) { if (!title.isNullOrBlank()) last.put("t", title); saveHistory(); return }
@@ -595,61 +714,52 @@ class MainActivity : Activity() {
         saveHistory()
     }
     private fun showHistory() {
-        val dlg = Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar)
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(BG); setPadding(dp(12), dp(12), dp(12), dp(12)) }
-        val search = EditText(this).apply { hint = "🔍 ابحث في السجل"; setHintTextColor(0xFF8A8A8A.toInt()); setTextColor(Color.WHITE); background = pill(SURFACE, 20); setPadding(dp(16), 0, dp(16), 0); setSingleLine() }
-        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val fmt = java.text.SimpleDateFormat("d/M HH:mm", java.util.Locale.US)
-        fun fill(q: String) {
-            list.removeAllViews(); var shown = 0
-            for (i in history.length() - 1 downTo 0) {
-                val o = history.getJSONObject(i); val u = o.optString("u"); val t = o.optString("t").ifBlank { android.net.Uri.parse(u).host ?: u }
-                if (q.isNotEmpty() && !u.contains(q, true) && !t.contains(q, true)) continue
-                list.addView(TextView(this).apply {
-                    text = "$t\n${fmt.format(java.util.Date(o.optLong("d")))} · ${android.net.Uri.parse(u).host}"; textSize = 14f; setTextColor(Color.WHITE)
-                    setPadding(dp(8), dp(10), dp(8), dp(10)); maxLines = 2
-                    setOnClickListener { dlg.dismiss(); web.loadUrl(u) }
-                })
-                if (++shown >= 300) break
+        Ui.sheet(this, "السجل") { col, dlg ->
+            val search = EditText(this).apply {
+                hint = "بحث"; setHintTextColor(Ui.SECONDARY); setTextColor(Ui.LABEL); textSize = 16f; setSingleLine()
+                background = Ui.round(this@MainActivity, Ui.CARD, 10); setPadding(dp(12), 0, dp(12), 0)
             }
-            if (shown == 0) list.addView(TextView(this).apply { text = "لا يوجد شيء"; setTextColor(0xFF9A9A9A.toInt()); setPadding(dp(8), dp(16), dp(8), dp(16)) })
-        }
-        search.addTextChangedListener(object : android.text.TextWatcher {
-            override fun afterTextChanged(e: android.text.Editable?) { fill(e?.toString()?.trim() ?: "") }
-            override fun beforeTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
-            override fun onTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
-        })
-        val btns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        fun btn(t: String, f: () -> Unit) = TextView(this).apply { text = t; textSize = 15f; gravity = Gravity.CENTER; setTextColor(Color.WHITE); background = pill(ACCENT, 18); setOnClickListener { f() } }
-        btns.addView(btn("مسح السجل") { while (history.length() > 0) history.remove(0); saveHistory(); fill("") }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(0, 0, dp(6), 0) })
-        btns.addView(btn("إغلاق") { dlg.dismiss() }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, 0, 0) })
-        col.addView(TextView(this).apply { text = "🕘 السجل"; textSize = 19f; setTextColor(Color.WHITE); setPadding(dp(4), 0, 0, dp(10)) })
-        col.addView(search, LinearLayout.LayoutParams(-1, dp(44)))
-        col.addView(ScrollView(this).apply { addView(list) }, LinearLayout.LayoutParams(-1, 0, 1f).apply { topMargin = dp(8); bottomMargin = dp(8) })
-        col.addView(btns)
-        dlg.setContentView(col); fill(""); dlg.show()
+            col.addView(search, LinearLayout.LayoutParams(-1, dp(38)))
+            val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            col.addView(list)
+            val fmt = java.text.SimpleDateFormat("d/M HH:mm", java.util.Locale.US)
+            fun fill(q: String) {
+                list.removeAllViews()
+                val g = Ui.Group(this, list, null)
+                var shown = 0
+                for (i in history.length() - 1 downTo 0) {
+                    val o = history.getJSONObject(i); val u = o.optString("u"); val t = o.optString("t").ifBlank { Uri.parse(u).host ?: u }
+                    if (q.isNotEmpty() && !u.contains(q, true) && !t.contains(q, true)) continue
+                    g.link(t.take(60), fmt.format(java.util.Date(o.optLong("d")))) { dlg.dismiss(); web.loadUrl(u) }
+                    if (++shown >= 200) break
+                }
+                if (shown == 0) list.addView(Ui.text(this, "لا يوجد شيء", 15f, Ui.SECONDARY).apply { setPadding(dp(16), dp(16), dp(16), dp(16)) })
+                Ui.Group(this, list, null).link("مسح السجل", color = Ui.RED) { while (history.length() > 0) history.remove(0); saveHistory(); fill("") }
+            }
+            search.addTextChangedListener(object : android.text.TextWatcher {
+                override fun afterTextChanged(e: android.text.Editable?) { fill(e?.toString()?.trim() ?: "") }
+                override fun beforeTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+                override fun onTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+            })
+            fill("")
+        }.show()
     }
 
     private fun showLog() {
-        val dlg = Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar)
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(BG); setPadding(dp(12), dp(12), dp(12), dp(12)) }
-        val txt = TextView(this).apply { text = logText(); textSize = 11f; setTextColor(0xFFD0D0D0.toInt()); setTextIsSelectable(true); typeface = android.graphics.Typeface.MONOSPACE }
-        val btns = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        fun btn(t: String, f: () -> Unit) = TextView(this).apply {
-            text = t; textSize = 15f; gravity = Gravity.CENTER; setTextColor(Color.WHITE); background = pill(ACCENT, 18); setOnClickListener { f() }
-        }
-        btns.addView(btn("نسخ الكل") {
-            (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("AI Browser log", logText()))
-            android.widget.Toast.makeText(this, "تم النسخ", android.widget.Toast.LENGTH_SHORT).show()
-        }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(0, 0, dp(6), 0) })
-        btns.addView(btn("مسح") { synchronized(logLines) { logLines.clear() }; txt.text = logText() }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, dp(6), 0) })
-        btns.addView(btn("إغلاق") { dlg.dismiss() }, LinearLayout.LayoutParams(0, dp(44), 1f).apply { setMargins(dp(6), 0, 0, 0) })
-        col.addView(btns)
-        col.addView(ScrollView(this).apply { addView(txt) }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = dp(10) })
-        dlg.setContentView(col)
-        dlg.show()
+        Ui.sheet(this, "سجل الأخطاء") { col, _ ->
+            val txt = Ui.text(this, logText(), 11f, 0xFFD0D0D0.toInt()).apply { setTextIsSelectable(true); typeface = android.graphics.Typeface.MONOSPACE }
+            Ui.Group(this, col, null).apply {
+                link("نسخ الكل", color = Ui.BLUE) {
+                    (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("AI Browser log", logText()))
+                    Toast.makeText(this@MainActivity, "تم النسخ", Toast.LENGTH_SHORT).show()
+                }
+                link("مسح", color = Ui.RED) { synchronized(logLines) { logLines.clear() }; txt.text = logText() }
+            }
+            col.addView(txt, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
+        }.show()
     }
 
+    /* ======================= back navigation ======================= */
     /**
      * One back = one page. Pages (and ads) leave duplicate or redirect entries in the history, and some
      * phones deliver back twice; so: ignore a second back within 450 ms, and skip entries that are the
@@ -661,13 +771,14 @@ class MainActivity : Activity() {
         if (now - lastBack < 450) return true
         lastBack = now
         if (customView != null) { exitFullscreen(); return true }
+        if (urlEdit.visibility == View.VISIBLE) { endEdit(); return true }
         val list = web.copyBackForwardList(); val cur = list.currentIndex
         if (cur <= 0) return false
         val here = list.currentItem?.url?.substringBefore('#')
         var i = cur - 1
         while (i > 0) {
             val u = list.getItemAtIndex(i).url
-            if (u.substringBefore('#') != here && !isAd(android.net.Uri.parse(u).host)) break
+            if (u.substringBefore('#') != here && !isAd(Uri.parse(u).host)) break
             i--
         }
         web.goBackOrForward(i - cur)
@@ -678,7 +789,7 @@ class MainActivity : Activity() {
         return super.onKeyDown(keyCode, event)
     }
     @Deprecated("handled through onKeyDown")
-    override fun onBackPressed() { if (!goBackOnce()) super.onBackPressed() }
+    override fun onBackPressed() { if (!goBackOnce()) @Suppress("DEPRECATION") super.onBackPressed() }
 
     override fun onDestroy() { ui.removeCallbacksAndMessages(null); super.onDestroy() }
 }
