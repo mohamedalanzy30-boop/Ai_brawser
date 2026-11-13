@@ -161,8 +161,12 @@ class PlayerActivity : Activity() {
             override fun onPlayerError(error: PlaybackException) {
                 addLog("[player] error ${error.errorCodeName} ${error.message}")
                 // network dropped or the server hiccuped: try again from the same second, waiting a bit longer each time
-                val net = error.errorCode in 2000..2999
-                if ((net || error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW) && retries < 8) {
+                // only errors that a retry can fix: a dead link (404/403, file missing) is reported at once
+                val c = error.errorCode
+                val transient = c == PlaybackException.ERROR_CODE_IO_UNSPECIFIED || c == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+                    c == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT || c == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW ||
+                    (c == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS && retries < 2) // 5xx server hiccup: try twice
+                if (transient && retries < 8) {
                     val wait = 2000L * (1 shl Math.min(retries, 4)); retries++
                     status.text = "انقطع الاتصال، إعادة المحاولة خلال ${wait / 1000} ث…"
                     ui.postDelayed({
@@ -170,7 +174,7 @@ class PlayerActivity : Activity() {
                         if (error.errorCode == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW) player.seekToDefaultPosition()
                         player.prepare(); player.playWhenReady = true
                     }, wait)
-                } else status.text = "خطأ في التشغيل: ${error.errorCodeName}"
+                } else status.text = if (c == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS || c == PlaybackException.ERROR_CODE_IO_FILE_NOT_FOUND) "انتهت صلاحية رابط الفيديو، ارجع للصفحة وشغّله من جديد" else "خطأ في التشغيل: ${error.errorCodeName}"
             }
             override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
                 val f = tracks.groups.firstOrNull { it.type == C.TRACK_TYPE_VIDEO && it.isSelected }?.let { g -> (0 until g.length).firstOrNull { g.isTrackSelected(it) }?.let { g.getTrackFormat(it) } }
@@ -254,6 +258,7 @@ class PlayerActivity : Activity() {
     private fun displayHdr(): Boolean = try { windowManager.defaultDisplay.hdrCapabilities?.supportedHdrTypes?.isNotEmpty() == true } catch (e: Exception) { false }
     private fun useDirectHdr() {
         hdrDirect = true
+        aiBtn.visibility = View.GONE // HDR sources are already high resolution; the AI path does not apply
         addLog("[player] HDR video: direct output (AI upscaling not needed for HDR sources)")
         try { window.colorMode = android.content.pm.ActivityInfo.COLOR_MODE_HDR } catch (e: Exception) { }
         directView.holder.addCallback(object : SurfaceHolder.Callback {
@@ -331,7 +336,11 @@ class PlayerActivity : Activity() {
     }
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        if (player.isPlaying) try { enterPictureInPictureMode(android.app.PictureInPictureParams.Builder().setAspectRatio(android.util.Rational(16, 9)).build()) } catch (e: Exception) { }
+        if (player.isPlaying) try {
+            val vs = player.videoSize
+            val r = if (vs.width > 0 && vs.height > 0) (vs.width * vs.pixelWidthHeightRatio / vs.height).coerceIn(0.42f, 2.39f) else 16f / 9f
+            enterPictureInPictureMode(android.app.PictureInPictureParams.Builder().setAspectRatio(android.util.Rational((r * 1000).toInt(), 1000)).build())
+        } catch (e: Exception) { }
     }
     override fun onPictureInPictureModeChanged(inPip: Boolean, c: android.content.res.Configuration) { super.onPictureInPictureModeChanged(inPip, c); controls.visibility = if (inPip) View.GONE else View.VISIBLE }
     override fun onDestroy() {

@@ -221,6 +221,7 @@ class MainActivity : Activity() {
             return next.toFloat() / max
         }
         @android.webkit.JavascriptInterface fun pip() { ui.post { enterPip() } }
+        @android.webkit.JavascriptInterface fun pullOk(ok: Boolean) { pullOk = ok }
     }
 
     /** The screen must not go dark while a video plays (the phone's sleep timer ignores web video). */
@@ -263,9 +264,12 @@ class MainActivity : Activity() {
     private fun registerScript() {
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return
         scriptHandler?.remove()
-        val extra = if (on("cookies")) "\n;" + cookieJs else ""
+        val extra = (if (on("cookies")) "\n;" + cookieJs else "") + "\n;" + PULL_JS
         scriptHandler = WebViewCompat.addDocumentStartJavaScript(web, "window.__minCfg0=${config()};\n$bundle$extra", setOf("*"))
     }
+    /** Tells the app on every touch whether the touched content is scrolled to its top (inner scroll areas too), so pull-to-refresh never fires mid-page. */
+    private val PULL_JS = """(function(){if(window.__aibPull)return;window.__aibPull=1;addEventListener('touchstart',function(e){var n=window.AIBNative;if(!n||!n.pullOk)return;var ok=(document.scrollingElement||document.documentElement).scrollTop<=0;for(var el=e.target;ok&&el&&el.nodeType===1;el=el.parentElement){if(el.scrollTop>0)ok=false}try{n.pullOk(ok)}catch(x){}},{passive:true,capture:true})})();"""
+    @Volatile private var pullOk = true
     private fun applyConfig() {
         registerScript()
         web.evaluateJavascript("window.__minEnhanceSet&&window.__minEnhanceSet(${config()})", null)
@@ -290,7 +294,7 @@ class MainActivity : Activity() {
             setColorSchemeColors(Ui.BLUE); setProgressBackgroundColorSchemeColor(0xFF2C2C2E.toInt())
             setOnRefreshListener { web.reload() }
             // only when the page itself is scrolled to the top (pages with their own scrolling area keep working)
-            setOnChildScrollUpCallback { _, _ -> web.scrollY > 0 || customView != null }
+            setOnChildScrollUpCallback { _, _ -> web.scrollY > 0 || customView != null || !pullOk }
         }
         column.addView(refresher, LinearLayout.LayoutParams(-1, 0, 1f))
         bottomBar = buildBottomBar()
@@ -310,7 +314,8 @@ class MainActivity : Activity() {
         loadLists()
         registerScript()
         pollBadge()
-        go(intent?.dataString ?: HOME)
+        val restore = prefs.getString("restoreUrl", null); prefs.edit().remove("restoreUrl").apply()
+        go(restore ?: intent?.dataString ?: HOME)
     }
 
     private fun buildBottomBar(): LinearLayout {
@@ -487,7 +492,7 @@ class MainActivity : Activity() {
     private inner class Client : WebViewClient() {
         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
             val u = request.url
-            noteMedia(request)
+            if (!(adblockOn && isAd(u.host))) noteMedia(request)
             // anti-adblock libraries are often served from the site itself: answer them with a stand-in that says "no blocker"
             if (adblockOn && !request.isForMainFrame && antiAdblock.containsMatchIn(u.toString())) return fakeResponse(request)
             if (!request.isForMainFrame && ((adblockOn && isAd(u.host) && !isAd(pageHost)) || isAdult(u.host))) {
@@ -524,6 +529,9 @@ class MainActivity : Activity() {
         }
         override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
             addLog("[CRASH] WebView renderer gone, didCrash=${detail.didCrash()}")
+            // the page engine died (out of memory or a crash): reopen the same page in a fresh screen instead of staying blank
+            prefs.edit().putString("restoreUrl", view.url ?: HOME).apply()
+            ui.post { recreate() }
             return true
         }
         override fun shouldOverrideUrlLoading(view: WebView, req: WebResourceRequest): Boolean {
@@ -563,6 +571,7 @@ class MainActivity : Activity() {
         }
         override fun onPageFinished(view: WebView, url: String) {
             refresher.isRefreshing = false
+            Uri.parse(url).host?.let { upgraded.remove(it) } // https worked: no http fallback needed for this site
             if (!urlEdit.hasFocus()) showAddress(url)
             recordHistory(url, view.title)
             if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
@@ -889,5 +898,5 @@ class MainActivity : Activity() {
     @Deprecated("handled through onKeyDown")
     override fun onBackPressed() { if (!goBackOnce()) @Suppress("DEPRECATION") super.onBackPressed() }
 
-    override fun onDestroy() { ui.removeCallbacksAndMessages(null); super.onDestroy() }
+    override fun onDestroy() { ui.removeCallbacksAndMessages(null); try { (web.parent as? ViewGroup)?.removeView(web); web.destroy() } catch (e: Exception) { }; super.onDestroy() }
 }
