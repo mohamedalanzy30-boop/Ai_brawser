@@ -40,6 +40,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import java.nio.ByteBuffer
@@ -220,9 +221,12 @@ class PlayerActivity : Activity() {
                 // network dropped or the server hiccuped: try again from the same second, waiting a bit longer each time
                 // only errors that a retry can fix: a dead link (404/403, file missing) is reported at once
                 val c = error.errorCode
+                // an expired link answers 403/404/410: only a 5xx status is a server hiccup worth another try
+                val http5xx = generateSequence<Throwable>(error.cause) { it.cause }.take(8)
+                    .any { it is HttpDataSource.InvalidResponseCodeException && it.responseCode in 500..599 }
                 val transient = c == PlaybackException.ERROR_CODE_IO_UNSPECIFIED || c == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
                     c == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT || c == PlaybackException.ERROR_CODE_BEHIND_LIVE_WINDOW ||
-                    (c == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS && retries < 2) // 5xx server hiccup: try twice
+                    (c == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS && http5xx && retries < 2) // 5xx server hiccup: try twice
                 if (transient && retries < 8) {
                     val wait = 2000L * (1 shl Math.min(retries, 4)); retries++
                     status.text = "انقطع الاتصال، إعادة المحاولة خلال ${wait / 1000} ث…"
@@ -247,7 +251,7 @@ class PlayerActivity : Activity() {
             override fun surfaceCreated(h: SurfaceHolder) {
                 if (hdrDirect) return
                 renderer = Renderer(this@PlayerActivity, h.surface) { s -> ui.post { status.text = s } }.also {
-                    it.aiWanted = aiWanted
+                    it.aiWanted = aiWanted; it.pip = isInPictureInPictureMode
                     it.start { videoSurface -> ui.post { player.setVideoSurface(videoSurface) } }
                     val vs = player.videoSize; if (vs.width > 0) it.setVideoSize(vs.width, vs.height, vs.pixelWidthHeightRatio)
                 }
@@ -439,7 +443,7 @@ class PlayerActivity : Activity() {
             enterPictureInPictureMode(android.app.PictureInPictureParams.Builder().setAspectRatio(android.util.Rational((r * 1000).toInt(), 1000)).build())
         } catch (e: Exception) { }
     }
-    override fun onPictureInPictureModeChanged(inPip: Boolean, c: android.content.res.Configuration) { super.onPictureInPictureModeChanged(inPip, c); controls.visibility = if (inPip) View.GONE else View.VISIBLE }
+    override fun onPictureInPictureModeChanged(inPip: Boolean, c: android.content.res.Configuration) { super.onPictureInPictureModeChanged(inPip, c); controls.visibility = if (inPip) View.GONE else View.VISIBLE; renderer?.pip = inPip }
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
         saveResume()
@@ -453,6 +457,8 @@ class PlayerActivity : Activity() {
 
     class Renderer(private val ctx: Context, private val out: Surface, private val onStatus: (String) -> Unit) : SurfaceTexture.OnFrameAvailableListener {
         @Volatile var aiWanted = true
+        @Volatile var pip = false // picture-in-picture: a tiny window does not need 2560x1440 from the NPU, the GPU path draws it
+        @Volatile private var stopped = false // set at once by stop(): a model still loading is closed instead of kept
         private val thread = HandlerThread("ai-render").apply { start() }
         private val h = Handler(thread.looper)
         private var egl: EGLDisplay = EGL14.EGL_NO_DISPLAY
@@ -502,7 +508,7 @@ class PlayerActivity : Activity() {
             videoSurface = Surface(st); onSurface(videoSurface!!)
             loader.execute { initOrt() }
         }
-        fun stop() { h.post { loader.shutdownNow(); buckets.forEach { it.close() }; try { outTensor?.close() } catch (e: Exception) { }; st?.release(); videoSurface?.release(); EGL14.eglMakeCurrent(egl, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT); EGL14.eglDestroySurface(egl, eglSurf); EGL14.eglDestroyContext(egl, eglCtx); EGL14.eglTerminate(egl); pool.shutdown(); thread.quitSafely() } }
+        fun stop() { stopped = true; h.post { loader.shutdownNow(); buckets.forEach { it.close() }; try { outTensor?.close() } catch (e: Exception) { }; st?.release(); videoSurface?.release(); EGL14.eglMakeCurrent(egl, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT); EGL14.eglDestroySurface(egl, eglSurf); EGL14.eglDestroyContext(egl, eglCtx); EGL14.eglTerminate(egl); pool.shutdown(); thread.quitSafely() } }
         fun setViewSize(w: Int, hh: Int) = h.post { viewW = w; viewH = hh }
         fun setVideoSize(w: Int, hh: Int, p: Float) { vidW = w; vidH = hh; par = if (p > 0) p else 1f; h.post { slowSince = 0; slowFrames = 0; emaMs = 0.0 } }
 
@@ -535,7 +541,9 @@ class PlayerActivity : Activity() {
             for ((t, file) in tries) {
                 val bytes = model(file) ?: continue
                 val tag = "sr_ctx_${t}_${b.w}x${b.h}_"
-                val ctxFile = java.io.File(ctx.filesDir, "$tag${bytes.size}.onnx") // new model in an update = new compiled copy
+                // keyed by the model's content: a re-calibrated model has the same size, an update must still get a new compiled copy
+                val hash = java.security.MessageDigest.getInstance("SHA-256").digest(bytes).take(8).joinToString("") { "%02x".format(it.toInt() and 255) }
+                val ctxFile = java.io.File(ctx.filesDir, "$tag$hash.onnx")
                 ctx.filesDir.listFiles { f -> f.name.startsWith(tag) && f.name != ctxFile.name }?.forEach { it.delete() }
                 try {
                     fun opts(dump: Boolean) = OrtSession.SessionOptions().apply {
@@ -552,21 +560,34 @@ class PlayerActivity : Activity() {
                     addLog("[player] SR ${b.w}x${b.h} session on $t in ${System.currentTimeMillis() - t0}ms")
                     val ib = ByteBuffer.allocateDirect(3 * b.w * b.h * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
                     val tin = OnnxTensor.createTensor(e, ib, longArrayOf(1, 3, b.h.toLong(), b.w.toLong()))
+                    fun drop() { try { s.close(); tin.close() } catch (x: Exception) { } }
                     // speed test on the render thread (it owns the shared output buffer): two runs, the first warms the NPU up
+                    // stop() sets `stopped` before it queues its own cleanup on that thread, so a test that sees it false still has the output buffer
                     val done = java.util.concurrent.CountDownLatch(1); var testMs = Long.MAX_VALUE
-                    h.post {
-                        try { for (k in 0 until 2) { val w0 = System.currentTimeMillis(); s.run(mapOf(s.inputNames.first() to tin), mapOf(s.outputNames.first() to outTensor!!)).close(); testMs = System.currentTimeMillis() - w0 } }
+                    val test = Runnable {
+                        try { if (!stopped) for (k in 0 until 2) { val w0 = System.currentTimeMillis(); s.run(mapOf(s.inputNames.first() to tin), mapOf(s.outputNames.first() to outTensor!!)).close(); testMs = System.currentTimeMillis() - w0 } }
                         catch (x: Throwable) { addLog("[player] SR ${b.w}x${b.h} test failed: ${x.message?.take(200)}") }
                         done.countDown()
                     }
-                    if (!done.await(20, java.util.concurrent.TimeUnit.SECONDS)) { s.close(); tin.close(); b.state = "idle"; return }
+                    if (stopped || !h.post(test)) { drop(); return } // player closing: keep the compiled copy
+                    // interrupted only by stop() (loader.shutdownNow), which runs after a started test is over: closing here is safe
+                    val finished = try { done.await(20, java.util.concurrent.TimeUnit.SECONDS) } catch (x: InterruptedException) { drop(); return }
+                    if (!finished) { if (!h.post { drop() }) drop(); b.state = "idle"; return } // NPU stuck: close after the test, on its thread
+                    if (stopped) { drop(); return }
                     addLog("[player] SR ${b.w}x${b.h} test run on $t: ${testMs}ms per frame")
-                    if (testMs > 55) { // slower than a 24 fps movie needs: never stutter, a smaller model or the GPU path takes over
-                        s.close(); tin.close(); b.testMs = testMs; b.state = "slow"; return
+                    // the NPU run alone must fit one frame of a 24 fps movie (41 ms); readback, conversion and upload come on top
+                    // and are watched per frame in render(): never stutter, a smaller model or the GPU path takes over
+                    if (testMs > 1000 / 24) {
+                        drop(); b.testMs = testMs; b.state = "slow"; return
                     }
-                    b.session = s; b.inBuf = ib; b.inTensor = tin; b.backend = t; b.testMs = testMs; b.state = "ready"
-                    // keep at most two compiled models in memory (ABR streams switch between two sizes)
-                    buckets.filter { it !== b && it.session != null }.sortedBy { it.lastUsed }.dropLast(1).forEach { o -> h.post { if (cur !== o) { o.close(); o.state = "idle" } } }
+                    // handed over on the render thread: there stop() cannot slip in between the check and the store
+                    val handed = h.post {
+                        if (stopped) { drop(); return@post }
+                        b.session = s; b.inBuf = ib; b.inTensor = tin; b.backend = t; b.testMs = testMs; b.state = "ready"
+                        // keep at most two compiled models in memory (ABR streams switch between two sizes)
+                        buckets.filter { it !== b && it.session != null }.sortedBy { it.lastUsed }.dropLast(1).forEach { o -> if (cur !== o) { o.close(); o.state = "idle" } }
+                    }
+                    if (!handed) drop()
                     return
                 } catch (x: InterruptedException) { return // player closing: keep the compiled copy
                 } catch (x: Throwable) { addLog("[player] SR ${b.w}x${b.h} on $t failed: ${x.message?.take(200)}"); ctxFile.delete() }
@@ -586,7 +607,7 @@ class PlayerActivity : Activity() {
             if (vw <= 0 || vh <= 0) return
             val dispAspect = vw * par / vh
             // neural path for sources up to 660p, each through the model of its own size; 720p+ is already sharp on this screen
-            val b = if (aiWanted && env != null) pick(vw * par, vh.toFloat()) else null
+            val b = if (aiWanted && !pip && env != null) pick(vw * par, vh.toFloat()) else null
             if (b != null && b.state == "idle") { b.state = "loading"; loader.execute { load(b) } }
             val s = b?.session?.takeIf { b.state == "ready" }
             if (b !== cur) { cur = b; emaMs = 0.0; slowSince = 0; slowFrames = 0 }
