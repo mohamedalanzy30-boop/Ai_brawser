@@ -1,0 +1,35 @@
+name: SR quality eval
+on:
+  push:
+    branches: [sr-eval]
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Eval
+        run: |
+          set -e
+          pip install --quiet --only-binary=:all: onnx onnxruntime imageio-ffmpeg scipy pillow
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet lpips
+          FF=$(python3 -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())")
+          mkdir -p m out
+          curl -fsL -o m/x4.onnx https://huggingface.co/CoderViking/realesr-general-x4v3-onnx/resolve/main/realesr-general-x4v3.onnx
+          for v in bigbuckbunny/mp4/h264/1080/Big_Buck_Bunny_1080_10s_5MB.mp4 sintel/mp4/h264/1080/Sintel_1080_10s_5MB.mp4 jellyfish/mp4/h264/1080/Jellyfish_1080_10s_5MB.mp4; do
+            curl -fsL -o "m/$(basename $v)" "https://test-videos.co.uk/vids/$v" || echo "skip $v"; done
+          # calibration frames 640x360 for the quantized copies
+          "$FF" -loglevel error -i m/Big_Buck_Bunny_1080_10s_5MB.mp4 -vf "select='not(mod(n\,10))',scale=640:360:flags=bicubic" -fps_mode vfr -frames:v 24 -f rawvideo -pix_fmt rgb24 m/calib.rgb
+          Q=""
+          for h in 360 480 660; do w=$(( (h*16/9+1)/2*2 )); [ $h = 660 ] && w=1174; [ $h = 480 ] && w=854
+            python3 tools/fix_model.py m/x4.onnx m/f$h.onnx $h $w
+            python3 tools/quantize_qnn.py m/f$h.onnx m/calib.rgb m/q$h.onnx 640x360 && Q="$Q $h=m/q$h.onnx"; done
+          ls m/*.mp4 | python3 tools/sr_eval.py m/x4.onnx "$FF" out $Q
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sr-eval, path: out/*.png, retention-days: 3 }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sr-results, path: out/results.json, retention-days: 3 }

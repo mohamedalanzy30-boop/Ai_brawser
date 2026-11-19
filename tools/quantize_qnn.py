@@ -7,10 +7,16 @@ from onnxruntime.quantization import CalibrationDataReader, QuantType, quantize
 from onnxruntime.quantization.execution_providers.qnn import get_qnn_qdq_config, qnn_preprocess_model
 
 src, frames_path, dst = sys.argv[1], sys.argv[2], sys.argv[3]
-W, H = 640, 360
+import onnx as _o
+_d = _o.load(src).graph.input[0].type.tensor_type.shape.dim
+H, W = _d[2].dim_value, _d[3].dim_value  # model input size (fixed by fix_model.py)
+CW, CH = (int(a) for a in (sys.argv[4] if len(sys.argv) > 4 else '640x360').split('x'))  # size of the raw calibration frames
 raw = np.fromfile(frames_path, dtype=np.uint8)
-n = raw.size // (W * H * 3)
-frames = raw[: n * W * H * 3].reshape(n, H, W, 3)
+n = raw.size // (CW * CH * 3)
+frames = raw[: n * CW * CH * 3].reshape(n, CH, CW, 3)
+if (CW, CH) != (W, H):
+    from PIL import Image
+    frames = np.stack([np.asarray(Image.fromarray(f).resize((W, H), Image.BICUBIC)) for f in frames])
 print('calibration frames:', n)
 
 
