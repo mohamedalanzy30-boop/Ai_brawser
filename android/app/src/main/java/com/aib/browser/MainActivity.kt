@@ -171,6 +171,8 @@ class MainActivity : Activity() {
     @Volatile private var videoPlaying = false
     @Volatile private var sessPos = 0.0; @Volatile private var sessPage: String? = null; @Volatile private var pageUrl: String? = null
     private var pendingSeek: Pair<String, Double>? = null
+    /** title of pageUrl, read on the UI thread (the bridge thread must not touch the WebView); throttle of the page player's Resume saves */
+    @Volatile private var pageTitle: String? = null; @Volatile private var lastResume = 0L; @Volatile private var lastResumePage: String? = null
     @Volatile private var videoAspect = android.util.Rational(16, 9)
     /** subtitle files the page loaded (.vtt / .srt): handed to the native player */
     private val subs = java.util.concurrent.CopyOnWriteArrayList<String>()
@@ -244,8 +246,21 @@ class MainActivity : Activity() {
         }
         @android.webkit.JavascriptInterface fun pip() { ui.post { enterPip() } }
         @android.webkit.JavascriptInterface fun pullOk(ok: Boolean) { pullOk = ok }
-        /** playing film position (any frame), kept for restoring the session after Android closes the app */
-        @android.webkit.JavascriptInterface fun position(t: Double, dur: Double) { if (t > 5 && dur - t > 20) { sessPos = t; sessPage = pageUrl } }
+        /** playing film position (any frame), kept for restoring the session after Android closes the app and for "continue watching" */
+        @android.webkit.JavascriptInterface fun position(t: Double, dur: Double) {
+            val page = pageUrl ?: return
+            if (!dur.isFinite() || !t.isFinite() || dur <= 0 || t <= 5 || !page.startsWith("http")) return // live streams, not started yet
+            if (dur - t <= 20) { // finished: reopening must not jump to the credits, and it leaves "continue watching"
+                sessPos = 0.0; sessPage = null; lastResume = 0L; Resume.remove(this@MainActivity, page); return
+            }
+            sessPos = t; sessPage = page
+            if (t < 30) return // the first seconds (autoplay before the saved position is restored) must not erase the saved entry
+            // "continue watching" for films played in the site's own player too, at most every 10 s
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (page == lastResumePage && now - lastResume < 10_000L) return
+            lastResume = now; lastResumePage = page
+            Resume.save(this@MainActivity, page, pageTitle ?: "", (t * 1000).toLong(), (dur * 1000).toLong())
+        }
     }
 
     /** The screen must not go dark while a video plays (the phone's sleep timer ignores web video). */
@@ -631,7 +646,7 @@ class MainActivity : Activity() {
             refresher.isRefreshing = false
             Uri.parse(url).host?.let { upgraded.remove(it) } // https worked: no http fallback needed for this site
             if (!urlEdit.hasFocus()) showAddress(url)
-            recordHistory(url, view.title); pageUrl = url; seekRestored(url)
+            recordHistory(url, view.title); pageTitle = view.title; pageUrl = url; seekRestored(url)
             if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
         }
         override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) { if (!urlEdit.hasFocus()) showAddress(url) }
@@ -880,11 +895,11 @@ class MainActivity : Activity() {
     private fun showContinue() {
         Ui.sheet(this, "أكمل المشاهدة") { col, dlg ->
             val items = Resume.list(this)
-            if (items.isEmpty()) { Ui.empty(this, col, "الأفلام التي لم تكملها في المشغّل الأصلي تظهر هنا."); return@sheet }
+            if (items.isEmpty()) { Ui.empty(this, col, "الأفلام التي لم تكملها تظهر هنا، سواء شاهدتها في مشغّل الموقع أو في المشغّل الأصلي."); return@sheet }
             val g = Ui.Group(this, col, null, "افتح الفيلم وسيكمل من حيث توقفت.")
             for (it in items) {
                 val left = (it.durMs - it.posMs) / 60000
-                g.link(it.title.ifBlank { Uri.parse(it.page).host ?: it.page }, "باقي $left د") { dlg.dismiss(); web.loadUrl(it.page) }
+                g.link(it.title.ifBlank { Uri.parse(it.page).host ?: it.page }, "باقي $left د") { dlg.dismiss(); pendingSeek = it.page to it.posMs / 1000.0; web.loadUrl(it.page) }
             }
         }.show()
     }
