@@ -7,7 +7,7 @@
 - `android/app/src/main/java/.../PlayerActivity.kt`: المشغّل الأصلي: فك تشفير بالعتاد (ExoPlayer) + رفع دقة 4× بنموذج Real-ESRGAN x4v3 على المعالج العصبي (ONNX Runtime + Qualcomm QNN)، مع محسّن حوار.
 - `android/app/src/main/assets/engine.js`: محرك داخل الصفحة: رفع دقة عصبي (WebGPU) أو تحسين بالـGPU (WebGL2)، إزالة ضوضاء، حدة، تباين HDR تكيفي.
 - `tools/`: تثبيت أبعاد النموذج وتكميمه (A16W8) للمعالج العصبي وقت البناء.
-- `engine-tests/`: اختبارات المحرك في Chromium (Playwright).
+- `engine-tests/`: اختبارات المحرك في Chromium (Playwright)، مستقلة بلا ملفات من خارج المجلد وتفشل عند أي خطأ: `cd engine-tests && npm install && npm test`. تعمل أيضاً في CI مع كل دفع.
 - `tools/ui-harness/`: يشغّل واجهة المتصفح الحقيقية (MainActivity و Ui.kt) على Robolectric بدون جهاز ولا Android SDK، ويصوّرها بالعربي (RTL) والإنجليزي: `cd tools/ui-harness && gradle test` ثم الصور في `build/shots/` (`SEED=1` يضيف سجلاً وأفلاماً تجريبية). يتحقق أيضاً من أن الكود يُترجم.
 
 ## البناء

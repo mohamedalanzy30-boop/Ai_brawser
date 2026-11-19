@@ -1,0 +1,12 @@
+{
+  "name": "aib-engine-tests",
+  "private": true,
+  "description": "In-page engine tests (engine.js) in headless Chromium. Run: npm install && npm test",
+  "scripts": {
+    "test": "node run.js"
+  },
+  "devDependencies": {
+    "onnxruntime-web": "1.31.1",
+    "playwright": "1.63.0"
+  }
+}

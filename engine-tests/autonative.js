@@ -1,20 +1,20 @@
 // A long video (>= 10 min) that starts playing is handed to the native player once; a short one is not.
-const { chromium } = require('playwright'); const fs = require('fs'); const path = require('path')
-const ENGINE = path.resolve(__dirname, '../android/app/src/main/assets/engine.js')
-;(async () => {
-  const browser = await chromium.launch({ args: ['--autoplay-policy=no-user-gesture-required'] })
+const { ENGINE, launch, run, check, canvasVideo } = require('./lib')
+run('autonative: movies go to the native player once', async () => {
+  const browser = await launch()
   const page = await browser.newPage()
-  await page.route('https://test.local/', r => r.fulfill({ contentType: 'text/html', body: '<body><video id=s muted src="/short.webm" style="width:400px;height:225px"></video><video id=l muted src="/long.webm" style="width:400px;height:225px"></video></body>' }))
-  await page.route('https://test.local/short.webm', r => r.fulfill({ contentType: 'video/webm', body: fs.readFileSync('/tmp/claude-0/t.webm') }))
-  await page.route('https://test.local/long.webm', r => r.fulfill({ contentType: 'video/webm', body: fs.readFileSync('/tmp/claude-0/long.webm') }))
-  await page.addInitScript(() => { window.__calls = []; window.AIBNative = { playing () {}, autoNative: (s, t) => { window.__calls.push(s.split('/').pop()); return true }, openNative () {} } })
+  await page.route('https://test.local/', r => r.fulfill({ contentType: 'text/html', body: '<body><video id=s style="width:400px;height:225px"></video><video id=l style="width:400px;height:225px"></video></body>' }))
+  await page.addInitScript(() => { window.__calls = []; window.AIBNative = { playing () {}, autoNative: (s, t) => { window.__calls.push(s); return true }, openNative () {} } })
   await page.goto('https://test.local/')
-  await page.addScriptTag({ content: fs.readFileSync(ENGINE, 'utf8') })
-  await page.waitForFunction(() => document.getElementById('l').readyState >= 1 && document.getElementById('s').readyState >= 1)
-  await page.evaluate(async () => { await document.getElementById('s').play(); await document.getElementById('l').play() })
-  await page.waitForTimeout(500)
-  await page.evaluate(async () => { await document.getElementById('l').play() }) // second play: must not hand over again
-  await page.waitForTimeout(300)
-  console.log('handed to native:', JSON.stringify(await page.evaluate(() => window.__calls)), ' long video paused:', await page.evaluate(() => document.getElementById('l').paused))
+  await page.addScriptTag({ content: ENGINE })
+  await page.evaluate(canvasVideo, { id: 's', duration: 30 }) // a trailer
+  await page.evaluate(canvasVideo, { id: 'l', duration: 5400 }) // a 90 min film
+  await page.waitForTimeout(600)
+  const a = await page.evaluate(() => ({ calls: window.__calls.length, longPaused: document.getElementById('l').paused, shortPaused: document.getElementById('s').paused }))
+  check('the film is handed over and paused in the page; the trailer keeps playing', a.calls === 1 && a.longPaused && !a.shortPaused, a)
+  await page.evaluate(() => document.getElementById('l').play()) // back from the native player, play again: no second hand-over
+  await page.waitForTimeout(400)
+  const b = await page.evaluate(() => ({ calls: window.__calls.length, longPaused: document.getElementById('l').paused }))
+  check('playing it again in the page is not handed over a second time', b.calls === 1 && !b.longPaused, b)
   await browser.close()
-})()
+})

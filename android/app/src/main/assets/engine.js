@@ -50,7 +50,7 @@
     log('performance guard: neural upscaling paused ' + secs + 's (busy ' + Math.round(busy) + 'ms/3s)')
   }, 1500)
   const log = (...a) => { try { console.warn('[AIB]', ...a) } catch (e) { /* ignore */ } }
-  const state = { videos: new Map(), failed: false, nn: null, stats: { nn: 'idle', fps: 0, ms: 0 } }
+  const state = { videos: new Map(), nn: null, stats: { nn: 'idle', fps: 0, ms: 0 } }
 
   /* ---------------- shaders ---------------- */
   const VS = `#version 300 es
@@ -204,7 +204,7 @@ void main(){
   /* ---------------- neural 4x via ONNX Runtime Web (in page) ---------------- */
   function nnInit () {
     if (state.nn || !window.ort) { if (!window.ort) state.stats.nn = 'ort-missing'; return }
-    const nn = state.nn = { session: null, busy: false, last: null, ms: 0, id: 0, rid: 0 }
+    const nn = state.nn = { session: null, busy: false, last: null, ms: 0, id: 0, rid: 0, runs: 0, lastProbe: 0 }
     state.stats.nn = 'loading'
     const ort = window.ort
     ort.env.wasm.wasmPaths = HOST + 'ort/'; ort.env.wasm.numThreads = 1
@@ -220,7 +220,7 @@ void main(){
     })().catch((e) => { state.stats.nn = 'error'; log('neural SR load failed:', String(e)) })
   }
   const grab = document.createElement('canvas'); const grabCtx = grab.getContext('2d', { willReadFrequently: true })
-  async function nnRun (video, vw, vh) {
+  async function nnRun (video, vw, vh, probe) {
     const nn = state.nn; nn.busy = true
     try {
       grab.width = vw; grab.height = vh; grabCtx.drawImage(video, 0, 0, vw, vh)
@@ -228,7 +228,10 @@ void main(){
       for (let i = 0, j = 0; i < px; i++, j += 4) { inp[i] = d[j] / 255; inp[px + i] = d[j + 1] / 255; inp[2 * px + i] = d[j + 2] / 255 }
       const mt = video.currentTime; const t0 = performance.now()
       const out = await nn.session.run({ [nn.session.inputNames[0]]: new window.ort.Tensor('float32', inp, [1, 3, vh, vw]) })
-      nn.ms = nn.ms ? nn.ms * 0.7 + (performance.now() - t0) * 0.3 : performance.now() - t0
+      // the first runs include the backend warm-up, and a probe after a slow spell must be able to switch the model back on:
+      // both take the new time as it is instead of averaging it with a stale one
+      const ms = performance.now() - t0; nn.runs++
+      nn.ms = (nn.runs <= 2 || probe || !nn.ms) ? ms : nn.ms * 0.7 + ms * 0.3
       const o = out[nn.session.outputNames[0]].data; const ow = vw * 4; const oh = vh * 4 // Float32 NCHW, converted on the GPU
       nn.last = { mediaTime: mt, w: ow, h: oh, planes: o, id: ++nn.rid }
     } catch (e) { state.stats.nn = 'error'; log('SR inference failed:', String(e)) } finally { nn.busy = false }
@@ -255,23 +258,54 @@ void main(){
     return { left, top, width: w, height: h, clip }
   }
   function host () { return document.fullscreenElement || document.webkitFullscreenElement || document.documentElement }
-  document.addEventListener('fullscreenchange', () => state.videos.forEach(st => host().appendChild(st.canvas)))
-  document.addEventListener('webkitfullscreenchange', () => state.videos.forEach(st => host().appendChild(st.canvas)))
+  const moveOverlays = () => state.videos.forEach(st => { if (st.canvas) host().appendChild(st.canvas) })
+  document.addEventListener('fullscreenchange', moveOverlays)
+  document.addEventListener('webkitfullscreenchange', moveOverlays)
+  /* A WebGL context is a scarce resource: the browser keeps about 16 per page and silently kills the oldest one beyond
+     that. A killed context left the video hidden (opacity 0) under a dead overlay: a white or black box instead of the film.
+     So: a video gets its context only while it is really being enhanced, at most MAX_VIDEO_GL at a time, an idle video
+     gives it back, and a lost context hands the page its own video back at once (enhancement returns on a fresh one). */
+  const MAX_VIDEO_GL = 4
+  const hooked = new WeakSet()
   function attach (video) {
     if (video.mediaKeys) { log('DRM video skipped'); return }
-    if (state.videos.has(video) || state.failed) return
+    if (state.videos.has(video)) return
+    const st = { canvas: null, R: null, running: false, prevOpacity: video.style.opacity, errors: 0, frame: 0, tone: { lo: 0, hi: 1, contrast: 0.22, sat: 1.1, gamma: 1 }, lastT: 0, fpsEMA: 30, lost: 0, noGl: 0, idleSince: 0, drawn: '' }
+    state.videos.set(video, st)
+    if (!hooked.has(video)) { hooked.add(video); video.addEventListener('play', () => { const s = state.videos.get(video); if (s) { s.fpsEMA = 30; s.lastT = 0 } loop(video) }) }
+    loop(video)
+  }
+  function ensureR (video, st) {
+    if (st.R) return true
+    const now = performance.now()
+    if (st.noGl > now) return false
+    const live = Array.from(state.videos.entries()).filter(([, s]) => s.R)
+    if (live.length >= MAX_VIDEO_GL) { // free the context of a video that is not on screen; otherwise wait
+      const idle = live.filter(([, s]) => s.idleSince).sort((a, b) => a[1].idleSince - b[1].idleSince)[0]
+      if (!idle) { st.noGl = now + 2000; return false }
+      dropR(idle[0], idle[1])
+    }
     const canvas = document.createElement('canvas')
     canvas.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483646;display:none'
-    let R
-    try { R = makeRenderer(canvas) } catch (e) { R = null; console.warn('enhance: shader error', e) }
-    if (!R) { state.failed = true; log('WebGL2 unavailable'); return }
-    const st = { canvas, R, running: false, prevOpacity: video.style.opacity, errors: 0, frame: 0, tone: { lo: 0, hi: 1, contrast: 0.22, sat: 1.1, gamma: 1 }, lastT: 0, fpsEMA: 30 }
-    state.videos.set(video, st); host().appendChild(canvas)
-    video.addEventListener('play', () => { st.fpsEMA = 30; st.lastT = 0; loop(video) }); loop(video)
+    let R = null
+    try { R = makeRenderer(canvas) } catch (e) { log('enhance: shader error', String(e)) }
+    if (!R) { st.noGl = now + 10000; log('WebGL2 unavailable for this video, trying again in 10 s'); return false }
+    canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); if (st.R && st.R.canvas === canvas) dropR(video, st, 'GPU context lost') })
+    st.canvas = canvas; st.R = R; st.drawn = ''; host().appendChild(canvas)
+    return true
+  }
+  /** gives the page its own video back and frees the GPU context; [why] = it died (retried later, at most 3 times) */
+  function dropR (video, st, why) {
+    if (!st.R) return
+    const R = st.R; st.R = null
+    st.canvas.remove(); st.canvas = null; st.nnId = 0; st.drawn = ''
+    video.style.opacity = st.prevOpacity
+    try { R.dispose() } catch (e) { /* already lost */ }
+    if (why) { st.lost++; st.noGl = st.lost > 3 ? Infinity : performance.now() + 1000; log('video overlay removed:', why, st.lost > 3 ? '(enhancement off for this video)' : '(retrying)') }
   }
   function detach (video) {
     const st = state.videos.get(video); if (!st) return
-    st.canvas.remove(); st.R.dispose(); video.style.opacity = st.prevOpacity; state.videos.delete(video)
+    dropR(video, st); video.style.opacity = st.prevOpacity; state.videos.delete(video)
   }
   function loop (video) {
     const st = state.videos.get(video); if (!st || st.running) return
@@ -280,26 +314,33 @@ void main(){
       if (video.requestVideoFrameCallback && !video.paused) video.requestVideoFrameCallback(cb)
       else setTimeout(() => requestAnimationFrame(cb), video.paused ? 250 : 16)
     }
-    const tick = (now, meta) => {
-      if (video.mediaKeys) { detach(video); st.running = false; return }
-      if (!state.videos.has(video) || !cfg.enabled) { st.running = false; return }
+    const tick = () => {
+      const now = performance.now()
+      if (video.mediaKeys || !video.isConnected) { detach(video); st.running = false; return } // DRM, or the page removed the video
+      if (state.videos.get(video) !== st || !cfg.enabled) { st.running = false; return }
       const rect = video.getBoundingClientRect(); const vw = video.videoWidth; const vh = video.videoHeight; const dpr = window.devicePixelRatio || 1
       const wantH = Math.min(effTarget(), fitRect(video, rect, vw, vh).height * dpr)
       const visible = vw > 0 && video.readyState >= 2 && rect.width > 40 && rect.height > 40 && rect.bottom > 0 && rect.top < window.innerHeight && !document.hidden
       const why = !visible ? 'hidden/not-ready' : (vh >= wantH * 0.95 ? 'source already >= target' : 'enhancing')
       if (st.why !== why) { st.why = why; log('video', vw + 'x' + vh, 'shown=' + Math.round(rect.width) + 'x' + Math.round(rect.height) + 'css', 'wantH=' + Math.round(wantH), '=>', why, 'frame=' + (window.top === window ? 'TOP' : 'FRAME')) }
-      if (!(visible && vh < wantH * 0.95)) { st.canvas.style.display = 'none'; video.style.opacity = st.prevOpacity; next(tick); return }
+      if (!(visible && vh < wantH * 0.95)) {
+        if (st.canvas) st.canvas.style.display = 'none'
+        video.style.opacity = st.prevOpacity
+        if (!st.idleSince) st.idleSince = now
+        else if (st.R && now - st.idleSince > 8000) dropR(video, st) // not enhanced for 8 s: give the context back
+        next(tick); return
+      }
+      st.idleSince = 0
+      if (!ensureR(video, st) || st.R.gl.isContextLost()) { if (st.R) dropR(video, st, 'GPU context lost'); video.style.opacity = st.prevOpacity; next(tick); return }
       const fr = fitRect(video, rect, vw, vh)
       const [w, h] = outSize(vw, vh, fr)
-      if (st.canvas.width !== w || st.canvas.height !== h) { st.canvas.width = w; st.canvas.height = h }
+      if (st.canvas.width !== w || st.canvas.height !== h) { st.canvas.width = w; st.canvas.height = h; st.drawn = '' }
       const s = st.canvas.style; s.display = 'block'; s.left = fr.left + 'px'; s.top = fr.top + 'px'; s.width = fr.width + 'px'; s.height = fr.height + 'px'; s.clipPath = fr.clip
       state.stats.fps = Math.round(st.fpsEMA)
-      state.stats.active = Array.from(state.videos.values()).filter(x => x.canvas.style.display === 'block').length
+      state.stats.active = Array.from(state.videos.values()).filter(x => x.canvas && x.canvas.style.display === 'block').length
       try {
-        st.R.resize(vw, vh); st.R.upload(video); st.frame++
-        if (cfg.tone && st.frame % 3 === 1) analyseTone(st, video) // every 3rd frame (each read copies the video frame to the CPU): scene cuts still snap within ~0.1 s
-        const tone = cfg.tone ? st.tone : { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }
-        const dt = st.lastT ? (now - st.lastT) : 33; st.lastT = now; st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
+        const dt = st.lastT ? (now - st.lastT) : 33; st.lastT = now
+        if (!video.paused) st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
         const nnLiveOk = vh <= 660 // 360p..660p get the neural 4x path at their own size (the result is scaled to the screen); bigger sources use the shader path
         const wantNN = cfg.neural && (video.paused || (!guard.noNeural && nnLiveOk)) && vh <= 660 && state.nn && state.nn.session && state.stats.nn !== 'error'
         if (cfg.neural && vh <= 660) nnInit()
@@ -307,36 +348,64 @@ void main(){
         // model keeps up with the video (always one steady frame late). Never mix stale and live frames.
         const nnS = state.nn; const T = 1000 / Math.max(st.fpsEMA, 1)
         const fast = !!nnS && nnS.ms > 0 && nnS.ms < 0.6 * T
-        if (wantNN && !nnS.busy && (video.paused || fast || !nnS.ms)) { nnS.lastProbe = performance.now(); nnRun(video, vw, vh) }
         const r = nnS && nnS.last
-        const fresh = wantNN && r && r.w === vw * 4 && (video.paused ? Math.abs(r.mediaTime - video.currentTime) < 0.05 : fast && Math.abs(r.mediaTime - video.currentTime) < 3 * T / 1000)
-        if (fresh) {
-          if (st.nnId !== r.id) { st.R.uploadPlanes(r.planes, r.w, r.h); st.nnId = r.id }
-          st.R.draw('nn', vw, vh, tone, cfg.sharpness * 0.3)
-        } else st.R.draw('cur', vw, vh, tone, cfg.sharpness)
+        const pausedFrameDone = video.paused && r && r.w === vw * 4 && Math.abs(r.mediaTime - video.currentTime) < 0.05
+        // paused: the model runs once for the paused frame, then rests until the picture changes (seek, new source)
+        // too slow for this video: tried again every 5 s (warm-up, a busy moment or a smaller video can make it fast enough)
+        const probe = !video.paused && !fast && nnS && nnS.ms > 0 && now - nnS.lastProbe > 5000
+        if (wantNN && !nnS.busy && (video.paused ? !pausedFrameDone : (fast || !nnS.ms || probe))) { nnS.lastProbe = now; nnRun(video, vw, vh, probe) }
+        const fresh = wantNN && r && r.w === vw * 4 && (video.paused ? pausedFrameDone : fast && Math.abs(r.mediaTime - video.currentTime) < 3 * T / 1000)
+        // a paused picture that is already on the overlay is not uploaded, analysed and drawn again 4 times a second
+        const key = video.paused ? [video.currentTime, w, h, fresh ? 'nn' + r.id : 'cur', cfg.tone, cfg.sharpness, cfg.denoise].join('|') : ''
+        if (!key || key !== st.drawn) {
+          st.R.resize(vw, vh); st.R.upload(video); st.frame++
+          if (cfg.tone && (st.frame % 3 === 1 || video.paused)) analyseTone(st, video) // every 3rd frame (each read copies the video frame to the CPU): scene cuts still snap within ~0.1 s
+          const tone = cfg.tone ? st.tone : { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }
+          if (fresh) {
+            if (st.nnId !== r.id) { st.R.uploadPlanes(r.planes, r.w, r.h); st.nnId = r.id }
+            st.R.draw('nn', vw, vh, tone, cfg.sharpness * 0.3)
+          } else st.R.draw('cur', vw, vh, tone, cfg.sharpness)
+          st.drawn = key
+        }
         video.style.opacity = '0'; st.errors = 0
       } catch (e) { if (++st.errors > 3) { log('video disabled (', String(e), ') src=', (video.currentSrc || '').slice(0, 80)); detach(video); st.running = false; return } }
       next(tick)
     }
-    tick(performance.now())
+    tick()
   }
 
   /* ---------------- images ---------------- */
+  // All images share ONE GPU context, used for one image at a time (the next starts when the previous is saved), so a page
+  // full of pictures can never use up the browser's contexts. Pictures from another site without CORS cannot be read back
+  // (the GPU upload throws): they are skipped before any GPU work instead of costing a context each.
   const doneImages = new WeakSet()
-  function upscaleImage (img) {
-    if (doneImages.has(img) || !img.complete || !img.naturalWidth || img.dataset.minEnhanced) return
+  let imgR = null
+  function readable (img) {
+    const src = img.currentSrc || img.src || ''
+    if (/^(data|blob):/i.test(src)) return true
+    try { return new URL(src, location.href).origin === location.origin || img.crossOrigin != null } catch (e) { return false }
+  }
+  function releaseImgR () { if (imgR) { try { imgR.dispose() } catch (e) { /* lost */ } imgR = null } }
+  /** calls done(true) when the image was replaced by its enhanced copy, done(false) otherwise */
+  function upscaleImage (img, done) {
+    if (doneImages.has(img) || !img.complete || !img.naturalWidth || img.dataset.minEnhanced) return done(false)
     const rect = img.getBoundingClientRect(); const dpr = window.devicePixelRatio || 1
     const wantW = Math.min(rect.width * dpr, effTarget() * (img.naturalWidth / img.naturalHeight))
-    if (rect.width < 80 || img.naturalWidth >= wantW * 0.9 || img.naturalWidth * img.naturalHeight > 4e6) return
+    if (rect.width < 80 || img.naturalWidth >= wantW * 0.9 || img.naturalWidth * img.naturalHeight > 4e6) return done(false)
     doneImages.add(img)
+    const pic = img.parentElement && img.parentElement.tagName === 'PICTURE' && img.parentElement.querySelector('source')
+    if (!readable(img) || pic) return done(false) // other site without CORS / <picture> sources would win over our copy
     try {
-      const scale = Math.min(4, Math.ceil(wantW / img.naturalWidth)); const canvas = document.createElement('canvas')
-      canvas.width = img.naturalWidth * scale; canvas.height = img.naturalHeight * scale
-      const R = makeRenderer(canvas); if (!R) return
+      if (!imgR || imgR.gl.isContextLost()) { releaseImgR(); imgR = makeRenderer(document.createElement('canvas')); if (!imgR) return done(false) }
+      const R = imgR; const scale = Math.min(4, Math.ceil(wantW / img.naturalWidth))
+      R.canvas.width = img.naturalWidth * scale; R.canvas.height = img.naturalHeight * scale
       R.resize(img.naturalWidth, img.naturalHeight); R.upload(img)
       R.draw('cur', img.naturalWidth, img.naturalHeight, { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }, cfg.sharpness)
-      canvas.toBlob(b => { R.dispose(); if (b) { img.dataset.minEnhanced = '1'; img.removeAttribute('srcset'); img.src = URL.createObjectURL(b) } }, 'image/webp', 0.92)
-    } catch (e) { /* tainted cross-origin image */ }
+      R.canvas.toBlob(b => {
+        if (b && img.isConnected) { img.dataset.minEnhanced = '1'; img.removeAttribute('srcset'); img.src = URL.createObjectURL(b) }
+        done(!!b)
+      }, 'image/webp', 0.92)
+    } catch (e) { done(false) } // unreadable after all (tainted)
   }
 
   /* ---------------- fullscreen button (like Samsung Internet) ---------------- */
@@ -509,6 +578,11 @@ void main(){
     // where the film is, so reopening the browser after Android closed it continues from there
     if (v && v.duration >= 120 && NATIVE.position) try { NATIVE.position(v.currentTime, v.duration) } catch (err) { /* ignore */ }
   }, 1500)
+  // the film reached its end: the app forgets the position (reopening must not jump to the last 20 s, "continue watching" drops it)
+  document.addEventListener('ended', (e) => {
+    const v = e.target
+    if (NATIVE && NATIVE.position && v instanceof HTMLVideoElement && v.duration >= 120 && isFinite(v.duration)) try { NATIVE.position(v.duration, v.duration) } catch (err) { /* ignore */ }
+  }, true)
 
   function updateFsButton () {
     if (locked) return
@@ -538,20 +612,22 @@ void main(){
 
   /* ---------------- orchestration ---------------- */
   function scan () {
-    if (!cfg.enabled || state.failed) return
+    if (!cfg.enabled) return
     document.querySelectorAll('video').forEach(attach)
-    if (cfg.images) document.querySelectorAll('img').forEach(i => { if (!imgQueue.includes(i)) imgQueue.push(i) })
+    if (cfg.images) document.querySelectorAll('img').forEach(i => { if (!doneImages.has(i) && !queued.has(i)) { queued.add(i); imgQueue.push(i) } })
     pumpImages()
   }
-  const imgQueue = []; let imgDone = 0; let imgPumping = false
-  function pumpImages () { // one image per 120ms, max 40 per page: keeps scrolling and playback smooth
+  const imgQueue = []; const queued = new WeakSet(); let imgDone = 0; let imgPumping = false
+  function pumpImages () { // one image at a time, 120 ms apart, max 40 per page: keeps scrolling and playback smooth
     if (imgPumping) return
     imgPumping = true
     const step = () => {
       const img = imgQueue.shift()
-      if (!img || imgDone >= 40 || !cfg.images || !cfg.enabled) { imgPumping = false; imgQueue.length = 0; return }
-      if (!doneImages.has(img)) { upscaleImage(img); if (doneImages.has(img)) imgDone++ }
-      setTimeout(step, doneImages.has(img) ? 120 : 0)
+      if (!img || imgDone >= 40 || !cfg.images || !cfg.enabled) {
+        imgPumping = false; imgQueue.forEach(i => queued.delete(i)); imgQueue.length = 0; releaseImgR(); return
+      }
+      queued.delete(img) // not loaded yet / too small now: looked at again on the next scan
+      upscaleImage(img, (did) => { if (did) imgDone++; setTimeout(step, did ? 120 : 0) })
     }
     step()
   }
