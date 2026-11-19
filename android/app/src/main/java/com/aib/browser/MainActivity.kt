@@ -212,13 +212,26 @@ class MainActivity : Activity() {
             .putExtra("pos", pos).putExtra("title", web.title ?: "").putExtra("page", page), PLAYER_REQ)
     }
 
-    /** Small bridge for the in-page player controls. Every method is harmless if a page calls it. */
+    /**
+     * Small bridge for the in-page player controls. It is visible to every frame of every site (ads in iframes too),
+     * so each method is limited to what the engine needs: volume and brightness only with the extra player tools switched
+     * on and a video playing, small steps only; the native player opens at most once every 2 s and never on top of itself.
+     */
+    @Volatile private var lastNativeAt = 0L
+    private fun nativeAllowed(): Boolean {
+        val now = android.os.SystemClock.uptimeMillis()
+        if (nativeOpen || now - lastNativeAt < 2000) return false
+        lastNativeAt = now; return true
+    }
+    @Volatile private var pageTitle = ""
+    @Volatile private var lastResumeSave = 0L
     inner class Bridge {
-        @android.webkit.JavascriptInterface fun openNative(src: String, pos: Double) { ui.post { this@MainActivity.openNative(src, pos) } }
+        @android.webkit.JavascriptInterface fun openNative(src: String, pos: Double) { if (nativeAllowed()) ui.post { this@MainActivity.openNative(src, pos) } }
         /** auto mode: only switches when a real video address is known; otherwise the page keeps playing */
         @android.webkit.JavascriptInterface fun autoNative(src: String, pos: Double): Boolean {
             if (!on("autoNative") || pageHost in noNative) return false
             if (!src.startsWith("http") && media.isEmpty()) return false
+            if (!nativeAllowed()) return false
             ui.post { this@MainActivity.openNative(src, pos) }
             return true
         }
@@ -230,7 +243,8 @@ class MainActivity : Activity() {
         @android.webkit.JavascriptInterface fun brightness(delta: Float): Float {
             val lp = window.attributes
             val cur = if (lp.screenBrightness < 0) try { android.provider.Settings.System.getInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS) / 255f } catch (e: Exception) { 0.5f } else lp.screenBrightness
-            val v = (cur + delta).coerceIn(0.02f, 1f)
+            if (!on("gestures") || !videoPlaying) return cur
+            val v = (cur + delta.coerceIn(-0.2f, 0.2f)).coerceIn(0.02f, 1f)
             ui.post { window.attributes = window.attributes.also { it.screenBrightness = v } }
             return v
         }
@@ -238,14 +252,26 @@ class MainActivity : Activity() {
             val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
             val max = am.getStreamMaxVolume(android.media.AudioManager.STREAM_MUSIC)
             val cur = am.getStreamVolume(android.media.AudioManager.STREAM_MUSIC)
-            val next = (cur + Math.round(delta * max)).coerceIn(0, max)
+            if (!on("gestures") || !videoPlaying) return cur.toFloat() / max
+            val next = (cur + Math.round(delta.coerceIn(-0.2f, 0.2f) * max)).coerceIn(0, max)
             if (next != cur) am.setStreamVolume(android.media.AudioManager.STREAM_MUSIC, next, 0)
             return next.toFloat() / max
         }
         @android.webkit.JavascriptInterface fun pip() { ui.post { enterPip() } }
         @android.webkit.JavascriptInterface fun pullOk(ok: Boolean) { pullOk = ok }
-        /** playing film position (any frame), kept for restoring the session after Android closes the app */
-        @android.webkit.JavascriptInterface fun position(t: Double, dur: Double) { if (t > 5 && dur - t > 20) { sessPos = t; sessPage = pageUrl } }
+        /** playing film position (any frame): restores the session after Android closes the app, and fills "continue watching"
+         *  for films watched in the site's own player too. The end of the film clears both (no reopening 20 s before the end). */
+        @android.webkit.JavascriptInterface fun position(t: Double, dur: Double) {
+            val page = pageUrl ?: return
+            if (!(dur > 0) || dur.isInfinite()) return
+            if (dur - t <= 20) { // finished
+                if (sessPage == page) sessPos = 0.0
+                Resume.remove(this@MainActivity, page); return
+            }
+            if (t > 5) { sessPos = t; sessPage = page }
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastResumeSave > 10_000) { lastResumeSave = now; Resume.save(this@MainActivity, page, pageTitle, (t * 1000).toLong(), (dur * 1000).toLong()) }
+        }
     }
 
     /** The screen must not go dark while a video plays (the phone's sleep timer ignores web video). */
@@ -339,11 +365,24 @@ class MainActivity : Activity() {
         loadLists()
         registerScript()
         val restore = prefs.getString("restoreUrl", null); prefs.edit().remove("restoreUrl").apply()
+        // a link from another app opens it; but when Android recreates the browser (from recents, after closing it in the
+        // background) the old link intent comes back too: then the session continues where you were instead
+        val fromHistory = savedInstanceState != null || (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0
+        val link = intent?.dataString?.takeIf { !fromHistory && (it.startsWith("http://") || it.startsWith("https://")) }
         when {
             restore != null -> go(restore) // renderer crash: reload that page (crash-loop guard picks HOME)
-            intent?.dataString != null -> go(intent.dataString!!)
+            link != null -> go(link)
             !restoreSession() -> go(HOME)
         }
+    }
+
+    /** The browser is single-task: a link tapped in another app while it is open arrives here and opens in it. */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent); setIntent(intent)
+        val link = intent.dataString?.takeIf { it.startsWith("http://") || it.startsWith("https://") } ?: return
+        if (customView != null) exitFullscreen()
+        if (urlEdit.visibility == View.VISIBLE) endEdit()
+        go(link)
     }
 
     private fun buildBottomBar(): LinearLayout {
@@ -457,8 +496,8 @@ class MainActivity : Activity() {
             // look like Chrome, not like an embedded WebView: Google sign-in and some sites refuse WebViews
             userAgentString = userAgentString.replace("; wv", "").replace(Regex("Version/\\d+\\.\\d+ "), "")
             allowFileAccess = false; allowContentAccess = false; setGeolocationEnabled(false)
-            if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) WebSettingsCompat.setSafeBrowsingEnabled(this, true)
         }
+        applySafeBrowsing()
         applyDark()
         // third-party cookies stay allowed: embedded movie players and sign-in need them; trackers are cut by the host list
         CookieManager.getInstance().setAcceptCookie(true)
@@ -496,8 +535,17 @@ class MainActivity : Activity() {
         override fun onCreateWindow(view: WebView, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message): Boolean {
             // Pop-ups: a tap-less pop-up is always an ad. Otherwise catch the first address in a hidden window and decide:
             // sign-in pages open as a real window, same-site links open here, ads and pop-unders to other sites are dropped.
+            // A link the user really tapped ("open in new window", target=_blank) is followed even to another site;
+            // a tap anywhere that opens some OTHER address in a new window is the classic pop-under ad and stays blocked.
             val strict = on("popups")
             if (strict && !isUserGesture) { popupsBlocked++; addLog("[AIB] blocked pop-up (no tap)"); return false }
+            var tapped: String? = null
+            val hit = view.hitTestResult
+            if (isUserGesture) when (hit.type) {
+                WebView.HitTestResult.SRC_ANCHOR_TYPE -> tapped = hit.extra
+                // a linked picture: hitTestResult holds the picture's address, the link comes from the page
+                WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE -> view.requestFocusNodeHref(Handler(Looper.getMainLooper()) { m -> tapped = m.data.getString("url"); true }.obtainMessage())
+            }
             val pw = WebView(this@MainActivity)
             pw.settings.apply { javaScriptEnabled = true; domStorageEnabled = true; userAgentString = web.settings.userAgentString; setSupportMultipleWindows(false) }
             CookieManager.getInstance().setAcceptThirdPartyCookies(pw, true)
@@ -506,18 +554,24 @@ class MainActivity : Activity() {
                 override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
                     if (decided) return false
                     decided = true
-                    val host = r.url.host
+                    val host = r.url.host; val scheme = r.url.scheme
+                    val asked = tapped?.let { Uri.parse(it).host }
+                    val wanted = asked != null && site(asked) == site(host)
                     return when {
+                        scheme != "http" && scheme != "https" -> { popupsBlocked++; addLog("[AIB] blocked pop-up ($scheme:)"); ui.post { v.destroy() }; true } // never javascript:/data: into the main page
                         host in authHosts -> { showPopup(pw); false }
-                        isAd(host) || isAdult(host) || (strict && site(host) != site(pageHost)) -> { popupsBlocked++; addLog("[AIB] blocked pop-up -> $host"); ui.post { v.destroy() }; true }
-                        else -> { web.loadUrl(r.url.toString()); ui.post { v.destroy() }; true }
+                        isAd(host) || isAdult(host) || (strict && !wanted && site(host) != site(pageHost)) -> { popupsBlocked++; addLog("[AIB] blocked pop-up -> $host"); ui.post { v.destroy() }; true }
+                        else -> { go(r.url.toString()); ui.post { v.destroy() }; true }
                     }
                 }
             }
+            // a window that never goes anywhere (about:blank pop-unders) is not kept alive
+            ui.postDelayed({ if (!decided) { decided = true; addLog("[AIB] closed an empty pop-up"); pw.destroy() } }, 15_000)
             (resultMsg.obj as WebView.WebViewTransport).webView = pw
             resultMsg.sendToTarget()
             return true
         }
+        override fun onReceivedTitle(view: WebView, title: String?) { pageTitle = title ?: "" }
         override fun onConsoleMessage(m: ConsoleMessage): Boolean {
             val msg = m.message()
             val noise = msg.startsWith("Permissions policy violation") || msg.contains("VerifyEachNodeIsAssignedToAnEp") || msg.startsWith("ResizeObserver loop")
@@ -548,6 +602,9 @@ class MainActivity : Activity() {
     private inner class Client : WebViewClient() {
         override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
             val u = request.url
+            // the adult filter also covers addresses typed in the bar, history, links from other apps and restored pages
+            // (those loads never pass through shouldOverrideUrlLoading)
+            if (request.isForMainFrame && isAdult(u.host)) return WebResourceResponse("text/html", "utf-8", 200, "OK", mapOf("Cache-Control" to "no-store"), blockedHtml(u.host).byteInputStream())
             if (!(adblockOn && isAd(u.host))) noteMedia(request)
             // anti-adblock libraries are often served from the site itself: answer them with a stand-in that says "no blocker"
             if (adblockOn && !request.isForMainFrame && antiAdblock.containsMatchIn(u.toString())) return fakeResponse(request)
@@ -580,6 +637,18 @@ class MainActivity : Activity() {
                 view.loadUrl(req.url.buildUpon().scheme("http").build().toString())
             }
         }
+        /** A broken certificate is never accepted. But when WE turned the address into https (the site was typed or linked
+         *  as http), a certificate error means the site simply has no working https: open the http page it asked for. */
+        @SuppressLint("WebViewClientOnReceivedSslError")
+        override fun onReceivedSslError(view: WebView, handler: android.webkit.SslErrorHandler, error: android.net.http.SslError) {
+            handler.cancel()
+            val u = Uri.parse(error.url); val host = u.host
+            if (host != null && host in upgraded && u.scheme == "https") {
+                upgraded.remove(host); noHttps.add(host)
+                addLog("[AIB] $host has a broken https certificate, using http")
+                view.loadUrl(u.buildUpon().scheme("http").build().toString())
+            } else addLog("[SSL ERROR ${error.primaryError}] ${error.url}")
+        }
         override fun onReceivedHttpError(view: WebView, req: WebResourceRequest, resp: WebResourceResponse) {
             if (req.url.host == ASSET_HOST || req.isForMainFrame) addLog("[HTTP ${resp.statusCode}] ${req.url}")
         }
@@ -599,11 +668,17 @@ class MainActivity : Activity() {
                 if (on("popups") && (!req.hasGesture() || req.url.toString().contains("package=com.android.chrome"))) {
                     popupsBlocked++; addLog("[AIB] blocked app redirect $scheme://${req.url.host}"); return true
                 }
+                var fallback: String? = null
                 return try {
                     val it = Intent.parseUri(req.url.toString(), Intent.URI_INTENT_SCHEME)
+                    fallback = it.getStringExtra("browser_fallback_url")
                     it.addCategory(Intent.CATEGORY_BROWSABLE); it.component = null; it.selector = null
                     startActivity(it); true
-                } catch (e: Exception) { true }
+                } catch (e: Exception) {
+                    // app not installed: intent:// links carry a web address for exactly this case (Maps, YouTube, stores...)
+                    fallback?.takeIf { it.startsWith("https://") || it.startsWith("http://") }?.let { view.loadUrl(it) }
+                    true
+                }
             }
             if (req.isForMainFrame && isAdult(req.url.host)) { blockedPage(req.url.host); return true }
             if (req.isForMainFrame && on("protect")) {
@@ -669,29 +744,40 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun blockedPage(host: String?) {
+    /** viewport meta: without it the page is laid out 980px wide and zoomed out (tiny text); the address bar shows the blocked host */
+    private fun blockedHtml(host: String?): String {
         val h = android.text.TextUtils.htmlEncode(host ?: "")
-        // viewport meta: without it the page is laid out 980px wide and zoomed out (tiny text); the address bar shows the blocked host
-        web.loadDataWithBaseURL(null, "<!doctype html><html dir='rtl' lang='ar'><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>" +
+        return "<!doctype html><html dir='rtl' lang='ar'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'></head>" +
             "<body style='margin:0;background:#000;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:90vh;text-align:center'>" +
-            "<div><div style='font-size:48px'>🛡️</div><p style='font-size:18px;margin:16px 0 8px'>هذا الموقع محجوب</p><p dir='ltr' style='color:#98989d;margin:0'>$h</p></div></body></html>",
-            "text/html", "utf-8", if (host != null) "https://$host/" else null)
+            "<div><div style='font-size:48px'>🛡️</div><p style='font-size:18px;margin:16px 0 8px'>هذا الموقع محجوب</p><p dir='ltr' style='color:#98989d;margin:0'>$h</p></div></body></html>"
+    }
+    private fun blockedPage(host: String?) {
+        web.loadDataWithBaseURL(null, blockedHtml(host), "text/html", "utf-8", if (host != null) "https://$host/" else null)
     }
 
-    /** Some Google font files are served without CORS headers, so pages cannot use them. Same download, plus the header. */
-    private fun proxyFont(req: WebResourceRequest): WebResourceResponse? = try {
-        val c = java.net.URL(req.url.toString()).openConnection() as java.net.HttpURLConnection
-        c.connectTimeout = 8000; c.readTimeout = 15000
-        req.requestHeaders["User-Agent"]?.let { c.setRequestProperty("User-Agent", it) }
-        val code = c.responseCode
-        val acao = c.getHeaderField("Access-Control-Allow-Origin")
-        if (acao != null) { c.disconnect(); null } // already fine: let WebView load it normally
-        else if (code != 200) { // font removed by Google (e.g. old /ea/ fonts): fail quietly, page falls back to the phone font
-            c.disconnect()
-            WebResourceResponse("text/plain", "utf-8", 404, "Not Found", mapOf("Access-Control-Allow-Origin" to "*"), "".byteInputStream())
-        } else WebResourceResponse(c.contentType?.substringBefore(';') ?: "font/woff2", null, 200, "OK",
-            mapOf("Access-Control-Allow-Origin" to "*", "Cache-Control" to "public, max-age=31536000"), c.inputStream)
-    } catch (e: Exception) { null }
+    /**
+     * Some Google font files (old /ea/ fonts) are served without CORS headers, so pages cannot use them: those are passed
+     * through with the header added. Every font used to be fetched here first and, when it already had the header (almost
+     * always), thrown away and downloaded a second time by the WebView. Now the first file of each kind (/s/, /ea/, ...)
+     * is served from that one download, and kinds known to have the header load normally (with the WebView's cache).
+     */
+    private val fontCors = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+    private fun proxyFont(req: WebResourceRequest): WebResourceResponse? {
+        val kind = req.url.pathSegments.firstOrNull() ?: ""
+        if (fontCors[kind] == true) return null
+        return try {
+            val c = java.net.URL(req.url.toString()).openConnection() as java.net.HttpURLConnection
+            c.connectTimeout = 8000; c.readTimeout = 15000
+            for (h in listOf("User-Agent", "Accept", "Referer")) req.requestHeaders[h]?.let { c.setRequestProperty(h, it) }
+            val code = c.responseCode
+            if (code == 200) fontCors[kind] = c.getHeaderField("Access-Control-Allow-Origin") != null
+            if (code != 200) { // font removed by Google: fail quietly, the page falls back to the phone font
+                c.disconnect()
+                WebResourceResponse("text/plain", "utf-8", 404, "Not Found", mapOf("Access-Control-Allow-Origin" to "*"), "".byteInputStream())
+            } else WebResourceResponse(c.contentType?.substringBefore(';') ?: "font/woff2", null, 200, "OK",
+                mapOf("Access-Control-Allow-Origin" to "*", "Cache-Control" to "public, max-age=31536000"), c.inputStream)
+        } catch (e: Exception) { null }
+    }
 
     /* ======================= downloads & uploads ======================= */
     private fun download(url: String, ua: String, disposition: String?, mime: String?) {
@@ -745,7 +831,14 @@ class MainActivity : Activity() {
             t.contains(".") && !t.contains(" ") -> "https://$t"
             else -> "https://www.google.com/search?q=" + java.net.URLEncoder.encode(t, "UTF-8")
         }
-        web.loadUrl(url)
+        // loadUrl() never passes through shouldOverrideUrlLoading: typed addresses, history, links from other apps and the
+        // "continue" lists get the https upgrade and tracking-parameter removal here (the adult filter is in shouldInterceptRequest)
+        var u = Uri.parse(url)
+        if (on("protect") && u.host != null) {
+            cleanUrl(u)?.let { u = it }
+            if (u.scheme == "http" && u.host !in noHttps) { upgraded.add(u.host!!); u = u.buildUpon().scheme("https").build() }
+        }
+        web.loadUrl(u.toString())
     }
 
     private fun exitFullscreen() {
@@ -780,7 +873,7 @@ class MainActivity : Activity() {
             Ui.Group(this, col, "الخصوصية والحماية").apply {
                 toggle("حظر الإعلانات والمتتبعات", on("adblock")) { set("adblock", it); adblockOn = it }
                 toggle("منع النوافذ المنبثقة والتحويلات", on("popups")) { set("popups", it) }
-                toggle("حماية متقدمة: تصفح آمن، HTTPS، إزالة روابط التتبع", on("protect")) { set("protect", it) }
+                toggle("حماية متقدمة: تصفح آمن، HTTPS، إزالة روابط التتبع", on("protect")) { set("protect", it); applySafeBrowsing() }
                 toggle("حجب المحتوى غير اللائق", on("adult")) { set("adult", it); adultOn = it; if (it && adultHosts.isEmpty()) Thread { adultHosts = loadList("adulthosts.txt") }.start() }
             }
             Ui.Group(this, col, "بدون إنترنت").apply {
@@ -802,6 +895,11 @@ class MainActivity : Activity() {
         }.show()
     }
 
+    /** Google Safe Browsing (warning page before known phishing / malware sites) is part of "advanced protection":
+     *  it was switched on once at start and stayed on whatever the switch said. */
+    private fun applySafeBrowsing() {
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.SAFE_BROWSING_ENABLE)) WebSettingsCompat.setSafeBrowsingEnabled(web.settings, on("protect"))
+    }
     /** Dark mode for every site: sites with their own dark style use it, white sites are darkened by WebView. */
     private fun applyDark() {
         if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) WebSettingsCompat.setAlgorithmicDarkeningAllowed(web.settings, on("dark"))
@@ -880,11 +978,14 @@ class MainActivity : Activity() {
     private fun showContinue() {
         Ui.sheet(this, "أكمل المشاهدة") { col, dlg ->
             val items = Resume.list(this)
-            if (items.isEmpty()) { Ui.empty(this, col, "الأفلام التي لم تكملها في المشغّل الأصلي تظهر هنا."); return@sheet }
-            val g = Ui.Group(this, col, null, "افتح الفيلم وسيكمل من حيث توقفت.")
+            if (items.isEmpty()) { Ui.empty(this, col, "الأفلام التي لم تكملها تظهر هنا."); return@sheet }
+            val g = Ui.Group(this, col, null, "افتح الفيلم وسيكمل من حيث توقفت. اضغط مطولاً للحذف.")
             for (it in items) {
                 val left = (it.durMs - it.posMs) / 60000
-                g.link(it.title.ifBlank { Uri.parse(it.page).host ?: it.page }, "باقي $left د") { dlg.dismiss(); web.loadUrl(it.page) }
+                g.link(it.title.ifBlank { Uri.parse(it.page).host ?: it.page }, "باقي $left د") {
+                    // the site's own player is put back at that spot too once the page has loaded (the native player reads it itself)
+                    dlg.dismiss(); pendingSeek = it.page to it.posMs / 1000.0; web.loadUrl(it.page)
+                }.setOnLongClickListener { _ -> Resume.remove(this, it.page); dlg.dismiss(); showContinue(); true }
             }
         }.show()
     }
@@ -976,20 +1077,29 @@ class MainActivity : Activity() {
         if (cur <= 0) return false
         val here = list.currentItem?.url?.substringBefore('#')
         var i = cur - 1
-        while (i > 0) {
+        while (i >= 0) {
             val u = list.getItemAtIndex(i).url
             if (u.substringBefore('#') != here && !isAd(Uri.parse(u).host)) break
             i--
         }
+        if (i < 0) return false // only copies of this page or ads behind it: nothing to go back to
         web.goBackOrForward(i - cur)
         return true
     }
+    /**
+     * Back is handled on key-down only. It used to fall through to the system on the first page, which then called
+     * onBackPressed -> goBackOnce a second time within the 450 ms guard, so that call "handled" it and the app stayed open:
+     * only a long press closed it. Now one press on the first page leaves the browser.
+     */
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_BACK) { if ((event?.repeatCount ?: 0) > 0) return true; if (goBackOnce()) return true }
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            if ((event?.repeatCount ?: 0) == 0 && !goBackOnce()) finish()
+            return true
+        }
         return super.onKeyDown(keyCode, event)
     }
     @Deprecated("handled through onKeyDown")
-    override fun onBackPressed() { if (!goBackOnce()) @Suppress("DEPRECATION") super.onBackPressed() }
+    override fun onBackPressed() { if (!goBackOnce()) finish() }
 
     /** The browser is fully hidden (native player on top, or the app in the background but not in PiP): page timers stop,
      *  so site players stop buffering and scripts stop using battery and data. */
