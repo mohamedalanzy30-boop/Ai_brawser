@@ -3,6 +3,10 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+// a signing setting from a -P property or the environment; blank counts as missing (unset CI secrets are empty strings)
+fun signingValue(name: String): String? =
+    (project.findProperty(name) as String?)?.takeIf { it.isNotBlank() } ?: System.getenv(name)?.takeIf { it.isNotBlank() }
+
 dependencies {
     implementation("androidx.webkit:webkit:1.12.1")
     implementation("androidx.swiperefreshlayout:swiperefreshlayout:1.1.0") // pull down to refresh
@@ -27,12 +31,25 @@ android {
         ndk { abiFilters += listOf("arm64-v8a") } // the NPU runtime is arm64 only
     }
     signingConfigs {
-        // fixed key so updates install over previous builds (debug-only key, not a secret)
+        // fixed key so updates install over previous builds.
+        // The owner's own key (CI secrets, see README) is used when SIGNING_STORE_FILE is given as an environment
+        // variable or -P property; otherwise the committed debug.keystore, which anyone with the repo can sign with.
+        // Switching between the two keys needs one uninstall: Android refuses an update signed with another key.
         getByName("debug") {
-            storeFile = file("debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+            val ownStore = signingValue("SIGNING_STORE_FILE")
+            if (ownStore != null) {
+                fun required(name: String) = signingValue(name)
+                    ?: throw GradleException("SIGNING_STORE_FILE is set but $name is missing")
+                storeFile = file(ownStore)
+                storePassword = required("SIGNING_STORE_PASSWORD")
+                keyAlias = required("SIGNING_KEY_ALIAS")
+                keyPassword = required("SIGNING_KEY_PASSWORD")
+            } else {
+                storeFile = file("debug.keystore")
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
         }
     }
     buildTypes { release { isMinifyEnabled = false } }
