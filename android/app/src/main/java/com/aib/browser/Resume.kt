@@ -8,7 +8,11 @@ object Resume {
     private fun prefs(c: Context) = c.getSharedPreferences("resume", Context.MODE_PRIVATE)
     private fun all(c: Context): JSONObject = try { JSONObject(prefs(c).getString("items", "{}")!!) } catch (e: Exception) { JSONObject() }
 
-    fun save(c: Context, page: String, title: String, posMs: Long, durMs: Long) {
+    /** one key per film page for both players: the native player gets web.url, the page player the onPageFinished url (#fragments differ) */
+    fun key(page: String) = page.substringBefore('#')
+
+    fun save(c: Context, pageUrl: String, title: String, posMs: Long, durMs: Long) {
+        val page = key(pageUrl)
         if (page.isEmpty() || durMs < 5 * 60_000L) return // only real movies / episodes
         val o = all(c)
         if (posMs > durMs * 0.95 || posMs < 30_000L) o.remove(page) // finished, or barely started
@@ -19,7 +23,7 @@ object Resume {
         prefs(c).edit().putString("items", o.toString()).apply()
     }
 
-    fun position(c: Context, page: String): Long = all(c).optJSONObject(page)?.optLong("p") ?: 0L
+    fun position(c: Context, page: String): Long = all(c).let { it.optJSONObject(key(page)) ?: it.optJSONObject(page) }?.optLong("p") ?: 0L
 
     data class Item(val page: String, val title: String, val posMs: Long, val durMs: Long, val ts: Long)
     fun list(c: Context): List<Item> {
@@ -27,5 +31,5 @@ object Resume {
         return o.keys().asSequence().map { k -> val j = o.getJSONObject(k); Item(k, j.optString("t"), j.optLong("p"), j.optLong("d"), j.optLong("ts")) }
             .sortedByDescending { it.ts }.toList()
     }
-    fun remove(c: Context, page: String) { val o = all(c); o.remove(page); prefs(c).edit().putString("items", o.toString()).apply() }
+    fun remove(c: Context, page: String) { val o = all(c); if (o.remove(key(page)) == null && o.remove(page) == null) return; prefs(c).edit().putString("items", o.toString()).apply() }
 }
