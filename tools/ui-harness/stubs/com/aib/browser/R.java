@@ -1,3 +1,4 @@
+// Hand-written resource ids for the harness: add a line here when a drawable is added to android/app/src/main/res.
 package com.aib.browser;
 public final class R {
   public static final class color {
