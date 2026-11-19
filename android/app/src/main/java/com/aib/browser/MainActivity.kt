@@ -168,6 +168,8 @@ class MainActivity : Activity() {
     private val media = java.util.concurrent.CopyOnWriteArrayList<Media>()
     private val mediaExt = Regex("\\.(mp4|m4v|webm|mkv|mov)$", RegexOption.IGNORE_CASE)
     @Volatile private var videoPlaying = false
+    @Volatile private var sessPos = 0.0; @Volatile private var sessPage: String? = null; @Volatile private var pageUrl: String? = null
+    private var pendingSeek: Pair<String, Double>? = null
     @Volatile private var videoAspect = android.util.Rational(16, 9)
     /** subtitle files the page loaded (.vtt / .srt): handed to the native player */
     private val subs = java.util.concurrent.CopyOnWriteArrayList<String>()
@@ -241,6 +243,8 @@ class MainActivity : Activity() {
         }
         @android.webkit.JavascriptInterface fun pip() { ui.post { enterPip() } }
         @android.webkit.JavascriptInterface fun pullOk(ok: Boolean) { pullOk = ok }
+        /** playing film position (any frame), kept for restoring the session after Android closes the app */
+        @android.webkit.JavascriptInterface fun position(t: Double, dur: Double) { if (t > 5 && dur - t > 20) { sessPos = t; sessPage = pageUrl } }
     }
 
     /** The screen must not go dark while a video plays (the phone's sleep timer ignores web video). */
@@ -287,7 +291,7 @@ class MainActivity : Activity() {
         scriptHandler = WebViewCompat.addDocumentStartJavaScript(web, "window.__minCfg0=${config()};\n$bundle$extra", setOf("*"))
     }
     /** Tells the app on every touch whether the touched content is scrolled to its top (inner scroll areas too), so pull-to-refresh never fires mid-page. */
-    private val PULL_JS = """(function(){if(window.__aibPull)return;window.__aibPull=1;addEventListener('touchstart',function(e){var n=window.AIBNative;if(!n||!n.pullOk)return;var ok=(document.scrollingElement||document.documentElement).scrollTop<=0;for(var el=e.target;ok&&el&&el.nodeType===1;el=el.parentElement){if(el.scrollTop>0)ok=false}try{n.pullOk(ok)}catch(x){}},{passive:true,capture:true});window.__aibResume=function(t,play){var vs=[].slice.call(document.querySelectorAll('video')).filter(function(v){return v.duration>0});vs.sort(function(a,b){return b.duration-a.duration});var v=vs[0];if(v){if(t>1)v.currentTime=t;if(play)v.play().catch(function(){})}for(var i=0;i<frames.length;i++)try{frames[i].postMessage({__aibResume:[t,play]},'*')}catch(x){}};addEventListener('message',function(e){if(e.data&&e.data.__aibResume&&e.source===parent)window.__aibResume(e.data.__aibResume[0],e.data.__aibResume[1])})})();"""
+    private val PULL_JS = """(function(){if(window.__aibPull)return;window.__aibPull=1;addEventListener('touchstart',function(e){var n=window.AIBNative;if(!n||!n.pullOk)return;var ok=(document.scrollingElement||document.documentElement).scrollTop<=0;for(var el=e.target;ok&&el&&el.nodeType===1;el=el.parentElement){if(el.scrollTop>0)ok=false}try{n.pullOk(ok)}catch(x){}},{passive:true,capture:true});window.__aibResume=function(t,play,fresh){var vs=[].slice.call(document.querySelectorAll('video')).filter(function(v){return v.duration>0});vs.sort(function(a,b){return b.duration-a.duration});var v=vs[0];if(v){if(t>1&&!(fresh&&v.currentTime>2))v.currentTime=t;if(play)v.play().catch(function(){})}for(var i=0;i<frames.length;i++)try{frames[i].postMessage({__aibResume:[t,play,fresh]},'*')}catch(x){}};addEventListener('message',function(e){if(e.data&&e.data.__aibResume&&e.source===parent)window.__aibResume(e.data.__aibResume[0],e.data.__aibResume[1],e.data.__aibResume[2])})})();"""
     @Volatile private var pullOk = true
     private fun applyConfig() {
         registerScript()
@@ -334,7 +338,11 @@ class MainActivity : Activity() {
         registerScript()
         pollBadge()
         val restore = prefs.getString("restoreUrl", null); prefs.edit().remove("restoreUrl").apply()
-        go(restore ?: intent?.dataString ?: HOME)
+        when {
+            restore != null -> go(restore) // renderer crash: reload that page (crash-loop guard picks HOME)
+            intent?.dataString != null -> go(intent.dataString!!)
+            !restoreSession() -> go(HOME)
+        }
     }
 
     private fun buildBottomBar(): LinearLayout {
@@ -597,7 +605,7 @@ class MainActivity : Activity() {
             refresher.isRefreshing = false
             Uri.parse(url).host?.let { upgraded.remove(it) } // https worked: no http fallback needed for this site
             if (!urlEdit.hasFocus()) showAddress(url)
-            recordHistory(url, view.title)
+            recordHistory(url, view.title); pageUrl = url; seekRestored(url)
             if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) injectFallback()
         }
         override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) { if (!urlEdit.hasFocus()) showAddress(url) }
@@ -939,7 +947,44 @@ class MainActivity : Activity() {
 
     /** The browser is fully hidden (native player on top, or the app in the background but not in PiP): page timers stop,
      *  so site players stop buffering and scripts stop using battery and data. */
-    override fun onStop() { super.onStop(); if (!isInPictureInPictureMode && (nativeOpen || !videoPlaying)) { web.onPause(); web.pauseTimers() } }
+    /* ======================= session: Android may close the browser in the background; reopening continues ======================= */
+    private val sessFile by lazy { java.io.File(filesDir, "session.bin") }
+    private fun saveSession() {
+        try {
+            val b = Bundle(); if (web.saveState(b) == null) return
+            val p = android.os.Parcel.obtain(); try { b.writeToParcel(p, 0); sessFile.writeBytes(p.marshall()) } finally { p.recycle() }
+            val e = prefs.edit().putString("sessUrl", web.url)
+            if (sessPage != null && sessPage == web.url && sessPos > 0) e.putString("sessSeek", "${sessPos}|$sessPage") else e.remove("sessSeek")
+            e.apply()
+        } catch (x: Exception) { addLog("[AIB] session save failed: $x") }
+    }
+    private fun restoreSession(): Boolean {
+        val seek = prefs.getString("sessSeek", null)?.split("|", limit = 2)
+        if (seek != null && seek.size == 2) seek[0].toDoubleOrNull()?.let { pendingSeek = seek[1] to it }
+        try {
+            if (sessFile.exists()) {
+                val bytes = sessFile.readBytes(); val p = android.os.Parcel.obtain()
+                try {
+                    p.unmarshall(bytes, 0, bytes.size); p.setDataPosition(0)
+                    val b = Bundle.CREATOR.createFromParcel(p)
+                    if (web.restoreState(b) != null && web.copyBackForwardList().size > 0) { addLog("[AIB] session restored: ${web.url}"); return true }
+                } finally { p.recycle() }
+            }
+        } catch (x: Exception) { addLog("[AIB] session restore failed: $x") }
+        val u = prefs.getString("sessUrl", null) ?: return false
+        go(u); return true
+    }
+    /** once the restored page has loaded: put its film back where it was (paused; the page or the native player continues on play) */
+    private fun seekRestored(url: String) {
+        val (page, t) = pendingSeek ?: return
+        if (url != page) return
+        pendingSeek = null
+        // the player may appear late (iframes, scripts): try for 30 s
+        web.evaluateJavascript("(function(n){var f=function(){if(window.__aibResume){window.__aibResume($t,false,true)};if(--n>0)setTimeout(f,3000)};setTimeout(f,1500)})(10)", null)
+        Toast.makeText(this, "أكمل من ${(t / 60).toInt()}:${"%02d".format((t % 60).toInt())}", Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onStop() { saveSession(); super.onStop(); if (!isInPictureInPictureMode && (nativeOpen || !videoPlaying)) { web.onPause(); web.pauseTimers() } }
     override fun onStart() { super.onStart(); web.onResume(); web.resumeTimers() }
     override fun onDestroy() { ui.removeCallbacksAndMessages(null); try { (web.parent as? ViewGroup)?.removeView(web); web.destroy() } catch (e: Exception) { }; super.onDestroy() }
 }

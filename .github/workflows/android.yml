@@ -31,22 +31,26 @@ jobs:
           rm -rf package onnxruntime-web-*.tgz
           curl -fL -o model/realesr-general-x4v3.onnx \
             https://huggingface.co/CoderViking/realesr-general-x4v3-onnx/resolve/main/realesr-general-x4v3.onnx
-          # fixed-size copy of the SR model for the NPU (native player)
-          pip install --quiet --only-binary=:all: onnx
-          python3 "$GITHUB_WORKSPACE/tools/fix_model.py" model/realesr-general-x4v3.onnx model/realesr-x4v3-640x360.onnx 360 640
-          # A16W8 quantized copy for the NPU, calibrated on real video frames (Big Buck Bunny, CC-BY Blender Foundation; first mirror that answers).
-          # Optional: if anything here fails the app simply uses the float model.
-          ( pip install --quiet --only-binary=:all: onnxruntime imageio-ffmpeg &&
+          # fixed-size copies of the SR model for the NPU (native player), one per source class (360p..660p);
+          # each takes the video at its own size and returns 2560x1440 (the NPU scales the 4x result to the screen)
+          pip install --quiet --only-binary=:all: onnx pillow
+          SIZES="640x360 854x480 960x540 1174x660"
+          for S in $SIZES; do W=${S%x*}; H=${S#*x}
+            python3 "$GITHUB_WORKSPACE/tools/fix_model.py" model/realesr-general-x4v3.onnx model/realesr-x4v3-$S.onnx $H $W 1440 2560; done
+          # A16W8 quantized copies for the NPU, calibrated on real video frames (Big Buck Bunny, CC-BY Blender Foundation; first mirror that answers).
+          # Optional: if anything here fails the app simply uses the float models.
+          ( pip install --quiet --only-binary=:all: onnxruntime==1.29.0 imageio-ffmpeg &&  # 1.29 has the calibration cache quantize_qnn.py uses
             FFMPEG=$(python3 -c "import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())") &&
             for SRC in https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4 \
                        https://test-videos.co.uk/vids/bigbuckbunny/mp4/h264/360/Big_Buck_Bunny_360_10s_5MB.mp4 \
                        https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_480p_h264.mov; do
               "$FFMPEG" -loglevel error -y -i "$SRC" -t 600 \
-                -vf "select='not(mod(n\,25))',scale=640:360:flags=bicubic" -fps_mode vfr -frames:v 24 -f rawvideo -pix_fmt rgb24 "$RUNNER_TEMP/calib.rgb" \
+                -vf "select='not(mod(n\,10))',scale=640:360:flags=bicubic" -fps_mode vfr -frames:v 24 -f rawvideo -pix_fmt rgb24 "$RUNNER_TEMP/calib.rgb" \
                 && [ -s "$RUNNER_TEMP/calib.rgb" ] && echo "calibration frames from $SRC" && break
             done && [ -s "$RUNNER_TEMP/calib.rgb" ] &&
-            python3 "$GITHUB_WORKSPACE/tools/quantize_qnn.py" model/realesr-x4v3-640x360.onnx "$RUNNER_TEMP/calib.rgb" model/realesr-x4v3-640x360-a16w8.onnx &&
-            rm -f model/*.pre.onnx ) || echo "::warning::quantized model skipped"
+            for S in $SIZES; do
+              python3 "$GITHUB_WORKSPACE/tools/quantize_qnn.py" model/realesr-x4v3-$S.onnx "$RUNNER_TEMP/calib.rgb" model/realesr-x4v3-$S-a16w8.onnx 640x360 || exit 1; done &&
+            rm -f model/*.pre.onnx ) || { echo "::warning::quantized models skipped"; rm -f model/*-a16w8.onnx model/*.pre.onnx; }
           # ad/tracker host list (StevenBlack/hosts, MIT), bundled so blocking needs no network at runtime
           # + HaGeZi Pro (GPL-3.0): covers the pop-under / redirect ad networks used by movie sites
           { curl -fsSL https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts \

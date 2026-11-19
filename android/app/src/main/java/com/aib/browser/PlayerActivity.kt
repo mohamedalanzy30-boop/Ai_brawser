@@ -53,7 +53,8 @@ import java.nio.FloatBuffer
  */
 class PlayerActivity : Activity() {
     companion object {
-        const val IN_W = 640; const val IN_H = 360; const val OUT_W = IN_W * 4; const val OUT_H = IN_H * 4
+        const val OUT_W = 2560; const val OUT_H = 1440 // every SR model returns the picture at the screen's height
+        const val MAX_IN_W = 1174; const val MAX_IN_H = 660
         val log = ArrayDeque<String>()
         fun addLog(s: String) = synchronized(log) { log.addLast(s); while (log.size > 60) log.removeFirst() }
     }
@@ -197,7 +198,9 @@ class PlayerActivity : Activity() {
             .apply { if (url.contains(".m3u8", true) || intent.getBooleanExtra("hls", false)) setMimeType(MimeTypes.APPLICATION_M3U8) }.build()
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
             .setPreferredTextLanguage("ar").setSelectUndeterminedTextLanguage(true).build()
-        player.setMediaItem(item, intent.getLongExtra("pos", 0L).coerceAtLeast(0L))
+        // recreated by Android after it closed the app in the background: continue from the last saved spot, not the start position
+        val startPos = if (savedInstanceState != null) Math.max(Resume.position(this, page), intent.getLongExtra("pos", 0L)) else intent.getLongExtra("pos", 0L)
+        player.setMediaItem(item, startPos.coerceAtLeast(0L))
         player.prepare(); player.playWhenReady = true
         player.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) { playBtn.text = if (isPlaying) "⏸" else "▶"; if (isPlaying) { retries = 0; everPlayed = true } }
@@ -460,13 +463,24 @@ class PlayerActivity : Activity() {
         private var fbo = 0; private var fboTex = 0; private var outTex = 0
         private var viewW = 1; private var viewH = 1; @Volatile private var vidW = 0; @Volatile private var vidH = 0; @Volatile private var par = 1f
         private val stMatrix = FloatArray(16)
-        // neural
-        private var env: OrtEnvironment? = null; @Volatile private var session: OrtSession? = null
-        private var inBuf: FloatBuffer? = null; private var outBuf: FloatBuffer? = null
-        private var inTensor: OnnxTensor? = null; private var outTensor: OnnxTensor? = null
-        private val pixels: ByteBuffer = ByteBuffer.allocateDirect(IN_W * IN_H * 4).order(ByteOrder.nativeOrder())
-        private val rgba = IntArray(IN_W * IN_H)
-        private val planes = FloatArray(3 * IN_W * IN_H)
+        // neural: one fixed-size model per source class, each fed the video at its own resolution
+        // (squeezing 480p..660p into 640x360 first threw detail away and measured worse than no AI at all)
+        // every model hands back the same 2560x1440 picture: the NPU itself scales the 4x result to the screen
+        inner class Bucket(val w: Int, val h: Int) {
+            @Volatile var state = "idle" // idle | loading | ready | slow | failed
+            var session: OrtSession? = null; var inBuf: FloatBuffer? = null; var inTensor: OnnxTensor? = null
+            var backend = ""; var testMs = 0L; var lastUsed = 0L
+            fun close() { try { session?.close(); inTensor?.close() } catch (e: Exception) { }; session = null; inTensor = null; inBuf = null }
+        }
+        private val buckets = listOf(Bucket(640, 360), Bucket(854, 480), Bucket(960, 540), Bucket(1174, 660))
+        private val loader = java.util.concurrent.Executors.newSingleThreadExecutor()
+        @Volatile private var env: OrtEnvironment? = null
+        private var outBuf: FloatBuffer? = null; private var outTensor: OnnxTensor? = null
+        private var cur: Bucket? = null
+        private val maxIn = buckets.maxOf { it.w * it.h }
+        private val pixels: ByteBuffer = ByteBuffer.allocateDirect(maxIn * 4).order(ByteOrder.nativeOrder())
+        private val rgba = IntArray(maxIn)
+        private val planes = FloatArray(3 * maxIn)
         private val LUT = FloatArray(256) { it / 255f }
         // model output packed to RGBA8 on 4 cores: 4x less to upload than 3 float planes (44 MB -> 15 MB a frame) and the GPU filters it itself
         private val outPix: ByteBuffer = ByteBuffer.allocateDirect(OUT_W * OUT_H * 4).order(ByteOrder.nativeOrder())
@@ -478,67 +492,86 @@ class PlayerActivity : Activity() {
             val step = (n + 3) / 4
             (0 until 4).map { j -> pool.submit(Runnable { val lo = j * step; val hi = Math.min(n, lo + step); if (lo < hi) body(j, lo, hi) }) }.forEach { it.get() }
         }
-        private var backend = "loading"; private var emaMs = 0.0; private var slowSince = 0L; private var disabledReason = ""
+        private var emaMs = 0.0; private var slowSince = 0L; private var slowFrames = 0
         private var lastFrameNs = 0L; private var fpsEma = 30.0; private var frames = 0
-        private val content = FloatArray(4) // content rect inside the 640x360 model input (u0,v0,u1,v1)
+        private val content = FloatArray(4) // content rect inside the model input (u0,v0,u1,v1)
 
         fun start(onSurface: (Surface) -> Unit) = h.post {
             setupEgl(); setupGl()
             st = SurfaceTexture(oesTex).also { it.setOnFrameAvailableListener(this, h) }
             videoSurface = Surface(st); onSurface(videoSurface!!)
-            Thread { loadModel() }.start()
+            loader.execute { initOrt() }
         }
-        fun stop() { h.post { try { session?.close(); inTensor?.close(); outTensor?.close() } catch (e: Exception) { }; session = null; st?.release(); videoSurface?.release(); EGL14.eglMakeCurrent(egl, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT); EGL14.eglDestroySurface(egl, eglSurf); EGL14.eglDestroyContext(egl, eglCtx); EGL14.eglTerminate(egl); pool.shutdown(); thread.quitSafely() } }
+        fun stop() { h.post { loader.shutdownNow(); buckets.forEach { it.close() }; try { outTensor?.close() } catch (e: Exception) { }; st?.release(); videoSurface?.release(); EGL14.eglMakeCurrent(egl, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT); EGL14.eglDestroySurface(egl, eglSurf); EGL14.eglDestroyContext(egl, eglCtx); EGL14.eglTerminate(egl); pool.shutdown(); thread.quitSafely() } }
         fun setViewSize(w: Int, hh: Int) = h.post { viewW = w; viewH = hh }
-        fun setVideoSize(w: Int, hh: Int, p: Float) { vidW = w; vidH = hh; par = if (p > 0) p else 1f; h.post { slowSince = 0; emaMs = 0.0; disabledReason = "" } }
+        fun setVideoSize(w: Int, hh: Int, p: Float) { vidW = w; vidH = hh; par = if (p > 0) p else 1f; h.post { slowSince = 0; slowFrames = 0; emaMs = 0.0 } }
 
-        private fun loadModel() {
+        private fun initOrt() {
             try {
                 // the NPU (Hexagon HTP) user-space driver finds its DSP-side library through ADSP_LIBRARY_PATH
                 android.system.Os.setenv("ADSP_LIBRARY_PATH", ctx.applicationInfo.nativeLibraryDir + ";/vendor/dsp/cdsp;/vendor/lib/rfsa/adsp;/system/lib/rfsa/adsp;/dsp", true)
                 val e = OrtEnvironment.getEnvironment(); env = e
-                fun model(n: String) = try { ctx.assets.open("model/$n").use { it.readBytes() } } catch (x: Exception) { null }
-                // fastest first: 16-bit/8-bit quantized model on the NPU, then the float model on the NPU, then CPU
-                // NPU only: on the CPU this model takes seconds per frame, which froze the picture
-                val tries = listOf("npu-a16w8" to "realesr-x4v3-640x360-a16w8.onnx", "npu" to "realesr-x4v3-640x360.onnx")
-                for ((t, file) in tries) {
-                    val bytes = model(file) ?: continue
-                    val ctxFile = java.io.File(ctx.filesDir, "sr_ctx_${t}_${bytes.size}.onnx") // new model in an update = new compiled copy
-                    ctx.filesDir.listFiles { f -> (f.name.startsWith("sr_ctx_${t}_") || f.name == "sr_ctx_$t.onnx") && f.name != ctxFile.name }?.forEach { it.delete() }
-                    try {
-                        fun opts(dump: Boolean) = OrtSession.SessionOptions().apply {
-                            setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-                            if (t.startsWith("npu")) {
-                                // the few layers the NPU cannot run (seen on the phone: the float model) run on the CPU instead of failing the whole model
-                                // first run compiles the graph for the NPU (slow) and saves it; later runs load the saved one
-                                if (dump) { addConfigEntry("ep.context_enable", "1"); addConfigEntry("ep.context_file_path", ctxFile.absolutePath) }
-                                addQnn(mapOf("backend_path" to "libQnnHtp.so", "htp_performance_mode" to "burst", "htp_graph_finalization_optimization_mode" to "3") + (if (t == "npu") mapOf("enable_htp_fp16_precision" to "1") else emptyMap()))
-                            } else setIntraOpNumThreads(4) // this ORT build has no XNNPACK: plain CPU kernels
-                        }
-                        val t0 = System.currentTimeMillis()
-                        val s = if (t.startsWith("npu") && ctxFile.exists() && ctxFile.length() > 0)
-                            try { e.createSession(ctxFile.absolutePath, opts(false)) } catch (x: Exception) { ctxFile.delete(); e.createSession(bytes, opts(true)) }
-                        else { ctxFile.delete(); e.createSession(bytes, opts(t.startsWith("npu"))) }
-                        addLog("[player] SR session on $t in ${System.currentTimeMillis() - t0}ms")
-                        inBuf = ByteBuffer.allocateDirect(3 * IN_W * IN_H * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
-                        outBuf = ByteBuffer.allocateDirect(3 * OUT_W * OUT_H * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
-                        inTensor = OnnxTensor.createTensor(e, inBuf, longArrayOf(1, 3, IN_H.toLong(), IN_W.toLong()))
-                        outTensor = OnnxTensor.createTensor(e, outBuf, longArrayOf(1, 3, OUT_H.toLong(), OUT_W.toLong()))
-                        // test it before the video ever waits for it: two runs on a blank frame (the first one warms the NPU up)
-                        var testMs = 0L
-                        for (k in 0 until 2) { val w0 = System.currentTimeMillis(); s.run(mapOf(s.inputNames.first() to inTensor!!), mapOf(s.outputNames.first() to outTensor!!)).close(); testMs = System.currentTimeMillis() - w0 }
-                        addLog("[player] SR test run on $t: ${testMs}ms per frame")
-                        if (testMs > 60) { // cannot keep up with a 24 fps movie: keep the smooth GPU path instead of stuttering
-                            addLog("[player] SR on $t too slow for real time, not used"); s.close(); inTensor?.close(); outTensor?.close(); inTensor = null; outTensor = null
-                            disabledReason = "slow"; continue
-                        }
-                        disabledReason = ""
-                        backend = t; session = s
-                        break
-                    } catch (x: Throwable) { addLog("[player] SR on $t failed: ${x.message?.take(200)}"); if (t.startsWith("npu")) ctxFile.delete() }
-                }
-                if (session == null) backend = "unavailable"
-            } catch (x: Throwable) { backend = "error"; addLog("[player] SR load error: ${x.message?.take(200)}") }
+                val ob = ByteBuffer.allocateDirect(3 * OUT_W * OUT_H * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+                outTensor = OnnxTensor.createTensor(e, ob, longArrayOf(1, 3, OUT_H.toLong(), OUT_W.toLong())); outBuf = ob
+                // compiled copies from older app versions (one name per model before the size classes)
+                ctx.filesDir.listFiles { f -> Regex("sr_ctx_(npu|npu-a16w8)(_\\d+)?\\.onnx").matches(f.name) }?.forEach { it.delete() }
+            } catch (x: Throwable) { addLog("[player] SR init error: ${x.message?.take(200)}") }
+        }
+
+        /** The smallest model that takes the picture without shrinking it; one that shrinks it at most 15 % if nothing fits.
+         *  Bigger sources (720p+) are already sharp on this screen: GPU path. */
+        private fun pick(dw: Float, dh: Float): Bucket? {
+            if (dh > 680) return null
+            fun scale(b: Bucket) = Math.min(b.w / dw, b.h / dh)
+            val ok = buckets.filter { it.state != "slow" && it.state != "failed" }
+            return ok.firstOrNull { scale(it) >= 0.999f } ?: ok.lastOrNull()?.takeIf { scale(it) >= 0.85f }
+        }
+
+        private fun load(b: Bucket) {
+            val e = env ?: return
+            fun model(n: String) = try { ctx.assets.open("model/$n").use { it.readBytes() } } catch (x: Exception) { null }
+            // 16-bit activations / 8-bit weights on the NPU first, then the float model on the NPU (fp16). No CPU: seconds per frame.
+            val tries = listOf("npu-a16w8" to "realesr-x4v3-${b.w}x${b.h}-a16w8.onnx", "npu" to "realesr-x4v3-${b.w}x${b.h}.onnx")
+            for ((t, file) in tries) {
+                val bytes = model(file) ?: continue
+                val tag = "sr_ctx_${t}_${b.w}x${b.h}_"
+                val ctxFile = java.io.File(ctx.filesDir, "$tag${bytes.size}.onnx") // new model in an update = new compiled copy
+                ctx.filesDir.listFiles { f -> f.name.startsWith(tag) && f.name != ctxFile.name }?.forEach { it.delete() }
+                try {
+                    fun opts(dump: Boolean) = OrtSession.SessionOptions().apply {
+                        setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                        // the few layers the NPU cannot run (seen on the phone: the float model) run on the CPU instead of failing the whole model
+                        // first run compiles the graph for the NPU (slow) and saves it; later runs load the saved one
+                        if (dump) { addConfigEntry("ep.context_enable", "1"); addConfigEntry("ep.context_file_path", ctxFile.absolutePath) }
+                        addQnn(mapOf("backend_path" to "libQnnHtp.so", "htp_performance_mode" to "burst", "htp_graph_finalization_optimization_mode" to "3") + (if (t == "npu") mapOf("enable_htp_fp16_precision" to "1") else emptyMap()))
+                    }
+                    val t0 = System.currentTimeMillis()
+                    val s = if (ctxFile.exists() && ctxFile.length() > 0)
+                        try { e.createSession(ctxFile.absolutePath, opts(false)) } catch (x: Exception) { ctxFile.delete(); e.createSession(bytes, opts(true)) }
+                    else e.createSession(bytes, opts(true))
+                    addLog("[player] SR ${b.w}x${b.h} session on $t in ${System.currentTimeMillis() - t0}ms")
+                    val ib = ByteBuffer.allocateDirect(3 * b.w * b.h * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
+                    val tin = OnnxTensor.createTensor(e, ib, longArrayOf(1, 3, b.h.toLong(), b.w.toLong()))
+                    // speed test on the render thread (it owns the shared output buffer): two runs, the first warms the NPU up
+                    val done = java.util.concurrent.CountDownLatch(1); var testMs = Long.MAX_VALUE
+                    h.post {
+                        try { for (k in 0 until 2) { val w0 = System.currentTimeMillis(); s.run(mapOf(s.inputNames.first() to tin), mapOf(s.outputNames.first() to outTensor!!)).close(); testMs = System.currentTimeMillis() - w0 } }
+                        catch (x: Throwable) { addLog("[player] SR ${b.w}x${b.h} test failed: ${x.message?.take(200)}") }
+                        done.countDown()
+                    }
+                    if (!done.await(20, java.util.concurrent.TimeUnit.SECONDS)) { s.close(); tin.close(); b.state = "idle"; return }
+                    addLog("[player] SR ${b.w}x${b.h} test run on $t: ${testMs}ms per frame")
+                    if (testMs > 55) { // slower than a 24 fps movie needs: never stutter, a smaller model or the GPU path takes over
+                        s.close(); tin.close(); b.testMs = testMs; b.state = "slow"; return
+                    }
+                    b.session = s; b.inBuf = ib; b.inTensor = tin; b.backend = t; b.testMs = testMs; b.state = "ready"
+                    // keep at most two compiled models in memory (ABR streams switch between two sizes)
+                    buckets.filter { it !== b && it.session != null }.sortedBy { it.lastUsed }.dropLast(1).forEach { o -> h.post { if (cur !== o) { o.close(); o.state = "idle" } } }
+                    return
+                } catch (x: InterruptedException) { return // player closing: keep the compiled copy
+                } catch (x: Throwable) { addLog("[player] SR ${b.w}x${b.h} on $t failed: ${x.message?.take(200)}"); ctxFile.delete() }
+            }
+            b.state = "failed"
         }
 
         override fun onFrameAvailable(s: SurfaceTexture) {
@@ -552,13 +585,18 @@ class PlayerActivity : Activity() {
             val vw = vidW; val vh = vidH
             if (vw <= 0 || vh <= 0) return
             val dispAspect = vw * par / vh
-            // neural path only for small sources (<= 540p): bigger ones are already sharp on this screen
-            val s = session
-            val useAi = aiWanted && s != null && vh <= 540 && disabledReason.isEmpty()
+            // neural path for sources up to 660p, each through the model of its own size; 720p+ is already sharp on this screen
+            val b = if (aiWanted && env != null) pick(vw * par, vh.toFloat()) else null
+            if (b != null && b.state == "idle") { b.state = "loading"; loader.execute { load(b) } }
+            val s = b?.session?.takeIf { b.state == "ready" }
+            if (b !== cur) { cur = b; emaMs = 0.0; slowSince = 0; slowFrames = 0 }
+            val useAi = s != null
             var ms = 0.0
             if (useAi) {
+                val bk = b!!; bk.lastUsed = now
+                val IN_W = bk.w; val IN_H = bk.h
                 val t0 = System.nanoTime()
-                // 1) video frame -> 640x360 (aspect kept, black bars), rows top-first for the model
+                // 1) video frame -> model input (aspect kept, black bars), rows top-first for the model
                 GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo); GLES30.glViewport(0, 0, IN_W, IN_H)
                 GLES30.glClearColor(0f, 0f, 0f, 1f); GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
                 val fit = fitRect(IN_W, IN_H, dispAspect)
@@ -569,8 +607,8 @@ class PlayerActivity : Activity() {
                 GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
                 // 2) RGBA bytes -> NCHW float planes
                 // bulk copy into plain arrays first: per-pixel buffer calls cost ~10x more on every frame
-                val inb = inBuf!!; val px = IN_W * IN_H; pixels.rewind()
-                pixels.asIntBuffer().get(rgba); pixels.rewind()
+                val inb = bk.inBuf!!; val px = IN_W * IN_H; pixels.rewind()
+                pixels.asIntBuffer().get(rgba, 0, px); pixels.rewind()
                 val pl = planes; val little = ByteOrder.nativeOrder() == ByteOrder.LITTLE_ENDIAN
                 val t1 = System.nanoTime()
                 parallel(px) { _, lo, hi ->
@@ -582,10 +620,10 @@ class PlayerActivity : Activity() {
                         pl[i] = LUT[r]; pl[px + i] = LUT[g]; pl[2 * px + i] = LUT[b]
                     }
                 }
-                inb.position(0); inb.put(pl); inb.position(0)
+                inb.position(0); inb.put(pl, 0, 3 * px); inb.position(0)
                 // 3) NPU inference into the pinned output buffer
                 val t2 = System.nanoTime()
-                s!!.run(mapOf(s.inputNames.first() to inTensor!!), mapOf(s.outputNames.first() to outTensor!!)).close()
+                s!!.run(mapOf(s.inputNames.first() to bk.inTensor!!), mapOf(s.outputNames.first() to outTensor!!)).close()
                 // 4) float planes -> RGBA8 (4 cores, 16 rows at a time), one 15 MB upload, GPU bilinear
                 val t3 = System.nanoTime()
                 val ob = outBuf!!; val n = OUT_W * OUT_H; val opx = outPix.asIntBuffer()
@@ -611,27 +649,28 @@ class PlayerActivity : Activity() {
                 drawToScreen(progPlanes, dispAspect)
                 val t4 = System.nanoTime()
                 stage[0] += (t1 - t0) / 1e6; stage[1] += (t2 - t1) / 1e6; stage[2] += (t3 - t2) / 1e6; stage[3] += (t4 - t3) / 1e6
-                if (++stageN == 120) { addLog("[player] SR per frame: read ${"%.1f".format(stage[0] / 120)}ms, in ${"%.1f".format(stage[1] / 120)}ms, NPU ${"%.1f".format(stage[2] / 120)}ms, out ${"%.1f".format(stage[3] / 120)}ms"); stage.fill(0.0); stageN = 0 }
+                if (++stageN == 120) { addLog("[player] SR ${IN_W}x${IN_H} per frame: read ${"%.1f".format(stage[0] / 120)}ms, in ${"%.1f".format(stage[1] / 120)}ms, NPU ${"%.1f".format(stage[2] / 120)}ms, out ${"%.1f".format(stage[3] / 120)}ms"); stage.fill(0.0); stageN = 0 }
                 ms = (System.nanoTime() - t0) / 1e6
                 emaMs = if (emaMs == 0.0) ms else emaMs * 0.85 + ms * 0.15
-                // NPU too slow for this video's frame rate for 3 s -> stay smooth, fall back to the GPU shader
+                // too slow for this video's frame rate for 1 s -> this size is marked slow: a smaller model (if the picture
+                // fits it) or the GPU shader takes over, so playback never stutters
                 val budget = 1000.0 / Math.max(fpsEma, 1.0)
-                if (emaMs > budget * 1.15 && ++frames > 5) { if (slowSince == 0L) slowSince = now else if (now - slowSince > 1_000_000_000L || ms > budget * 4) { disabledReason = "slow"; addLog("[player] SR too slow (${emaMs.toInt()}ms > ${budget.toInt()}ms), using GPU shader") } } else slowSince = 0L
+                if (emaMs > budget * 1.15 && ++slowFrames > 5) { if (slowSince == 0L) slowSince = now else if (now - slowSince > 1_000_000_000L || ms > budget * 4) { bk.state = "slow"; bk.close(); addLog("[player] SR ${IN_W}x${IN_H} too slow (${emaMs.toInt()}ms > ${budget.toInt()}ms)") } } else slowSince = 0L
             } else drawToScreen(progDirect, dispAspect)
             EGL14.eglSwapBuffers(egl, eglSurf)
-            if (frames % 15 == 0) onStatus(statusText(vw, vh, useAi))
+            if (frames % 15 == 0) onStatus(statusText(vw, vh, b))
             frames++
         }
 
-        private fun statusText(vw: Int, vh: Int, ai: Boolean): String {
-            val b = when (backend) { "npu-a16w8" -> "NPU (int)"; "npu" -> "NPU"; "cpu" -> "CPU"; "loading" -> "…"; else -> backend }
+        private fun statusText(vw: Int, vh: Int, b: Bucket?): String {
+            val be = when (b?.backend) { "npu-a16w8" -> "NPU"; "npu" -> "NPU fp16"; else -> "" }
             return when {
                 !aiWanted -> "${vw}×${vh}  AI مطفأ"
-                ai -> "✨ ${vw}×${vh} → 4× عصبي على $b  ${emaMs.toInt()}ms"
-                disabledReason == "slow" -> "${vw}×${vh}  العصبي أبطأ من الفيديو (${emaMs.toInt()}ms) → تحسين GPU"
-                vh > 540 -> "${vw}×${vh}  مصدر عالي الدقة → تحسين GPU"
-                backend == "loading" -> "${vw}×${vh}  تحميل النموذج العصبي…"
-                else -> "${vw}×${vh}  العصبي غير متاح ($b) → تحسين GPU"
+                b == null && buckets.any { it.state == "slow" } && vh <= 660 -> "${vw}×${vh}  العصبي أبطأ من الفيديو على هذا الحجم → تحسين GPU"
+                b == null -> "${vw}×${vh}  مصدر عالي الدقة → تحسين GPU"
+                b.state == "ready" -> "✨ ${vw}×${vh} → 1440p عصبي ($be ${b.w}×${b.h})  ${emaMs.toInt()}ms"
+                b.state == "loading" || b.state == "idle" -> "${vw}×${vh}  تجهيز النموذج العصبي ${b.w}×${b.h}…"
+                else -> "${vw}×${vh}  العصبي غير متاح → تحسين GPU"
             }
         }
 
@@ -701,7 +740,7 @@ class PlayerActivity : Activity() {
             GLES30.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
             // model input FBO
             GLES30.glGenTextures(1, t, 0); fboTex = t[0]; GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, fboTex)
-            GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, IN_W, IN_H, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null)
+            GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, MAX_IN_W, MAX_IN_H, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null)
             GLES30.glGenFramebuffers(1, t, 0); fbo = t[0]; GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fbo)
             GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, fboTex, 0)
             GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
@@ -718,12 +757,21 @@ void main(){ vec2 t = pos*0.5+0.5; if (flip > 0.5) t.y = 1.0 - t.y; uv = (stm*ve
 #extension GL_OES_EGL_image_external_essl3 : require
 precision mediump float; uniform samplerExternalOES tex; in vec2 uv; out vec4 o;
 void main(){ o = vec4(texture(tex, uv).rgb, 1.); }""")
-            // direct path (big sources / AI off): light contrast-adaptive sharpening
+            // GPU path (720p+, AI off, model loading or too slow): Catmull-Rom upscale (sharper than the bilinear stretch)
+            // + contrast-adaptive sharpening; clamped to the local min/max so the bicubic never rings
             progDirect = program(vsOes, """#version 300 es
 #extension GL_OES_EGL_image_external_essl3 : require
-precision mediump float; uniform samplerExternalOES tex; uniform vec2 texel; in vec2 uv; out vec4 o;
-void main(){ vec3 c=texture(tex,uv).rgb; vec3 n=texture(tex,uv+vec2(0.,texel.y)).rgb, s=texture(tex,uv-vec2(0.,texel.y)).rgb, e=texture(tex,uv+vec2(texel.x,0.)).rgb, w=texture(tex,uv-vec2(texel.x,0.)).rgb;
-  vec3 mn=min(c,min(min(n,s),min(e,w))), mx=max(c,max(max(n,s),max(e,w)));
+precision highp float; uniform samplerExternalOES tex; uniform vec2 texel; in vec2 uv; out vec4 o;
+vec3 T(vec2 p){ return texture(tex,p).rgb; }
+vec3 cr(vec2 u){ vec2 sp=u/texel; vec2 t1=floor(sp-0.5)+0.5; vec2 f=sp-t1;
+  vec2 w0=f*(-0.5+f*(1.0-0.5*f)), w1=1.0+f*f*(-2.5+1.5*f), w2=f*(0.5+f*(2.0-1.5*f)), w3=f*f*(-0.5+0.5*f);
+  vec2 w12=w1+w2; vec2 p0=(t1-1.0)*texel, p3=(t1+2.0)*texel, p12=(t1+w2/w12)*texel;
+  return (T(vec2(p0.x,p0.y))*w0.x + T(vec2(p12.x,p0.y))*w12.x + T(vec2(p3.x,p0.y))*w3.x)*w0.y
+       + (T(vec2(p0.x,p12.y))*w0.x + T(vec2(p12.x,p12.y))*w12.x + T(vec2(p3.x,p12.y))*w3.x)*w12.y
+       + (T(vec2(p0.x,p3.y))*w0.x + T(vec2(p12.x,p3.y))*w12.x + T(vec2(p3.x,p3.y))*w3.x)*w3.y; }
+void main(){ vec3 b=T(uv); vec3 n=T(uv+vec2(0.,texel.y)), s=T(uv-vec2(0.,texel.y)), e=T(uv+vec2(texel.x,0.)), w=T(uv-vec2(texel.x,0.));
+  vec3 mn=min(b,min(min(n,s),min(e,w))), mx=max(b,max(max(n,s),max(e,w)));
+  vec3 c=clamp(cr(uv), mn, mx);
   vec3 amp=sqrt(clamp(min(mn,2.-mx)/max(mx,1e-4),0.,1.)); vec3 k=-amp/mix(8.,5.,0.5);
   o=vec4(clamp((c+(n+s+e+w)*k)/(1.+4.*k),0.,1.),1.); }""")
             // neural path: model output (rows top-first), cropped to the real picture

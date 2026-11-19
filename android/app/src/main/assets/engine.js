@@ -300,9 +300,9 @@ void main(){
         if (cfg.tone && st.frame % 3 === 1) analyseTone(st, video) // every 3rd frame (each read copies the video frame to the CPU): scene cuts still snap within ~0.1 s
         const tone = cfg.tone ? st.tone : { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }
         const dt = st.lastT ? (now - st.lastT) : 33; st.lastT = now; st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
-        const nnLiveOk = vh <= 480 // 480p and below get the neural 4x path (the result is scaled to the screen); bigger sources use the shader path
-        const wantNN = cfg.neural && (video.paused || (!guard.noNeural && nnLiveOk)) && vh <= 540 && state.nn && state.nn.session && state.stats.nn !== 'error'
-        if (cfg.neural && vh <= 540) nnInit()
+        const nnLiveOk = vh <= 660 // 360p..660p get the neural 4x path at their own size (the result is scaled to the screen); bigger sources use the shader path
+        const wantNN = cfg.neural && (video.paused || (!guard.noNeural && nnLiveOk)) && vh <= 660 && state.nn && state.nn.session && state.stats.nn !== 'error'
+        if (cfg.neural && vh <= 660) nnInit()
         // Neural frames are only shown when they are consistent: exact frame while paused, or when the
         // model keeps up with the video (always one steady frame late). Never mix stale and live frames.
         const nnS = state.nn; const T = 1000 / Math.max(st.fpsEMA, 1)
@@ -506,6 +506,8 @@ void main(){
     if (!NATIVE) return
     const v = Array.from(document.querySelectorAll('video')).find(x => !x.paused && !x.ended && x.readyState >= 2 && x.videoWidth > 0)
     if (v) { NATIVE.playing(true, v.videoWidth, v.videoHeight); reported = true } else if (reported) { NATIVE.playing(false, 0, 0); reported = false }
+    // where the film is, so reopening the browser after Android closed it continues from there
+    if (v && v.duration >= 120 && NATIVE.position) try { NATIVE.position(v.currentTime, v.duration) } catch (err) { /* ignore */ }
   }, 1500)
 
   function updateFsButton () {
