@@ -27,12 +27,26 @@ android {
         ndk { abiFilters += listOf("arm64-v8a") } // the NPU runtime is arm64 only
     }
     signingConfigs {
-        // fixed key so updates install over previous builds (debug-only key, not a secret)
+        // fixed key so updates install over previous builds.
+        // By default that is the committed debug.keystore, which anyone with the repo can sign with.
+        // Setting AIB_KEYSTORE_FILE, AIB_KEYSTORE_PASSWORD, AIB_KEY_ALIAS and AIB_KEY_PASSWORD (CI does it from
+        // repo secrets) signs with a private key instead. Switching keys means uninstalling the app on the phone
+        // once (its data is lost); after that, updates install over each other again.
         getByName("debug") {
-            storeFile = file("debug.keystore")
-            storePassword = "android"
-            keyAlias = "androiddebugkey"
-            keyPassword = "android"
+            val privateKey = System.getenv("AIB_KEYSTORE_FILE")
+            if (!privateKey.isNullOrBlank()) {
+                fun requireEnv(name: String): String =
+                    System.getenv(name)?.takeIf { it.isNotBlank() } ?: throw GradleException("$name is not set")
+                storeFile = file(privateKey)
+                storePassword = requireEnv("AIB_KEYSTORE_PASSWORD")
+                keyAlias = requireEnv("AIB_KEY_ALIAS")
+                keyPassword = requireEnv("AIB_KEY_PASSWORD")
+            } else {
+                storeFile = file("debug.keystore")
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
         }
     }
     buildTypes { release { isMinifyEnabled = false } }

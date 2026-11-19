@@ -2,14 +2,32 @@ name: Build Android APK
 on:
   push:
     branches: [main]
-    paths: ['android/**', '.github/workflows/android.yml']
+    paths: ['android/**', 'engine-tests/**', '.github/workflows/android.yml']
   workflow_dispatch:
+# read-only by default; only the release job below gets write access
 permissions:
-  contents: write
+  contents: read
 concurrency:
   group: apk-build
   cancel-in-progress: false
 jobs:
+  # in-page engine tests (engine.js) in headless Chromium, see engine-tests/
+  engine-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: engine-tests
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with: { node-version: '22' }
+      - name: Install test dependencies
+        run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+      - name: Run engine tests
+        run: npm test
+
   build:
     runs-on: ubuntu-latest
     steps:
@@ -29,8 +47,21 @@ jobs:
           # the WebGPU bundle only loads the asyncify build; the other three variants were 60 MB of dead weight
           cp package/dist/ort-wasm-simd-threaded.asyncify.mjs package/dist/ort-wasm-simd-threaded.asyncify.wasm ort/
           rm -rf package onnxruntime-web-*.tgz
-          curl -fL -o model/realesr-general-x4v3.onnx \
-            https://huggingface.co/CoderViking/realesr-general-x4v3-onnx/resolve/main/realesr-general-x4v3.onnx
+          # SR model from Hugging Face, checked against the sha256 of the copy every released APK so far has shipped
+          # (read from the APK's assets/model/realesr-general-x4v3.onnx, 4866417 bytes): if the file on Hugging Face
+          # ever changes, the build stops instead of silently shipping a different model. MODEL_REV can be set to the
+          # commit the run page prints as a notice (x-repo-commit); 'main' is safe while the checksum is checked.
+          MODEL_REV=main
+          MODEL_SHA256=1940a93ee08283a0a7286183186357b1688fe9fa8ede74604b424586aaddf112
+          curl -fL -D "$RUNNER_TEMP/model.headers" -o model/realesr-general-x4v3.onnx \
+            "https://huggingface.co/CoderViking/realesr-general-x4v3-onnx/resolve/$MODEL_REV/realesr-general-x4v3.onnx"
+          MODEL_COMMIT=$(grep -i '^x-repo-commit:' "$RUNNER_TEMP/model.headers" | head -n1 | cut -d' ' -f2 | tr -d '\r' || true)
+          echo "::notice::SR model commit ${MODEL_COMMIT:-unknown}, sha256 $(sha256sum model/realesr-general-x4v3.onnx | cut -d' ' -f1)"
+          if [ -n "$MODEL_SHA256" ]; then
+            echo "$MODEL_SHA256  model/realesr-general-x4v3.onnx" | sha256sum -c -
+          else
+            echo "::warning::SR model checksum not pinned yet (MODEL_SHA256 in android.yml)"
+          fi
           # fixed-size copies of the SR model for the NPU (native player), one per source class (360p..660p);
           # each takes the video at its own size and returns 2560x1440 (the NPU scales the 4x result to the screen)
           pip install --quiet --only-binary=:all: onnx pillow
@@ -63,6 +94,25 @@ jobs:
             | grep -v '^#' | tr 'A-Z' 'a-z' | grep -E '^[a-z0-9.-]+$' | sort -u > adulthosts.txt \
             || { echo "::warning::adult list skipped"; : > adulthosts.txt; }
           ls -la ort model adhosts.txt adulthosts.txt
+      # optional private signing key from repo secrets; without AIB_KEYSTORE_BASE64 the committed debug.keystore is used
+      # (see signingConfigs in android/app/build.gradle.kts: switching keys means one uninstall on the phone)
+      - name: Use private signing key (if configured)
+        env:
+          AIB_KEYSTORE_BASE64: ${{ secrets.AIB_KEYSTORE_BASE64 }}
+          AIB_KEYSTORE_PASSWORD: ${{ secrets.AIB_KEYSTORE_PASSWORD }}
+          AIB_KEY_ALIAS: ${{ secrets.AIB_KEY_ALIAS }}
+          AIB_KEY_PASSWORD: ${{ secrets.AIB_KEY_PASSWORD }}
+        run: |
+          if [ -z "$AIB_KEYSTORE_BASE64" ]; then echo "no private key configured: signing with the committed debug.keystore"; exit 0; fi
+          # half-configured secrets would quietly fall back to the public key, so stop instead
+          for V in AIB_KEYSTORE_PASSWORD AIB_KEY_ALIAS AIB_KEY_PASSWORD; do
+            [ -n "${!V}" ] || { echo "::error::secret $V is missing (needed with AIB_KEYSTORE_BASE64)"; exit 1; }; done
+          printf '%s' "$AIB_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/aib.keystore"
+          { echo "AIB_KEYSTORE_FILE=$RUNNER_TEMP/aib.keystore"
+            echo "AIB_KEYSTORE_PASSWORD=$AIB_KEYSTORE_PASSWORD"
+            echo "AIB_KEY_ALIAS=$AIB_KEY_ALIAS"
+            echo "AIB_KEY_PASSWORD=$AIB_KEY_PASSWORD"; } >> "$GITHUB_ENV"
+          echo "signing with the private key from secrets"
       - uses: gradle/actions/setup-gradle@v5
         with: { gradle-version: '8.10.2' }
       - name: Build debug APK
@@ -73,18 +123,46 @@ jobs:
           mkdir -p "$RUNNER_TEMP/apk"
           cp android/app/build/outputs/apk/debug/app-debug.apk "$RUNNER_TEMP/apk/ai-browser-debug.apk"
           ls -la "$RUNNER_TEMP/apk"
+      # the release job downloads this, so a failed upload must fail the build
       - uses: actions/upload-artifact@v6
-        continue-on-error: true
         with:
           name: ai-browser-debug-apk
           path: ${{ runner.temp }}/apk/ai-browser-debug.apk
-      # pushes only check that the app builds; the phone download is updated only when Basil asks
-      # (Actions -> Build Android APK -> Run workflow)
+
+  # pushes only check that the app builds; the phone download is updated only when Basil asks
+  # (Actions -> Build Android APK -> Run workflow)
+  release:
+    needs: build
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: ai-browser-debug-apk
+          path: ${{ runner.temp }}/apk
       - name: Publish APK as a release (direct download from the phone)
-        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
-          gh release create latest "$RUNNER_TEMP/apk/ai-browser-debug.apk" --repo "$GITHUB_REPOSITORY" \
-            --title "AI Browser (debug APK)" --notes "Debug build for Android. Install and allow unknown sources." --prerelease
+          APK="$RUNNER_TEMP/apk/ai-browser-debug.apk"
+          REPO="$GITHUB_REPOSITORY"
+          TITLE="AI Browser (debug APK)"
+          NOTES="Debug build 0.1.${{ github.run_number }} for Android. Install and allow unknown sources."
+          if gh release view latest --repo "$REPO" >/dev/null 2>&1; then
+            # replace the APK without ever leaving the release empty: upload under a temporary name first,
+            # then drop the old file and rename the new one (if the upload fails, the old APK is still there)
+            cp "$APK" "$RUNNER_TEMP/apk/ai-browser-debug.new.apk"
+            gh release upload latest "$RUNNER_TEMP/apk/ai-browser-debug.new.apk" --clobber --repo "$REPO"
+            ASSETS=$(gh api "repos/$REPO/releases/tags/latest" --jq '.assets[] | "\(.id) \(.name)"')
+            NEW=$(echo "$ASSETS" | awk '$2=="ai-browser-debug.new.apk" {print $1}')
+            OLD=$(echo "$ASSETS" | awk '$2=="ai-browser-debug.apk" {print $1}')
+            test -n "$NEW"
+            if [ -n "$OLD" ]; then gh api -X DELETE "repos/$REPO/releases/assets/$OLD"; fi
+            gh api -X PATCH "repos/$REPO/releases/assets/$NEW" -f name=ai-browser-debug.apk >/dev/null
+            gh release edit latest --repo "$REPO" --title "$TITLE" --notes "$NOTES" --prerelease
+          else
+            gh release create latest "$APK" --repo "$REPO" --target "$GITHUB_SHA" \
+              --title "$TITLE" --notes "$NOTES" --prerelease
+          fi
