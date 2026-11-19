@@ -502,7 +502,9 @@ class PlayerActivity : Activity() {
             videoSurface = Surface(st); onSurface(videoSurface!!)
             loader.execute { initOrt() }
         }
-        fun stop() { h.post { loader.shutdownNow(); buckets.forEach { it.close() }; try { outTensor?.close() } catch (e: Exception) { }; st?.release(); videoSurface?.release(); EGL14.eglMakeCurrent(egl, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT); EGL14.eglDestroySurface(egl, eglSurf); EGL14.eglDestroyContext(egl, eglCtx); EGL14.eglTerminate(egl); pool.shutdown(); thread.quitSafely() } }
+        /** set at once (not on the render thread): a model still compiling on the loader thread sees it and closes its session */
+        @Volatile private var stopped = false
+        fun stop() { stopped = true; h.post { loader.shutdownNow(); buckets.forEach { it.close() }; try { outTensor?.close() } catch (e: Exception) { }; st?.release(); videoSurface?.release(); EGL14.eglMakeCurrent(egl, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT); EGL14.eglDestroySurface(egl, eglSurf); EGL14.eglDestroyContext(egl, eglCtx); EGL14.eglTerminate(egl); pool.shutdown(); thread.quitSafely() } }
         fun setViewSize(w: Int, hh: Int) = h.post { viewW = w; viewH = hh }
         fun setVideoSize(w: Int, hh: Int, p: Float) { vidW = w; vidH = hh; par = if (p > 0) p else 1f; h.post { slowSince = 0; slowFrames = 0; emaMs = 0.0 } }
 
@@ -535,7 +537,10 @@ class PlayerActivity : Activity() {
             for ((t, file) in tries) {
                 val bytes = model(file) ?: continue
                 val tag = "sr_ctx_${t}_${b.w}x${b.h}_"
-                val ctxFile = java.io.File(ctx.filesDir, "$tag${bytes.size}.onnx") // new model in an update = new compiled copy
+                // the compiled copy is named after the model's CONTENT: an update with new weights but the same byte size
+                // (a re-calibrated quantized model always has the same size) used to keep running the old compiled model
+                val sum = java.util.zip.CRC32().apply { update(bytes) }.value
+                val ctxFile = java.io.File(ctx.filesDir, "$tag${bytes.size}_${java.lang.Long.toHexString(sum)}.onnx")
                 ctx.filesDir.listFiles { f -> f.name.startsWith(tag) && f.name != ctxFile.name }?.forEach { it.delete() }
                 try {
                     fun opts(dump: Boolean) = OrtSession.SessionOptions().apply {
@@ -550,16 +555,24 @@ class PlayerActivity : Activity() {
                         try { e.createSession(ctxFile.absolutePath, opts(false)) } catch (x: Exception) { ctxFile.delete(); e.createSession(bytes, opts(true)) }
                     else e.createSession(bytes, opts(true))
                     addLog("[player] SR ${b.w}x${b.h} session on $t in ${System.currentTimeMillis() - t0}ms")
+                    if (stopped) { s.close(); return } // the player closed while the model was compiling
                     val ib = ByteBuffer.allocateDirect(3 * b.w * b.h * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
                     val tin = OnnxTensor.createTensor(e, ib, longArrayOf(1, 3, b.h.toLong(), b.w.toLong()))
                     // speed test on the render thread (it owns the shared output buffer): two runs, the first warms the NPU up
                     val done = java.util.concurrent.CountDownLatch(1); var testMs = Long.MAX_VALUE
-                    h.post {
-                        try { for (k in 0 until 2) { val w0 = System.currentTimeMillis(); s.run(mapOf(s.inputNames.first() to tin), mapOf(s.outputNames.first() to outTensor!!)).close(); testMs = System.currentTimeMillis() - w0 } }
+                    val posted = h.post {
+                        try { if (!stopped) for (k in 0 until 2) { val w0 = System.currentTimeMillis(); s.run(mapOf(s.inputNames.first() to tin), mapOf(s.outputNames.first() to outTensor!!)).close(); testMs = System.currentTimeMillis() - w0 } }
                         catch (x: Throwable) { addLog("[player] SR ${b.w}x${b.h} test failed: ${x.message?.take(200)}") }
                         done.countDown()
                     }
-                    if (!done.await(20, java.util.concurrent.TimeUnit.SECONDS)) { s.close(); tin.close(); b.state = "idle"; return }
+                    if (!posted) done.countDown() // render thread already gone (player closed)
+                    // closing the player interrupts this thread: still wait for the test so the session is never closed under it,
+                    // and close it here (it used to be left open: NPU memory held until the app died)
+                    val finished = try { done.await(20, java.util.concurrent.TimeUnit.SECONDS) } catch (x: InterruptedException) {
+                        try { done.await(20, java.util.concurrent.TimeUnit.SECONDS) } catch (y: InterruptedException) { false }
+                    }
+                    if (!finished) { b.state = "idle"; return } // test still running on the render thread: closing now could crash it
+                    if (stopped) { s.close(); tin.close(); b.state = "idle"; return }
                     addLog("[player] SR ${b.w}x${b.h} test run on $t: ${testMs}ms per frame")
                     if (testMs > 55) { // slower than a 24 fps movie needs: never stutter, a smaller model or the GPU path takes over
                         s.close(); tin.close(); b.testMs = testMs; b.state = "slow"; return
@@ -590,9 +603,9 @@ class PlayerActivity : Activity() {
             if (b != null && b.state == "idle") { b.state = "loading"; loader.execute { load(b) } }
             val s = b?.session?.takeIf { b.state == "ready" }
             if (b !== cur) { cur = b; emaMs = 0.0; slowSince = 0; slowFrames = 0 }
-            val useAi = s != null
+            var useAi = s != null
             var ms = 0.0
-            if (useAi) {
+            if (useAi) try {
                 val bk = b!!; bk.lastUsed = now
                 val IN_W = bk.w; val IN_H = bk.h
                 val t0 = System.nanoTime()
@@ -656,7 +669,13 @@ class PlayerActivity : Activity() {
                 // fits it) or the GPU shader takes over, so playback never stutters
                 val budget = 1000.0 / Math.max(fpsEma, 1.0)
                 if (emaMs > budget * 1.15 && ++slowFrames > 5) { if (slowSince == 0L) slowSince = now else if (now - slowSince > 1_000_000_000L || ms > budget * 4) { bk.state = "slow"; bk.close(); addLog("[player] SR ${IN_W}x${IN_H} too slow (${emaMs.toInt()}ms > ${budget.toInt()}ms)") } } else slowSince = 0L
-            } else drawToScreen(progDirect, dispAspect)
+            } catch (x: Throwable) {
+                // the NPU failed mid-film (driver reset, out of memory...): drop this model, the GPU path takes over at once
+                addLog("[player] SR ${b?.w}x${b?.h} failed while playing, GPU path from now: ${x.message?.take(160)}")
+                b?.let { it.state = "failed"; it.close() }; cur = null; useAi = false
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+            }
+            if (!useAi) drawToScreen(progDirect, dispAspect)
             EGL14.eglSwapBuffers(egl, eglSurf)
             if (frames % 15 == 0) onStatus(statusText(vw, vh, b))
             frames++
