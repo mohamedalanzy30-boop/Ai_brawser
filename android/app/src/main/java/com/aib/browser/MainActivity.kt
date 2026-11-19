@@ -72,6 +72,7 @@ class MainActivity : Activity() {
     private lateinit var backBtn: ImageView
     private lateinit var fwdBtn: ImageView
     private lateinit var aiBtn: ImageView
+    private lateinit var clearBtn: ImageView
     private var customView: View? = null
     private var customCallback: WebChromeClient.CustomViewCallback? = null
     private var scriptHandler: ScriptHandler? = null
@@ -306,7 +307,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.statusBarColor = Ui.BG
-        window.navigationBarColor = 0xFF1C1C1E.toInt()
+        window.navigationBarColor = Ui.SHEET
         adblockOn = on("adblock"); adultOn = on("adult")
 
         content = FrameLayout(this).apply { setBackgroundColor(Ui.BG) }
@@ -314,7 +315,7 @@ class MainActivity : Activity() {
         web = WebView(this).apply { setBackgroundColor(Ui.BG) }
         refresher = SwipeRefreshLayout(this).apply {
             addView(web)
-            setColorSchemeColors(Ui.BLUE); setProgressBackgroundColorSchemeColor(0xFF2C2C2E.toInt())
+            setColorSchemeColors(Ui.BLUE); setProgressBackgroundColorSchemeColor(Ui.CARD)
             setOnRefreshListener { web.reload() }
             // only when the page itself is scrolled to the top (pages with their own scrolling area keep working)
             setOnChildScrollUpCallback { _, _ -> web.scrollY > 0 || customView != null || !pullOk }
@@ -327,7 +328,8 @@ class MainActivity : Activity() {
 
         // Android 15 draws edge-to-edge: keep content clear of the system bars; the bar colour runs under the nav bar
         content.setOnApplyWindowInsetsListener { v, insets ->
-            val b = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime())
+            // the camera cutout counts too: in landscape the page and the bar must not slide under it
+            val b = insets.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime() or WindowInsets.Type.displayCutout())
             v.setPadding(b.left, b.top, b.right, 0)
             bottomBar.setPadding(dp(12), dp(8), dp(12), b.bottom + dp(2))
             WindowInsets.CONSUMED
@@ -336,7 +338,6 @@ class MainActivity : Activity() {
         setupWebView()
         loadLists()
         registerScript()
-        pollBadge()
         val restore = prefs.getString("restoreUrl", null); prefs.edit().remove("restoreUrl").apply()
         when {
             restore != null -> go(restore) // renderer crash: reload that page (crash-loop guard picks HOME)
@@ -346,63 +347,84 @@ class MainActivity : Activity() {
     }
 
     private fun buildBottomBar(): LinearLayout {
-        val bar = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(0xFF1C1C1E.toInt()) }
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; setBackgroundColor(Ui.SHEET)
+            setPadding(dp(12), dp(8), dp(12), dp(2)) // same as in the insets listener, so the first frame is already right
+        }
         // hairline on top
-        bar.addView(View(this).apply { setBackgroundColor(0x33FFFFFF) }, LinearLayout.LayoutParams(-1, 1).apply { bottomMargin = dp(8) })
+        bar.addView(View(this).apply { setBackgroundColor(Ui.SEPARATOR) }, LinearLayout.LayoutParams(-1, 1).apply { bottomMargin = dp(8); marginStart = -dp(12); marginEnd = -dp(12) })
 
-        // address pill: lock + domain (centered, like Safari); tap = edit; swipe left/right = forward/back
-        addressPill = FrameLayout(this).apply { background = Ui.round(this@MainActivity, Ui.FIELD, 13) }
-        val shown = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
-        lock = Ui.icon(this, R.drawable.ic_lock, Ui.LABEL)
-        addressText = Ui.text(this, "", 16f).apply { setSingleLine(); ellipsize = android.text.TextUtils.TruncateAt.END }
+        // address pill: lock + domain (centered, like Safari); tap = edit; swipe toward the back button = back, the other way = forward
+        addressPill = FrameLayout(this).apply {
+            background = Ui.round(this@MainActivity, Ui.FIELD, 12); clipToOutline = true // the loading line follows the rounded corners
+            contentDescription = "شريط العنوان"; isClickable = true
+            setOnClickListener { startEdit() } // TalkBack double-tap; touches are handled below
+        }
+        val shown = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER; setPadding(dp(16), 0, dp(16), 0) }
+        lock = Ui.icon(this, R.drawable.ic_lock, Ui.SECONDARY, "اتصال آمن")
+        addressText = Ui.text(this, "", 16f).apply { setSingleLine(); ellipsize = android.text.TextUtils.TruncateAt.END; textDirection = View.TEXT_DIRECTION_FIRST_STRONG }
         shown.addView(lock, LinearLayout.LayoutParams(dp(14), dp(14)).apply { marginEnd = dp(6) })
         shown.addView(addressText)
         urlEdit = EditText(this).apply {
             setSingleLine(); hint = "ابحث أو اكتب عنواناً"; setHintTextColor(Ui.SECONDARY); setTextColor(Ui.LABEL); textSize = 16f
-            background = null; setPadding(dp(14), 0, dp(14), 0); visibility = View.GONE
-            imeOptions = EditorInfo.IME_ACTION_GO; textDirection = View.TEXT_DIRECTION_LTR
+            background = null; setPaddingRelative(dp(16), 0, dp(44), 0); visibility = View.GONE
+            // direction follows what is typed: addresses run left-to-right, Arabic searches (and the empty field) right-to-left
+            imeOptions = EditorInfo.IME_ACTION_GO; textDirection = View.TEXT_DIRECTION_FIRST_STRONG
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_URI
             setOnEditorActionListener { _, _, _ -> go(text.toString()); endEdit(); true }
             setOnFocusChangeListener { _, f -> if (!f) endEdit() }
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun afterTextChanged(e: android.text.Editable?) { if (visibility == View.VISIBLE) clearBtn.visibility = if (e.isNullOrEmpty()) View.GONE else View.VISIBLE }
+                override fun beforeTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+                override fun onTextChanged(a: CharSequence?, b: Int, c: Int, d: Int) {}
+            })
         }
+        clearBtn = Ui.icon(this, R.drawable.ic_clear, Ui.SECONDARY, "مسح النص") { urlEdit.setText("") }.apply { visibility = View.GONE }
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100; visibility = View.GONE; progressTintList = ColorStateList.valueOf(Ui.BLUE); progressBackgroundTintList = ColorStateList.valueOf(Color.TRANSPARENT)
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
         }
         addressPill.addView(shown, FrameLayout.LayoutParams(-1, -1))
         addressPill.addView(urlEdit, FrameLayout.LayoutParams(-1, -1))
-        addressPill.addView(progress, FrameLayout.LayoutParams(-1, dp(3), Gravity.BOTTOM).apply { setMargins(dp(10), 0, dp(10), 0) })
+        addressPill.addView(clearBtn, FrameLayout.LayoutParams(dp(44), -1, Gravity.END or Gravity.CENTER_VERTICAL))
+        addressPill.addView(progress, FrameLayout.LayoutParams(-1, dp(3), Gravity.BOTTOM))
         var x0 = 0f; var swiped = false
-        addressPill.setOnTouchListener { _, e ->
+        addressPill.setOnTouchListener { v, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> { x0 = e.x; swiped = false }
                 MotionEvent.ACTION_MOVE -> if (!swiped && Math.abs(e.x - x0) > dp(60)) {
                     swiped = true
-                    if (e.x > x0) goBackOnce() else if (web.canGoForward()) web.goForward()
+                    // the back button sits on the left in English and on the right in Arabic: swiping toward it goes back
+                    val towardBack = (e.x > x0) != (v.layoutDirection == View.LAYOUT_DIRECTION_RTL)
+                    if (towardBack) goBackOnce() else if (web.canGoForward()) web.goForward()
                 }
-                MotionEvent.ACTION_UP -> if (!swiped) startEdit()
+                MotionEvent.ACTION_UP -> if (!swiped) v.performClick()
             }
             true
         }
-        bar.addView(addressPill, LinearLayout.LayoutParams(-1, dp(46)))
+        bar.addView(addressPill, LinearLayout.LayoutParams(-1, dp(48)))
 
-        // toolbar: back · forward · AI · history · reload
+        // toolbar: back · forward · AI · history · reload (48dp touch targets)
         val tools = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        backBtn = Ui.icon(this, R.drawable.ic_back, Ui.BLUE) { goBackOnce() }.apply { setOnLongClickListener { showHistory(); true } }
-        fwdBtn = Ui.icon(this, R.drawable.ic_forward, Ui.BLUE) { if (web.canGoForward()) web.goForward() }
-        aiBtn = Ui.icon(this, R.drawable.ic_sparkle, Ui.BLUE) { showSettings() }
-        val hist = Ui.icon(this, R.drawable.ic_history, Ui.BLUE) { showHistory() }
-        val reload = Ui.icon(this, R.drawable.ic_reload, Ui.BLUE) { web.reload() }
-        for (v in listOf(backBtn, fwdBtn, aiBtn, hist, reload)) tools.addView(v, LinearLayout.LayoutParams(0, dp(46), 1f))
+        backBtn = Ui.icon(this, R.drawable.ic_back, Ui.BLUE, "رجوع") { goBackOnce() }.apply { setOnLongClickListener { showHistory(); true } }
+        fwdBtn = Ui.icon(this, R.drawable.ic_forward, Ui.BLUE, "تقدّم") { if (web.canGoForward()) web.goForward() }
+        aiBtn = Ui.icon(this, R.drawable.ic_sparkle, Ui.BLUE, "الإعدادات") { showSettings() }
+        val hist = Ui.icon(this, R.drawable.ic_history, Ui.BLUE, "السجل") { showHistory() }
+        val reload = Ui.icon(this, R.drawable.ic_reload, Ui.BLUE, "إعادة التحميل") { web.reload() }
+        for (v in listOf(backBtn, fwdBtn, aiBtn, hist, reload)) tools.addView(v, LinearLayout.LayoutParams(0, dp(48), 1f))
         bar.addView(tools, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(4) })
         return bar
     }
     private fun startEdit() {
         urlEdit.setText(web.url ?: ""); urlEdit.visibility = View.VISIBLE; addressText.parent.let { (it as View).visibility = View.INVISIBLE }
+        clearBtn.visibility = if (urlEdit.text.isEmpty()) View.GONE else View.VISIBLE
         urlEdit.requestFocus(); urlEdit.selectAll()
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(urlEdit, InputMethodManager.SHOW_IMPLICIT)
     }
     private fun endEdit() {
         (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(urlEdit.windowToken, 0)
-        urlEdit.visibility = View.GONE; (addressText.parent as View).visibility = View.VISIBLE; urlEdit.clearFocus()
+        urlEdit.visibility = View.GONE; clearBtn.visibility = View.GONE; (addressText.parent as View).visibility = View.VISIBLE; urlEdit.clearFocus()
+        showAddress(web.url) // a redirect may have landed while the field was open
     }
     private fun showAddress(url: String?) {
         val u = Uri.parse(url ?: "")
@@ -412,8 +434,8 @@ class MainActivity : Activity() {
             else -> u.host!!.removePrefix("www.")
         }
         lock.visibility = if (u.scheme == "https") View.VISIBLE else View.GONE
-        backBtn.alpha = if (web.canGoBack()) 1f else 0.35f
-        fwdBtn.alpha = if (web.canGoForward()) 1f else 0.35f
+        backBtn.alpha = if (web.canGoBack()) 1f else 0.35f; backBtn.isEnabled = web.canGoBack() || customView != null
+        fwdBtn.alpha = if (web.canGoForward()) 1f else 0.35f; fwdBtn.isEnabled = web.canGoForward()
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -508,14 +530,18 @@ class MainActivity : Activity() {
     private fun showPopup(pw: WebView) {
         val dlg = Dialog(this, android.R.style.Theme_DeviceDefault_NoActionBar)
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(Ui.SHEET) }
-        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPadding(dp(16), dp(10), dp(8), dp(10)) }
-        head.addView(Ui.text(this, "تسجيل الدخول", 17f, bold = true), LinearLayout.LayoutParams(0, -2, 1f))
-        head.addView(Ui.text(this, "إغلاق", 17f, Ui.BLUE).apply { setPadding(dp(8), dp(4), dp(8), dp(4)); setOnClickListener { dlg.dismiss() } })
-        col.addView(head)
+        // full-screen window on Android 15 is edge-to-edge: keep the header below the status bar
+        col.setOnApplyWindowInsetsListener { v, i -> val b = i.getInsets(WindowInsets.Type.systemBars() or WindowInsets.Type.ime()); v.setPadding(b.left, b.top, b.right, b.bottom); WindowInsets.CONSUMED }
+        val head = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setPaddingRelative(dp(16), 0, dp(4), 0) }
+        head.addView(Ui.text(this, "تسجيل الدخول", 17f, bold = true).apply { textAlignment = View.TEXT_ALIGNMENT_VIEW_START }, LinearLayout.LayoutParams(0, -2, 1f))
+        head.addView(Ui.text(this, "إغلاق", 17f, Ui.BLUE).apply { gravity = Gravity.CENTER; setPadding(dp(12), 0, dp(12), 0); setOnClickListener { dlg.dismiss() } }, LinearLayout.LayoutParams(-2, dp(48)))
+        col.addView(head, LinearLayout.LayoutParams(-1, dp(52)))
         (pw.parent as? ViewGroup)?.removeView(pw)
         col.addView(pw, LinearLayout.LayoutParams(-1, 0, 1f))
         pw.webChromeClient = object : WebChromeClient() { override fun onCloseWindow(w: WebView) { dlg.dismiss() } }
         dlg.setOnDismissListener { pw.destroy() }
+        // back steps back inside the sign-in pages first, then closes
+        dlg.setOnKeyListener { _, k, e -> if (k == KeyEvent.KEYCODE_BACK && e.action == KeyEvent.ACTION_UP && pw.canGoBack()) { pw.goBack(); true } else false }
         dlg.setContentView(col); dlg.show()
     }
 
@@ -644,8 +670,12 @@ class MainActivity : Activity() {
     }
 
     private fun blockedPage(host: String?) {
-        web.loadDataWithBaseURL(null, "<html><body style='background:#000;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:90vh;text-align:center'>" +
-            "<div><div style='font-size:48px'>🛡️</div><p style='font-size:18px'>هذا الموقع محجوب</p><p style='color:#8e8e93'>${host ?: ""}</p></div></body></html>", "text/html", "utf-8", null)
+        val h = android.text.TextUtils.htmlEncode(host ?: "")
+        // viewport meta: without it the page is laid out 980px wide and zoomed out (tiny text); the address bar shows the blocked host
+        web.loadDataWithBaseURL(null, "<!doctype html><html dir='rtl' lang='ar'><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>" +
+            "<body style='margin:0;background:#000;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:90vh;text-align:center'>" +
+            "<div><div style='font-size:48px'>🛡️</div><p style='font-size:18px;margin:16px 0 8px'>هذا الموقع محجوب</p><p dir='ltr' style='color:#98989d;margin:0'>$h</p></div></body></html>",
+            "text/html", "utf-8", if (host != null) "https://$host/" else null)
     }
 
     /** Some Google font files are served without CORS headers, so pages cannot use them. Same download, plus the header. */
@@ -697,12 +727,14 @@ class MainActivity : Activity() {
     }
 
     /* ======================= AI badge ======================= */
-    private fun pollBadge() { // the ✨ turns purple while a video is being enhanced
+    /** The ✨ turns purple while a video is being enhanced; checked every 2 s only while the browser is on screen. */
+    private val badgeTick = Runnable { pollBadge() }
+    private fun pollBadge() {
         web.evaluateJavascript("(function(){var s=window.__minEnhance&&window.__minEnhance.state.stats;return JSON.stringify({a:(s&&s.active)||0})})()") { raw ->
             val j = try { JSONObject(org.json.JSONTokener(raw).nextValue() as String) } catch (e: Exception) { JSONObject() }
             aiBtn.imageTintList = ColorStateList.valueOf(if (j.optInt("a") > 0) Ui.AI else Ui.BLUE)
         }
-        ui.postDelayed({ pollBadge() }, 2000)
+        ui.removeCallbacks(badgeTick); ui.postDelayed(badgeTick, 2000)
     }
 
     private fun go(input: String) {
@@ -729,7 +761,7 @@ class MainActivity : Activity() {
 
     /* ======================= settings sheet ======================= */
     private fun showSettings() {
-        Ui.sheet(this, "✨ الإعدادات") { col, dlg ->
+        Ui.sheet(this, "الإعدادات", full = true) { col, dlg ->
             fun set(k: String, v: Boolean) { prefs.edit().putBoolean(k, v).apply() }
             Ui.Group(this, col, "تحسين الفيديو والصور بالذكاء الاصطناعي", "يعمل على جهازك بدون إنترنت إضافي.").apply {
                 toggle("تفعيل التحسين على كل المواقع", on("enabled")) { set("enabled", it); applyConfig() }
@@ -778,7 +810,9 @@ class MainActivity : Activity() {
     /* ======================= downloads list ======================= */
     private fun showDownloads() {
         val dm = getSystemService(Context.DOWNLOAD_SERVICE) as android.app.DownloadManager
-        Ui.sheet(this, "التحميلات") { col, dlg ->
+        var sheet: Ui.Sheet? = null
+        val tick = Runnable { if (sheet?.dialog?.isShowing == true) sheet?.refresh() }
+        sheet = Ui.sheet(this, "التحميلات") { col, dlg ->
             data class D(val id: Long, val name: String, val status: Int, val done: Long, val total: Long)
             val items = ArrayList<D>()
             try {
@@ -790,28 +824,29 @@ class MainActivity : Activity() {
                 }
             } catch (e: Exception) { addLog("[AIB] downloads query failed: $e") }
             items.sortByDescending { it.id }
-            val g = Ui.Group(this, col, null, if (items.isEmpty()) "ما حمّلته من المواقع يظهر هنا." else "اضغط لفتح الملف، ومطولاً لإلغائه أو حذفه من القائمة.")
+            if (items.isEmpty()) { Ui.empty(this, col, "ما تحمّله من المواقع يظهر هنا."); return@sheet }
+            val g = Ui.Group(this, col, null, "اضغط لفتح الملف، ومطولاً لإلغائه أو حذفه من القائمة.")
             for (d in items) {
-                val mb = { b: Long -> "%.1f MB".format(b / 1048576.0) }
+                val mb = { b: Long -> String.format(java.util.Locale.US, "%.1f MB", b / 1048576.0) }
                 val state = when (d.status) {
                     android.app.DownloadManager.STATUS_SUCCESSFUL -> mb(d.total)
                     android.app.DownloadManager.STATUS_FAILED -> "فشل"
                     android.app.DownloadManager.STATUS_PAUSED -> "متوقف مؤقتاً"
                     else -> if (d.total > 0) "${d.done * 100 / d.total}%" else mb(d.done)
                 }
-                g.link(d.name.take(40), state) {
+                g.link(d.name, state) {
                     if (d.status != android.app.DownloadManager.STATUS_SUCCESSFUL) return@link
                     val uri = dm.getUriForDownloadedFile(d.id) ?: return@link
                     try { startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, dm.getMimeTypeForDownloadedFile(d.id)).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)) }
                     catch (e: Exception) { Toast.makeText(this, "لا يوجد تطبيق يفتح هذا الملف", Toast.LENGTH_SHORT).show() }
-                }
+                }.setOnLongClickListener { dm.remove(d.id); sheet?.refresh(); true }
             }
-            val card = col.getChildAt(col.childCount - 2) as? LinearLayout
-            var i = 0
-            card?.let { c -> for (k in 0 until c.childCount) { val r = c.getChildAt(k); if (r is LinearLayout) { val d = items.getOrNull(i++) ?: continue; r.setOnLongClickListener { dm.remove(d.id); dlg.dismiss(); showDownloads(); true } } } }
-            // live progress while the sheet is open
-            col.postDelayed({ if (dlg.isShowing && items.any { it.status == android.app.DownloadManager.STATUS_RUNNING || it.status == android.app.DownloadManager.STATUS_PENDING }) { dlg.dismiss(); showDownloads() } }, 2000)
-        }.show()
+            // live progress while the sheet is open: the rows are redrawn in place (no close/reopen flicker)
+            ui.removeCallbacks(tick)
+            if (items.any { it.status == android.app.DownloadManager.STATUS_RUNNING || it.status == android.app.DownloadManager.STATUS_PENDING }) ui.postDelayed(tick, 2000)
+        }
+        sheet.dialog.setOnDismissListener { ui.removeCallbacks(tick) }
+        sheet.show()
     }
 
     /* ======================= offline pages (web archives on the phone) ======================= */
@@ -825,28 +860,28 @@ class MainActivity : Activity() {
         }
     }
     private fun showSaved() {
-        Ui.sheet(this, "الصفحات المحفوظة") { col, dlg ->
+        var sheet: Ui.Sheet? = null
+        sheet = Ui.sheet(this, "الصفحات المحفوظة") { col, dlg ->
             val files = savedDir.listFiles()?.sortedByDescending { it.lastModified() } ?: emptyList()
-            val g = Ui.Group(this, col, null, if (files.isEmpty()) "احفظ أي صفحة من ✨ ← حفظ هذه الصفحة." else "اضغط مطولاً للحذف.")
+            if (files.isEmpty()) { Ui.empty(this, col, "احفظ أي صفحة من ✨ ← حفظ هذه الصفحة، وتفتحها بعدها بدون إنترنت."); return@sheet }
+            val g = Ui.Group(this, col, null, "اضغط مطولاً للحذف.")
             for (f in files) {
                 g.link(f.name.substringBeforeLast('_')) {
                     dlg.dismiss()
                     web.settings.allowFileAccess = true // only for saved pages; switched off again on the next web page
                     web.loadUrl(Uri.fromFile(f).toString())
-                }
+                }.setOnLongClickListener { f.delete(); sheet?.refresh(); true } // long press = delete
             }
-            // long press = delete (rows are added in the same order as files)
-            val card = col.getChildAt(col.childCount - (if (files.isEmpty()) 2 else 2)) as? LinearLayout
-            var i = 0
-            card?.let { c -> for (k in 0 until c.childCount) { val r = c.getChildAt(k); if (r is LinearLayout) { val f = files.getOrNull(i++) ?: continue; r.setOnLongClickListener { f.delete(); dlg.dismiss(); showSaved(); true } } } }
-        }.show()
+        }
+        sheet.show()
     }
 
     /* ======================= continue watching ======================= */
     private fun showContinue() {
         Ui.sheet(this, "أكمل المشاهدة") { col, dlg ->
             val items = Resume.list(this)
-            val g = Ui.Group(this, col, null, if (items.isEmpty()) "الأفلام التي لم تكملها في المشغّل الأصلي تظهر هنا." else "افتح الفيلم وسيكمل من حيث توقفت.")
+            if (items.isEmpty()) { Ui.empty(this, col, "الأفلام التي لم تكملها في المشغّل الأصلي تظهر هنا."); return@sheet }
+            val g = Ui.Group(this, col, null, "افتح الفيلم وسيكمل من حيث توقفت.")
             for (it in items) {
                 val left = (it.durMs - it.posMs) / 60000
                 g.link(it.title.ifBlank { Uri.parse(it.page).host ?: it.page }, "باقي $left د") { dlg.dismiss(); web.loadUrl(it.page) }
@@ -868,15 +903,16 @@ class MainActivity : Activity() {
         saveHistory()
     }
     private fun showHistory() {
-        Ui.sheet(this, "السجل") { col, dlg ->
+        Ui.sheet(this, "السجل", full = true) { col, dlg ->
             val search = EditText(this).apply {
-                hint = "بحث"; setHintTextColor(Ui.SECONDARY); setTextColor(Ui.LABEL); textSize = 16f; setSingleLine()
-                background = Ui.round(this@MainActivity, Ui.CARD, 10); setPadding(dp(12), 0, dp(12), 0)
+                hint = "بحث في السجل"; setHintTextColor(Ui.SECONDARY); setTextColor(Ui.LABEL); textSize = 16f; setSingleLine()
+                textDirection = View.TEXT_DIRECTION_FIRST_STRONG; imeOptions = EditorInfo.IME_ACTION_SEARCH
+                background = Ui.round(this@MainActivity, Ui.CARD, 12); setPaddingRelative(dp(16), 0, dp(16), 0)
             }
-            col.addView(search, LinearLayout.LayoutParams(-1, dp(38)))
+            col.addView(search, LinearLayout.LayoutParams(-1, dp(44)))
             val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
             col.addView(list)
-            val fmt = java.text.SimpleDateFormat("d/M HH:mm", java.util.Locale.US)
+            val fmt = java.text.SimpleDateFormat("d/M  HH:mm", java.util.Locale.US)
             fun fill(q: String) {
                 list.removeAllViews()
                 val g = Ui.Group(this, list, null)
@@ -884,11 +920,21 @@ class MainActivity : Activity() {
                 for (i in history.length() - 1 downTo 0) {
                     val o = history.getJSONObject(i); val u = o.optString("u"); val t = o.optString("t").ifBlank { Uri.parse(u).host ?: u }
                     if (q.isNotEmpty() && !u.contains(q, true) && !t.contains(q, true)) continue
-                    g.link(t.take(60), fmt.format(java.util.Date(o.optLong("d")))) { dlg.dismiss(); web.loadUrl(u) }
+                    g.link(t, fmt.format(java.util.Date(o.optLong("d")))) { dlg.dismiss(); web.loadUrl(u) }
                     if (++shown >= 200) break
                 }
-                if (shown == 0) list.addView(Ui.text(this, "لا يوجد شيء", 15f, Ui.SECONDARY).apply { setPadding(dp(16), dp(16), dp(16), dp(16)) })
-                Ui.Group(this, list, null).link("مسح السجل", color = Ui.RED) { while (history.length() > 0) history.remove(0); saveHistory(); fill("") }
+                if (shown == 0) {
+                    list.removeAllViews() // no empty card
+                    Ui.empty(this, list, if (q.isEmpty()) "لم تزر أي صفحة بعد." else "لا نتائج لـ «$q».")
+                }
+                if (history.length() > 0) Ui.Group(this, list, null).action("مسح السجل", Ui.RED) {
+                    // a one-tap wipe of 1,500 entries needs a confirmation
+                    android.app.AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                        .setTitle("مسح السجل؟").setMessage("ستُحذف كل الصفحات المحفوظة في السجل من هذا الجوال.")
+                        .setNegativeButton("إلغاء", null)
+                        .setPositiveButton("مسح") { _, _ -> while (history.length() > 0) history.remove(0); saveHistory(); fill("") }
+                        .show()
+                }
             }
             search.addTextChangedListener(object : android.text.TextWatcher {
                 override fun afterTextChanged(e: android.text.Editable?) { fill(e?.toString()?.trim() ?: "") }
@@ -900,14 +946,14 @@ class MainActivity : Activity() {
     }
 
     private fun showLog() {
-        Ui.sheet(this, "سجل الأخطاء") { col, _ ->
-            val txt = Ui.text(this, logText(), 11f, 0xFFD0D0D0.toInt()).apply { setTextIsSelectable(true); typeface = android.graphics.Typeface.MONOSPACE }
+        Ui.sheet(this, "سجل الأخطاء", full = true) { col, _ ->
+            val txt = Ui.text(this, logText(), 11f, 0xFFD0D0D0.toInt()).apply { setTextIsSelectable(true); typeface = android.graphics.Typeface.MONOSPACE; textDirection = View.TEXT_DIRECTION_LTR }
             Ui.Group(this, col, null).apply {
-                link("نسخ الكل", color = Ui.BLUE) {
+                action("نسخ الكل") {
                     (getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).setPrimaryClip(ClipData.newPlainText("AI Browser log", logText()))
                     Toast.makeText(this@MainActivity, "تم النسخ", Toast.LENGTH_SHORT).show()
                 }
-                link("مسح", color = Ui.RED) { synchronized(logLines) { logLines.clear() }; txt.text = logText() }
+                action("مسح", Ui.RED) { synchronized(logLines) { logLines.clear() }; txt.text = logText() }
             }
             col.addView(txt, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(16) })
         }.show()
@@ -984,7 +1030,7 @@ class MainActivity : Activity() {
         Toast.makeText(this, "أكمل من ${(t / 60).toInt()}:${"%02d".format((t % 60).toInt())}", Toast.LENGTH_SHORT).show()
     }
 
-    override fun onStop() { saveSession(); super.onStop(); if (!isInPictureInPictureMode && (nativeOpen || !videoPlaying)) { web.onPause(); web.pauseTimers() } }
-    override fun onStart() { super.onStart(); web.onResume(); web.resumeTimers() }
+    override fun onStop() { saveSession(); super.onStop(); ui.removeCallbacks(badgeTick); if (!isInPictureInPictureMode && (nativeOpen || !videoPlaying)) { web.onPause(); web.pauseTimers() } }
+    override fun onStart() { super.onStart(); web.onResume(); web.resumeTimers(); pollBadge() }
     override fun onDestroy() { ui.removeCallbacksAndMessages(null); try { (web.parent as? ViewGroup)?.removeView(web); web.destroy() } catch (e: Exception) { }; super.onDestroy() }
 }
