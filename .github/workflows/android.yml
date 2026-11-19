@@ -13,10 +13,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: '17' }
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with: { python-version: '3.12' }
       - name: Fetch ONNX Runtime Web + model into app assets
         run: |
@@ -63,7 +63,7 @@ jobs:
             | grep -v '^#' | tr 'A-Z' 'a-z' | grep -E '^[a-z0-9.-]+$' | sort -u > adulthosts.txt \
             || { echo "::warning::adult list skipped"; : > adulthosts.txt; }
           ls -la ort model adhosts.txt adulthosts.txt
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v5
         with: { gradle-version: '8.10.2' }
       - name: Build debug APK
         working-directory: android
@@ -73,7 +73,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/apk"
           cp android/app/build/outputs/apk/debug/app-debug.apk "$RUNNER_TEMP/apk/ai-browser-debug.apk"
           ls -la "$RUNNER_TEMP/apk"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         continue-on-error: true
         with:
           name: ai-browser-debug-apk
