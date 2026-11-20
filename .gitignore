@@ -1,0 +1,15 @@
+# build output and caches
+build/
+.gradle/
+.kotlin/
+local.properties
+*.apk
+__pycache__/
+*.pyc
+node_modules/
+
+# app assets that the CI workflow downloads or generates at build time (see .github/workflows/android.yml)
+android/app/src/main/assets/ort/
+android/app/src/main/assets/model/
+android/app/src/main/assets/adhosts.txt
+android/app/src/main/assets/adulthosts.txt

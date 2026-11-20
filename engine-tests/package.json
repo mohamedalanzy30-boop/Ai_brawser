@@ -1,0 +1,12 @@
+{
+  "name": "aib-engine-tests",
+  "private": true,
+  "description": "Chromium (Playwright) tests for android/app/src/main/assets/engine.js",
+  "scripts": {
+    "test": "node run.js"
+  },
+  "devDependencies": {
+    "onnxruntime-web": "1.31.1",
+    "playwright": "1.63.0"
+  }
+}

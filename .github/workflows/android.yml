@@ -12,6 +12,10 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # true only when the owner added his own signing key as repository secrets (see README); otherwise the
+      # committed debug.keystore signs the APK as before. Secrets cannot be tested directly in a step's `if`.
+      HAS_SIGNING_KEY: ${{ secrets.SIGNING_STORE_B64 != '' }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v5
@@ -19,6 +23,12 @@ jobs:
       - uses: actions/setup-python@v6
         with: { python-version: '3.12' }
       - name: Fetch ONNX Runtime Web + model into app assets
+        env:
+          # the SR model is fetched from this Hugging Face revision; a commit sha (instead of main) plus its sha256
+          # makes the build reproducible. Every run writes the commit and sha256 it got into the job summary, so
+          # pinning is copying those two values here. With SR_MODEL_SHA256 set, a different file fails the build.
+          SR_MODEL_REV: main
+          SR_MODEL_SHA256: ''
         run: |
           set -e
           cd android/app/src/main/assets
@@ -29,8 +39,13 @@ jobs:
           # the WebGPU bundle only loads the asyncify build; the other three variants were 60 MB of dead weight
           cp package/dist/ort-wasm-simd-threaded.asyncify.mjs package/dist/ort-wasm-simd-threaded.asyncify.wasm ort/
           rm -rf package onnxruntime-web-*.tgz
-          curl -fL -o model/realesr-general-x4v3.onnx \
-            https://huggingface.co/CoderViking/realesr-general-x4v3-onnx/resolve/main/realesr-general-x4v3.onnx
+          curl -fL -D "$RUNNER_TEMP/model.headers" -o model/realesr-general-x4v3.onnx \
+            "https://huggingface.co/CoderViking/realesr-general-x4v3-onnx/resolve/$SR_MODEL_REV/realesr-general-x4v3.onnx"
+          MODEL_COMMIT=$(grep -i '^x-repo-commit:' "$RUNNER_TEMP/model.headers" | head -1 | awk '{print $2}' | tr -d '\r')
+          MODEL_SHA=$(sha256sum model/realesr-general-x4v3.onnx | cut -d' ' -f1)
+          echo "SR model: revision \`$SR_MODEL_REV\`, Hugging Face commit \`${MODEL_COMMIT:-unknown}\`, sha256 \`$MODEL_SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ -n "$SR_MODEL_SHA256" ] && [ "$MODEL_SHA" != "$SR_MODEL_SHA256" ]; then
+            echo "::error::SR model sha256 $MODEL_SHA does not match the pinned $SR_MODEL_SHA256"; exit 1; fi
           # fixed-size copies of the SR model for the NPU (native player), one per source class (360p..660p);
           # each takes the video at its own size and returns 2560x1440 (the NPU scales the 4x result to the screen)
           pip install --quiet --only-binary=:all: onnx pillow
@@ -50,9 +65,14 @@ jobs:
             done && [ -s "$RUNNER_TEMP/calib.rgb" ] &&
             for S in $SIZES; do
               python3 "$GITHUB_WORKSPACE/tools/quantize_qnn.py" model/realesr-x4v3-$S.onnx "$RUNNER_TEMP/calib.rgb" model/realesr-x4v3-$S-a16w8.onnx 640x360 || exit 1; done &&
-            rm -f model/*.pre.onnx ) || { echo "::warning::quantized models skipped"; rm -f model/*-a16w8.onnx model/*.pre.onnx; }
+            rm -f model/*.pre.onnx &&
+            echo "A16W8 quantized NPU models: built" >> "$GITHUB_STEP_SUMMARY" ) ||
+            { echo "::warning::quantized models skipped"; rm -f model/*-a16w8.onnx model/*.pre.onnx
+              echo "**A16W8 quantized NPU models: skipped** (calibration or quantization failed; this APK uses the fp16 NPU models)" >> "$GITHUB_STEP_SUMMARY"; }
           # ad/tracker host list (StevenBlack/hosts, MIT), bundled so blocking needs no network at runtime
           # + HaGeZi Pro (GPL-3.0): covers the pop-under / redirect ad networks used by movie sites
+          # the block lists are deliberately NOT pinned: each build should ship the freshest lists (new ad domains
+          # appear daily), so two builds of the same commit may differ here
           { curl -fsSL https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts \
               | awk '$1=="0.0.0.0" && $2!="0.0.0.0" {print tolower($2)}'
             curl -fsSL https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/pro-onlydomains.txt \
@@ -65,9 +85,25 @@ jobs:
           ls -la ort model adhosts.txt adulthosts.txt
       - uses: gradle/actions/setup-gradle@v5
         with: { gradle-version: '8.10.2' }
+      - name: Signing key from secrets (skipped unless SIGNING_STORE_B64 exists)
+        if: env.HAS_SIGNING_KEY == 'true'
+        env:
+          SIGNING_STORE_B64: ${{ secrets.SIGNING_STORE_B64 }}
+        run: |
+          echo "$SIGNING_STORE_B64" | base64 -d > "$RUNNER_TEMP/signing.jks"
+          echo "SIGNING_STORE_FILE=$RUNNER_TEMP/signing.jks" >> "$GITHUB_ENV"
+          echo "APK signed with the owner's key from the SIGNING_* secrets" >> "$GITHUB_STEP_SUMMARY"
       - name: Build debug APK
         working-directory: android
+        env:
+          # read by app/build.gradle.kts only when SIGNING_STORE_FILE was set by the step above
+          SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.SIGNING_KEY_PASSWORD }}
         run: gradle --no-daemon assembleDebug -Pvc=${{ github.run_number }}
+      - name: Remove decoded signing key
+        if: always() && env.HAS_SIGNING_KEY == 'true'
+        run: rm -f "$RUNNER_TEMP/signing.jks"
       - name: Stage APK (outside the workspace; its path contains '..')
         run: |
           mkdir -p "$RUNNER_TEMP/apk"
@@ -85,6 +121,14 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release delete latest --yes --cleanup-tag --repo "$GITHUB_REPOSITORY" || true
-          gh release create latest "$RUNNER_TEMP/apk/ai-browser-debug.apk" --repo "$GITHUB_REPOSITORY" \
-            --title "AI Browser (debug APK)" --notes "Debug build for Android. Install and allow unknown sources." --prerelease
+          # the release is never deleted, so the phone's download link keeps working during the update:
+          # first run creates it; later runs move the tag to this commit and replace the APK in place
+          NOTES="Debug build for Android (commit $GITHUB_SHA, run ${{ github.run_number }}). Install and allow unknown sources."
+          if gh release view latest --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/latest" -f sha="$GITHUB_SHA" -F force=true > /dev/null
+            gh release upload latest "$RUNNER_TEMP/apk/ai-browser-debug.apk" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit latest --repo "$GITHUB_REPOSITORY" --notes "$NOTES"
+          else
+            gh release create latest "$RUNNER_TEMP/apk/ai-browser-debug.apk" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "AI Browser (debug APK)" --notes "$NOTES" --prerelease
+          fi

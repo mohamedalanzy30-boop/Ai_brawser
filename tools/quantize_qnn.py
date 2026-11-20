@@ -72,7 +72,7 @@ run(pre(src, 'real'), dst, Reader(name, []), cache)
 
 m = onnx.load(dst)
 # The quantizer also quantizes Resize's 'scales' constant ([1,1,4,4]); its dequantized value is a hair off 4, which shifts the
-# nearest-neighbour base image the network adds its detail to: colour fringes / purple cast, worse than no AI at all (tools/sr_eval.py).
+# nearest-neighbour base image the network adds its detail to: colour fringes / purple cast, worse than no AI at all (measured with tools/sr_eval.py, which lives on the sr-eval branch, not on main).
 # Put the exact float scales back.
 src_m = onnx.load(src)
 orig = {n.output[0]: numpy_helper.to_array(n.attribute[0].t) for n in src_m.graph.node if n.op_type == 'Constant'}
