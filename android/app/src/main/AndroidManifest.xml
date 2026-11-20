@@ -9,10 +9,10 @@
         android:largeHeap="true"
         android:supportsRtl="true"
         android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+        <!-- standard launch mode: singleTask closed the native player and the file chooser whenever the launcher icon was tapped -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:launchMode="singleTask"
             android:colorMode="wideColorGamut"
             android:supportsPictureInPicture="true"
             android:resizeableActivity="true"
@@ -22,6 +22,16 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+        </activity>
+        <!-- links from other apps: an invisible step that passes them to the browser's own task (taskAffinity "" so this
+             step, which is hidden from recents, never becomes the root of the browser's task) -->
+        <activity
+            android:name=".LinkActivity"
+            android:exported="true"
+            android:taskAffinity=""
+            android:noHistory="true"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.NoDisplay">
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
