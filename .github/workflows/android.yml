@@ -2,13 +2,15 @@ name: Build Android APK
 on:
   push:
     branches: [main]
-    paths: ['android/**', 'engine-tests/**', '.github/workflows/android.yml']
+    paths: ['android/**', 'engine-tests/**', 'tools/**', '.github/workflows/android.yml']
   workflow_dispatch:
 # read-only by default; only the release job below gets write access
 permissions:
   contents: read
+# one queue per trigger: GitHub keeps only the newest waiting run of a group, so with one shared group
+# a push could cancel a manual release that was waiting its turn
 concurrency:
-  group: apk-build
+  group: apk-build-${{ github.event_name }}
   cancel-in-progress: false
 jobs:
   # in-page engine tests (engine.js) in headless Chromium, see engine-tests/
@@ -94,30 +96,32 @@ jobs:
             | grep -v '^#' | tr 'A-Z' 'a-z' | grep -E '^[a-z0-9.-]+$' | sort -u > adulthosts.txt \
             || { echo "::warning::adult list skipped"; : > adulthosts.txt; }
           ls -la ort model adhosts.txt adulthosts.txt
+      - uses: gradle/actions/setup-gradle@v5
+        with: { gradle-version: '8.10.2' }
       # optional private signing key from repo secrets; without AIB_KEYSTORE_BASE64 the committed debug.keystore is used
-      # (see signingConfigs in android/app/build.gradle.kts: switching keys means one uninstall on the phone)
-      - name: Use private signing key (if configured)
+      # (see signingConfigs in android/app/build.gradle.kts: switching keys means one uninstall on the phone).
+      # The secrets go to this step only: written to $GITHUB_ENV they reached every later step and post-job hook too.
+      - name: Build debug APK
+        working-directory: android
         env:
           AIB_KEYSTORE_BASE64: ${{ secrets.AIB_KEYSTORE_BASE64 }}
           AIB_KEYSTORE_PASSWORD: ${{ secrets.AIB_KEYSTORE_PASSWORD }}
           AIB_KEY_ALIAS: ${{ secrets.AIB_KEY_ALIAS }}
           AIB_KEY_PASSWORD: ${{ secrets.AIB_KEY_PASSWORD }}
         run: |
-          if [ -z "$AIB_KEYSTORE_BASE64" ]; then echo "no private key configured: signing with the committed debug.keystore"; exit 0; fi
-          # half-configured secrets would quietly fall back to the public key, so stop instead
-          for V in AIB_KEYSTORE_PASSWORD AIB_KEY_ALIAS AIB_KEY_PASSWORD; do
-            [ -n "${!V}" ] || { echo "::error::secret $V is missing (needed with AIB_KEYSTORE_BASE64)"; exit 1; }; done
-          printf '%s' "$AIB_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/aib.keystore"
-          { echo "AIB_KEYSTORE_FILE=$RUNNER_TEMP/aib.keystore"
-            echo "AIB_KEYSTORE_PASSWORD=$AIB_KEYSTORE_PASSWORD"
-            echo "AIB_KEY_ALIAS=$AIB_KEY_ALIAS"
-            echo "AIB_KEY_PASSWORD=$AIB_KEY_PASSWORD"; } >> "$GITHUB_ENV"
-          echo "signing with the private key from secrets"
-      - uses: gradle/actions/setup-gradle@v5
-        with: { gradle-version: '8.10.2' }
-      - name: Build debug APK
-        working-directory: android
-        run: gradle --no-daemon assembleDebug -Pvc=${{ github.run_number }}
+          if [ -n "$AIB_KEYSTORE_BASE64" ]; then
+            # half-configured secrets would quietly fall back to the public key, so stop instead
+            for V in AIB_KEYSTORE_PASSWORD AIB_KEY_ALIAS AIB_KEY_PASSWORD; do
+              [ -n "${!V}" ] || { echo "::error::secret $V is missing (needed with AIB_KEYSTORE_BASE64)"; exit 1; }; done
+            # the key file is gone again when this step ends, whether the build worked or not
+            trap 'rm -f "$RUNNER_TEMP/aib.keystore"' EXIT
+            printf '%s' "$AIB_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/aib.keystore"
+            export AIB_KEYSTORE_FILE="$RUNNER_TEMP/aib.keystore"
+            echo "signing with the private key from secrets"
+          else
+            echo "no private key configured: signing with the committed debug.keystore"
+          fi
+          gradle --no-daemon assembleDebug -Pvc=${{ github.run_number }}
       - name: Stage APK (outside the workspace; its path contains '..')
         run: |
           mkdir -p "$RUNNER_TEMP/apk"
@@ -132,7 +136,7 @@ jobs:
   # pushes only check that the app builds; the phone download is updated only when Basil asks
   # (Actions -> Build Android APK -> Run workflow)
   release:
-    needs: build
+    needs: [build, engine-tests] # a failing engine test never reaches the phone
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
@@ -151,16 +155,27 @@ jobs:
           TITLE="AI Browser (debug APK)"
           NOTES="Debug build 0.1.${{ github.run_number }} for Android. Install and allow unknown sources."
           if gh release view latest --repo "$REPO" >/dev/null 2>&1; then
-            # replace the APK without ever leaving the release empty: upload under a temporary name first,
-            # then drop the old file and rename the new one (if the upload fails, the old APK is still there)
+            # replace the APK without ever breaking the download link: upload under a temporary name first, move the old
+            # file aside, give the new one the real name (putting the old one back if that fails), only then delete the old one
             cp "$APK" "$RUNNER_TEMP/apk/ai-browser-debug.new.apk"
             gh release upload latest "$RUNNER_TEMP/apk/ai-browser-debug.new.apk" --clobber --repo "$REPO"
             ASSETS=$(gh api "repos/$REPO/releases/tags/latest" --jq '.assets[] | "\(.id) \(.name)"')
             NEW=$(echo "$ASSETS" | awk '$2=="ai-browser-debug.new.apk" {print $1}')
             OLD=$(echo "$ASSETS" | awk '$2=="ai-browser-debug.apk" {print $1}')
+            STALE=$(echo "$ASSETS" | awk '$2=="ai-browser-debug.old.apk" {print $1}')
             test -n "$NEW"
+            # left behind by a run that stopped half-way; it would block moving the old file aside
+            if [ -n "$STALE" ]; then gh api -X DELETE "repos/$REPO/releases/assets/$STALE"; fi
+            if [ -n "$OLD" ]; then gh api -X PATCH "repos/$REPO/releases/assets/$OLD" -f name=ai-browser-debug.old.apk >/dev/null; fi
+            if ! gh api -X PATCH "repos/$REPO/releases/assets/$NEW" -f name=ai-browser-debug.apk >/dev/null; then
+              if [ -n "$OLD" ]; then gh api -X PATCH "repos/$REPO/releases/assets/$OLD" -f name=ai-browser-debug.apk >/dev/null; fi
+              echo "::error::could not rename the new APK; the previous one is still the download"; exit 1
+            fi
             if [ -n "$OLD" ]; then gh api -X DELETE "repos/$REPO/releases/assets/$OLD"; fi
-            gh api -X PATCH "repos/$REPO/releases/assets/$NEW" -f name=ai-browser-debug.apk >/dev/null
+            # the tag still pointed at the first release's commit: move it to the commit this APK was built from
+            # (a warning only: the new APK is already the download by now)
+            gh api -X PATCH "repos/$REPO/git/refs/tags/latest" -f sha="$GITHUB_SHA" -F force=true >/dev/null \
+              || echo "::warning::could not move the latest tag to $GITHUB_SHA"
             gh release edit latest --repo "$REPO" --title "$TITLE" --notes "$NOTES" --prerelease
           else
             gh release create latest "$APK" --repo "$REPO" --target "$GITHUB_SHA" \

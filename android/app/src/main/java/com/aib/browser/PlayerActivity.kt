@@ -57,6 +57,8 @@ class PlayerActivity : Activity() {
         const val MAX_IN_W = 1174; const val MAX_IN_H = 660
         val log = ArrayDeque<String>()
         fun addLog(s: String) = synchronized(log) { log.addLast(s); while (log.size > 60) log.removeFirst() }
+        // one NPU compile at a time in the whole app, shared by every Renderer (see Renderer.load)
+        private val compileLock = Any()
     }
 
     private lateinit var player: ExoPlayer
@@ -541,20 +543,29 @@ class PlayerActivity : Activity() {
                 // (a re-calibrated quantized model always has the same size) used to keep running the old compiled model
                 val sum = java.util.zip.CRC32().apply { update(bytes) }.value
                 val ctxFile = java.io.File(ctx.filesDir, "$tag${bytes.size}_${java.lang.Long.toHexString(sum)}.onnx")
-                ctx.filesDir.listFiles { f -> f.name.startsWith(tag) && f.name != ctxFile.name }?.forEach { it.delete() }
                 try {
                     fun opts(dump: Boolean) = OrtSession.SessionOptions().apply {
                         setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
                         // the few layers the NPU cannot run (seen on the phone: the float model) run on the CPU instead of failing the whole model
-                        // first run compiles the graph for the NPU (slow) and saves it; later runs load the saved one
-                        if (dump) { addConfigEntry("ep.context_enable", "1"); addConfigEntry("ep.context_file_path", ctxFile.absolutePath) }
+                        // first run compiles the graph for the NPU (slow) and saves it; later runs load the saved one.
+                        // embed mode 1 puts the compiled NPU graph inside that one file: by default ORT writes it to a separate
+                        // .bin next to it, which the cleanup below deleted every time, so the saved copy never loaded
+                        if (dump) { addConfigEntry("ep.context_enable", "1"); addConfigEntry("ep.context_file_path", ctxFile.absolutePath); addConfigEntry("ep.context_embed_mode", "1") }
                         addQnn(mapOf("backend_path" to "libQnnHtp.so", "htp_performance_mode" to "burst", "htp_graph_finalization_optimization_mode" to "3") + (if (t == "npu") mapOf("enable_htp_fp16_precision" to "1") else emptyMap()))
                     }
-                    val t0 = System.currentTimeMillis()
-                    val s = if (ctxFile.exists() && ctxFile.length() > 0)
-                        try { e.createSession(ctxFile.absolutePath, opts(false)) } catch (x: Exception) { ctxFile.delete(); e.createSession(bytes, opts(true)) }
-                    else e.createSession(bytes, opts(true))
-                    addLog("[player] SR ${b.w}x${b.h} session on $t in ${System.currentTimeMillis() - t0}ms")
+                    // a second player (surface recreated mid-compile: back to the app, PiP) would otherwise compile the same model
+                    // alongside this one, delete its fresh files and write the same file; after waiting it just loads the saved copy
+                    val s = synchronized(compileLock) {
+                        if (stopped) return // this player closed while another one was compiling
+                        // older compiled copies of this model, and the separate .bin files older app versions wrote
+                        ctx.filesDir.listFiles { f -> f.name.startsWith(tag) && f.name != ctxFile.name }?.forEach { it.delete() }
+                        val t0 = System.currentTimeMillis()
+                        val made = if (ctxFile.exists() && ctxFile.length() > 0)
+                            try { e.createSession(ctxFile.absolutePath, opts(false)) } catch (x: Exception) { ctxFile.delete(); e.createSession(bytes, opts(true)) }
+                        else e.createSession(bytes, opts(true))
+                        addLog("[player] SR ${b.w}x${b.h} session on $t in ${System.currentTimeMillis() - t0}ms")
+                        made
+                    }
                     if (stopped) { s.close(); return } // the player closed while the model was compiling
                     val ib = ByteBuffer.allocateDirect(3 * b.w * b.h * 4).order(ByteOrder.nativeOrder()).asFloatBuffer()
                     val tin = OnnxTensor.createTensor(e, ib, longArrayOf(1, 3, b.h.toLong(), b.w.toLong()))
@@ -571,15 +582,33 @@ class PlayerActivity : Activity() {
                     val finished = try { done.await(20, java.util.concurrent.TimeUnit.SECONDS) } catch (x: InterruptedException) {
                         try { done.await(20, java.util.concurrent.TimeUnit.SECONDS) } catch (y: InterruptedException) { false }
                     }
-                    if (!finished) { b.state = "idle"; return } // test still running on the render thread: closing now could crash it
+                    if (!finished) {
+                        // test still running on the render thread (NPU stuck): closing now could crash it, so close it there once
+                        // the test lets go. "slow", not "idle": idle made the next frame start another 20 s test (frozen picture, leak)
+                        addLog("[player] SR ${b.w}x${b.h} test on $t did not finish in 20 s: not used")
+                        b.state = "slow"
+                        // post refused = stop() already ran there, and a test still queued sees `stopped` and never touches s
+                        if (!h.post { s.close(); tin.close() }) { s.close(); tin.close() }
+                        return
+                    }
                     if (stopped) { s.close(); tin.close(); b.state = "idle"; return }
                     addLog("[player] SR ${b.w}x${b.h} test run on $t: ${testMs}ms per frame")
                     if (testMs > 55) { // slower than a 24 fps movie needs: never stutter, a smaller model or the GPU path takes over
                         s.close(); tin.close(); b.testMs = testMs; b.state = "slow"; return
                     }
-                    b.session = s; b.inBuf = ib; b.inTensor = tin; b.backend = t; b.testMs = testMs; b.state = "ready"
-                    // keep at most two compiled models in memory (ABR streams switch between two sizes)
-                    buckets.filter { it !== b && it.session != null }.sortedBy { it.lastUsed }.dropLast(1).forEach { o -> h.post { if (cur !== o) { o.close(); o.state = "idle" } } }
+                    // hand the model over on the render thread: stop() runs there too, so either it closes this session with the
+                    // others or this sees `stopped` and closes it (set from here, a session could land after stop() and stay open)
+                    val published = h.post {
+                        if (stopped) { s.close(); tin.close(); b.state = "idle" }
+                        else {
+                            b.session = s; b.inBuf = ib; b.inTensor = tin; b.backend = t; b.testMs = testMs; b.state = "ready"
+                            // keep at most two compiled models in memory (ABR streams switch between two sizes);
+                            // only "ready" ones: a model that just failed or went slow must not become "idle" (= loaded again)
+                            buckets.filter { it !== b && it.session != null }.sortedBy { it.lastUsed }.dropLast(1)
+                                .forEach { o -> if (cur !== o && o.state == "ready") { o.close(); o.state = "idle" } }
+                        }
+                    }
+                    if (!published) { s.close(); tin.close() } // render thread already gone (player closed)
                     return
                 } catch (x: InterruptedException) { return // player closing: keep the compiled copy
                 } catch (x: Throwable) { addLog("[player] SR ${b.w}x${b.h} on $t failed: ${x.message?.take(200)}"); ctxFile.delete() }
