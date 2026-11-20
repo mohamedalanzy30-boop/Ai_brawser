@@ -45,18 +45,20 @@ run('critical: images vs video context, paused video vs neural model', async () 
   await page.close() // one page at a time: a page left open in front keeps the next one's video frames from ticking
 
   // ---- 2) paused video: the model runs once for the paused frame, then stays idle
-  const stubPage = async (delayMs, play, file, noGuard) => { // ONNX Runtime stand-in: counts model runs, returns a 4x picture after delayMs
+  const stubPage = async (delayMs, play, file, noGuard, gpu) => { // ONNX Runtime stand-in: counts model runs, returns a 4x picture after delayMs
     const p = await browser.newPage({ viewport: { width: 800, height: 500 } })
     await p.route('https://appassets.min.local/**', r => r.fulfill({ body: Buffer.from('fake'), headers: { 'access-control-allow-origin': '*' } }))
     await p.route('https://test.local/', r => r.fulfill({ contentType: 'text/html', body: '<body style="margin:0;height:3000px"><video id=v style="width:640px;height:360px;display:block"></video></body>' }))
     await p.addInitScript((delay) => {
-      window.__runs = 0
+      window.__runs = 0; window.__runAt = []
       window.ort = {
         env: { wasm: {} },
         Tensor: function (type, data, dims) { this.type = type; this.data = data; this.dims = dims },
-        InferenceSession: { create: async () => ({ inputNames: ['x'], outputNames: ['y'], run: async (f) => { window.__runs++; const d = f.x.dims; if (delay) await new Promise(r => setTimeout(r, delay)); return { y: { data: new Float32Array(3 * d[2] * 4 * d[3] * 4) } } } }) }
+        InferenceSession: { create: async () => ({ inputNames: ['x'], outputNames: ['y'], run: async (f) => { window.__runs++; window.__runAt.push(performance.now()); const d = f.x.dims; if (delay) await new Promise(r => setTimeout(r, delay)); return { y: { data: new Float32Array(3 * d[2] * 4 * d[3] * 4) } } } }) }
       }
     }, delayMs)
+    // this browser has no WebGPU adapter (the model would run on the wasm backend); a stand-in adapter makes it 'webgpu'
+    if (gpu) await p.addInitScript(() => Object.defineProperty(navigator, 'gpu', { configurable: true, value: { requestAdapter: async () => ({}) } }))
     // the performance guard pauses the model for 20 s when the page is busy; on a loaded test machine it can do that at
     // any time, so a check that is not about the guard switches its long-task watcher off
     if (noGuard) await p.addInitScript(() => { const PO = window.PerformanceObserver; window.PerformanceObserver = function (cb) { const o = new PO(cb); return { observe (x) { if (!(x && x.entryTypes && x.entryTypes.includes('longtask'))) o.observe(x) }, disconnect () { o.disconnect() } } } })
@@ -92,10 +94,19 @@ run('critical: images vs video context, paused video vs neural model', async () 
   check('paused after playing: at most one more model run', e - d <= 1, { runsWhilePaused: e - d })
   await p2.close()
 
-  // ---- 3) a model too slow for live video is not given up for good: tried again every 5 s
-  const p3 = await stubPage(60, true, false, true)
-  await p3.waitForTimeout(12500)
-  const n = await p3.evaluate(() => ({ runs: window.__runs, guard: window.__minEnhance.guard.noNeural }))
-  check('slow model: re-checked every 5 s while playing (not every frame, not never)', n.runs >= 2 && n.runs <= 5, { runsIn12s: n.runs, guardPaused: n.guard })
+  // ---- 3) a model too slow for live video (100 ms a frame at 30 fps). On WebGPU it is not given up for good: tried again
+  // after 5 s, then twice as long after each slow try (5 s, 10 s, 20 s ...). On the wasm backend it is never tried again:
+  // wasm runs on the page's main thread, and every try froze the film for the whole run.
+  const p3 = await stubPage(100, true, false, true, true)
+  await p3.waitForTimeout(20000)
+  const n = await p3.evaluate(() => ({ nn: window.__minEnhance.state.stats.nn, at: window.__runAt.map(Math.round), guard: (window.__minEnhance.guard || {}).noNeural }))
+  const gaps = n.at.slice(1).map((t, i) => Math.round((t - n.at[i]) / 100) / 10)
+  check('slow model on WebGPU: first run, then re-checked after 5 s and again 10 s later (not every frame, not every 5 s, not never)',
+    n.nn === 'ready:webgpu' && n.at.length === 3 && gaps[0] >= 4.9 && gaps[0] < 9 && gaps[1] >= 9.9 && gaps[1] < 15, { backend: n.nn, gapsSeconds: gaps, guardPaused: n.guard })
+  await p3.close()
+  const p4 = await stubPage(100, true, false, true, false)
+  await p4.waitForTimeout(9000)
+  const m = await p4.evaluate(() => ({ nn: window.__minEnhance.state.stats.nn, runs: window.__runs }))
+  check('slow model on wasm (main thread): measured once, never re-checked while playing', m.nn === 'ready:wasm' && m.runs === 1, m)
   await browser.close()
 })

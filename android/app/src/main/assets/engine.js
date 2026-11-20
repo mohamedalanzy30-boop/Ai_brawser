@@ -127,6 +127,14 @@ void main(){
   function makeRenderer (canvas) {
     const gl = canvas.getContext('webgl2', { alpha: false, antialias: false, preserveDrawingBuffer: true, powerPreference: 'high-performance' })
     if (!gl) return null
+    // a renderer that fails half-built (a shader the driver rejects, a context lost meanwhile) is never returned, so nobody
+    // could free its context: free it here, or every failed attempt would keep one of the page's few contexts
+    try { return buildRenderer(gl, canvas) } catch (e) {
+      try { const x = gl.getExtension('WEBGL_lose_context'); if (x) x.loseContext() } catch (e2) { /* already lost */ }
+      throw e
+    }
+  }
+  function buildRenderer (gl, canvas) {
     const R = { gl, canvas, w: 0, h: 0 }
     R.planesP = program(gl, FS_PLANES, VS_FBO); R.main = program(gl, FS_MAIN)
     const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf)
@@ -204,7 +212,7 @@ void main(){
   /* ---------------- neural 4x via ONNX Runtime Web (in page) ---------------- */
   function nnInit () {
     if (state.nn || !window.ort) { if (!window.ort) state.stats.nn = 'ort-missing'; return }
-    const nn = state.nn = { session: null, busy: false, last: null, ms: 0, id: 0, rid: 0, runs: 0, lastProbe: 0 }
+    const nn = state.nn = { session: null, busy: false, last: null, ms: 0, id: 0, rid: 0, runs: 0, lastProbe: 0, probeEvery: 5000 }
     state.stats.nn = 'loading'
     const ort = window.ort
     ort.env.wasm.wasmPaths = HOST + 'ort/'; ort.env.wasm.numThreads = 1
@@ -220,21 +228,34 @@ void main(){
     })().catch((e) => { state.stats.nn = 'error'; log('neural SR load failed:', String(e)) })
   }
   const grab = document.createElement('canvas'); const grabCtx = grab.getContext('2d', { willReadFrequently: true })
+  // Each video keeps its own last model result: one shared result was shown on another paused video at the same time
+  // and size, or two paused videos took turns running the model forever.
+  const nnOut = new WeakMap()
+  // Picture source generation of each video, counted up when the element gets a new source (emptied / loadeddata):
+  // a result or a paused picture of the previous source never stands for the new one. Kept outside the per-video state,
+  // which is rebuilt when a video is detached and attached again.
+  const gens = new WeakMap(); const gen = (v) => gens.get(v) || 0
+  // Videos from another site without CORS can never be read (frame copy and GPU upload throw SecurityError). Remembered
+  // with their source, so they neither switch the model off for the whole page nor get a new GPU context on every scan.
+  const tainted = new WeakMap(); const isTainted = (v) => tainted.has(v) && tainted.get(v) === (v.currentSrc || '')
   async function nnRun (video, vw, vh, probe) {
     const nn = state.nn; nn.busy = true
     try {
       grab.width = vw; grab.height = vh; grabCtx.drawImage(video, 0, 0, vw, vh)
       const d = grabCtx.getImageData(0, 0, vw, vh).data; const px = vw * vh; const inp = new Float32Array(3 * px)
       for (let i = 0, j = 0; i < px; i++, j += 4) { inp[i] = d[j] / 255; inp[px + i] = d[j + 1] / 255; inp[2 * px + i] = d[j + 2] / 255 }
-      const mt = video.currentTime; const t0 = performance.now()
+      const mt = video.currentTime; const g = gen(video); const paused = video.paused; const t0 = performance.now()
       const out = await nn.session.run({ [nn.session.inputNames[0]]: new window.ort.Tensor('float32', inp, [1, 3, vh, vw]) })
       // the first runs include the backend warm-up, and a probe after a slow spell must be able to switch the model back on:
       // both take the new time as it is instead of averaging it with a stale one
       const ms = performance.now() - t0; nn.runs++
       nn.ms = (nn.runs <= 2 || probe || !nn.ms) ? ms : nn.ms * 0.7 + ms * 0.3
       const o = out[nn.session.outputNames[0]].data; const ow = vw * 4; const oh = vh * 4 // Float32 NCHW, converted on the GPU
-      nn.last = { mediaTime: mt, w: ow, h: oh, planes: o, id: ++nn.rid }
-    } catch (e) { state.stats.nn = 'error'; log('SR inference failed:', String(e)) } finally { nn.busy = false }
+      const res = { mediaTime: mt, w: ow, h: oh, planes: o, id: ++nn.rid, gen: g, paused }
+      nnOut.set(video, res); nn.last = Object.assign({}, res) // nn.last: the newest result of any video (diagnostics)
+    } catch (e) {
+      if (e && e.name === 'SecurityError') { tainted.set(video, video.currentSrc || ''); log('SR: video from another site without CORS, not readable') } else { state.stats.nn = 'error'; log('SR inference failed:', String(e)) }
+    } finally { nn.busy = false }
   }
 
   /* ---------------- video ---------------- */
@@ -269,12 +290,28 @@ void main(){
   const hooked = new WeakSet()
   function attach (video) {
     if (video.mediaKeys) { log('DRM video skipped'); return }
-    if (state.videos.has(video)) return
-    const st = { canvas: null, R: null, running: false, prevOpacity: video.style.opacity, errors: 0, frame: 0, tone: { lo: 0, hi: 1, contrast: 0.22, sat: 1.1, gamma: 1 }, lastT: 0, fpsEMA: 30, lost: 0, noGl: 0, idleSince: 0, drawn: '' }
+    if (state.videos.has(video) || isTainted(video)) return
+    const st = { canvas: null, R: null, running: false, prevOpacity: video.style.opacity, hid: false, errors: 0, frame: 0, tone: { lo: 0, hi: 1, contrast: 0.22, sat: 1.1, gamma: 1 }, lastT: 0, fpsEMA: 30, lost: 0, noGl: 0, idleSince: 0, goodSince: 0, drawn: '' }
     state.videos.set(video, st)
-    if (!hooked.has(video)) { hooked.add(video); video.addEventListener('play', () => { const s = state.videos.get(video); if (s) { s.fpsEMA = 30; s.lastT = 0 } loop(video) }) }
+    if (!hooked.has(video)) {
+      hooked.add(video)
+      video.addEventListener('play', () => { const s = state.videos.get(video); if (s) { s.fpsEMA = 30; s.lastT = 0 } loop(video) })
+      const newSource = () => gens.set(video, gen(video) + 1)
+      video.addEventListener('emptied', newSource)
+      // a video given up as unreadable may get a readable source now (a scan alone would not notice: only the src changed)
+      video.addEventListener('loadeddata', () => { newSource(); if (cfg.enabled && video.isConnected && !state.videos.has(video)) attach(video) })
+    }
     loop(video)
   }
+  /* The page's video is hidden (opacity 0) while our overlay shows it. The site may set its own opacity at any time (fade in
+     when it starts playing, ...), so its value is saved right before each hide, and put back only if we hid the video:
+     a value saved once at the start was put back later and left the film invisible with no overlay. */
+  function hideVideo (video, st) {
+    const cur = video.style.opacity
+    if (!st.hid || cur !== '0') { st.prevOpacity = cur; st.hid = true } // first hide, or the site changed it since
+    video.style.opacity = '0'
+  }
+  function showVideo (video, st) { if (st.hid) { video.style.opacity = st.prevOpacity; st.hid = false } }
   function ensureR (video, st) {
     if (st.R) return true
     const now = performance.now()
@@ -291,7 +328,7 @@ void main(){
     try { R = makeRenderer(canvas) } catch (e) { log('enhance: shader error', String(e)) }
     if (!R) { st.noGl = now + 10000; log('WebGL2 unavailable for this video, trying again in 10 s'); return false }
     canvas.addEventListener('webglcontextlost', (e) => { e.preventDefault(); if (st.R && st.R.canvas === canvas) dropR(video, st, 'GPU context lost') })
-    st.canvas = canvas; st.R = R; st.drawn = ''; host().appendChild(canvas)
+    st.canvas = canvas; st.R = R; st.drawn = ''; st.goodSince = now; host().appendChild(canvas)
     return true
   }
   /** gives the page its own video back and frees the GPU context; [why] = it died (retried later, at most 3 times) */
@@ -299,13 +336,13 @@ void main(){
     if (!st.R) return
     const R = st.R; st.R = null
     st.canvas.remove(); st.canvas = null; st.nnId = 0; st.drawn = ''
-    video.style.opacity = st.prevOpacity
+    showVideo(video, st)
     try { R.dispose() } catch (e) { /* already lost */ }
     if (why) { st.lost++; st.noGl = st.lost > 3 ? Infinity : performance.now() + 1000; log('video overlay removed:', why, st.lost > 3 ? '(enhancement off for this video)' : '(retrying)') }
   }
   function detach (video) {
     const st = state.videos.get(video); if (!st) return
-    dropR(video, st); video.style.opacity = st.prevOpacity; state.videos.delete(video)
+    dropR(video, st); showVideo(video, st); state.videos.delete(video)
   }
   function loop (video) {
     const st = state.videos.get(video); if (!st || st.running) return
@@ -332,18 +369,23 @@ void main(){
       if (state.videos.get(video) !== st || !cfg.enabled) { st.running = false; return }
       const rect = video.getBoundingClientRect(); const vw = video.videoWidth; const vh = video.videoHeight; const dpr = window.devicePixelRatio || 1
       const wantH = Math.min(effTarget(), fitRect(video, rect, vw, vh).height * dpr)
-      const visible = vw > 0 && video.readyState >= 2 && rect.width > 40 && rect.height > 40 && rect.bottom > 0 && rect.top < window.innerHeight && !document.hidden
+      // In fullscreen only the fullscreen element is on screen. A video outside it is not (its overlay, moved into the
+      // fullscreen element, was drawn over the film), and the <video> element itself in fullscreen cannot show the overlay
+      // (children of a <video> are never drawn): the film was a black screen. The page shows its own video then.
+      const fsEl = document.fullscreenElement || document.webkitFullscreenElement
+      const onScreen = !fsEl || (fsEl !== video && fsEl.contains(video))
+      const visible = vw > 0 && video.readyState >= 2 && rect.width > 40 && rect.height > 40 && rect.bottom > 0 && rect.top < window.innerHeight && !document.hidden && onScreen
       const why = !visible ? 'hidden/not-ready' : (vh >= wantH * 0.95 ? 'source already >= target' : 'enhancing')
       if (st.why !== why) { st.why = why; log('video', vw + 'x' + vh, 'shown=' + Math.round(rect.width) + 'x' + Math.round(rect.height) + 'css', 'wantH=' + Math.round(wantH), '=>', why, 'frame=' + (window.top === window ? 'TOP' : 'FRAME')) }
       if (!(visible && vh < wantH * 0.95)) {
         if (st.canvas) st.canvas.style.display = 'none'
-        video.style.opacity = st.prevOpacity
+        showVideo(video, st)
         if (!st.idleSince) st.idleSince = now
         else if (st.R && now - st.idleSince > 8000) dropR(video, st) // not enhanced for 8 s: give the context back
         next(tick); return
       }
       st.idleSince = 0
-      if (!ensureR(video, st) || st.R.gl.isContextLost()) { if (st.R) dropR(video, st, 'GPU context lost'); video.style.opacity = st.prevOpacity; next(tick); return }
+      if (!ensureR(video, st) || st.R.gl.isContextLost()) { if (st.R) dropR(video, st, 'GPU context lost'); showVideo(video, st); next(tick); return }
       const fr = fitRect(video, rect, vw, vh)
       const [w, h] = outSize(vw, vh, fr)
       if (st.canvas.width !== w || st.canvas.height !== h) { st.canvas.width = w; st.canvas.height = h; st.drawn = '' }
@@ -356,33 +398,48 @@ void main(){
           if (!video.paused) st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
         }
         const nnLiveOk = vh <= 660 // 360p..660p get the neural 4x path at their own size (the result is scaled to the screen); bigger sources use the shader path
-        const wantNN = cfg.neural && (video.paused || (!guard.noNeural && nnLiveOk)) && vh <= 660 && state.nn && state.nn.session && state.stats.nn !== 'error'
+        const wantNN = cfg.neural && (video.paused || (!guard.noNeural && nnLiveOk)) && vh <= 660 && state.nn && state.nn.session && state.stats.nn !== 'error' && !isTainted(video)
         if (cfg.neural && vh <= 660) nnInit()
         // Neural frames are only shown when they are consistent: exact frame while paused, or when the
         // model keeps up with the video (always one steady frame late). Never mix stale and live frames.
         const nnS = state.nn; const T = 1000 / Math.max(st.fpsEMA, 1)
         const fast = !!nnS && nnS.ms > 0 && nnS.ms < 0.6 * T
-        const r = nnS && nnS.last
-        const pausedFrameDone = video.paused && r && r.w === vw * 4 && Math.abs(r.mediaTime - video.currentTime) < 0.05
-        // paused: the model runs once for the paused frame, then rests until the picture changes (seek, new source)
-        // too slow for this video: tried again every 5 s (warm-up, a busy moment or a smaller video can make it fast enough)
-        const probe = !video.paused && !fast && nnS && nnS.ms > 0 && now - nnS.lastProbe > 5000
-        if (wantNN && !nnS.busy && (video.paused ? !pausedFrameDone : (fast || !nnS.ms || probe))) { nnS.lastProbe = now; nnRun(video, vw, vh, probe) }
-        const fresh = wantNN && r && r.w === vw * 4 && (video.paused ? pausedFrameDone : fast && Math.abs(r.mediaTime - video.currentTime) < 3 * T / 1000)
+        if (fast) nnS.probeEvery = 5000
+        // this video's own result, of its current source, still on its GPU texture or still held to upload
+        const g = gen(video); const r = nnOut.get(video)
+        const usable = !!r && r.gen === g && r.w === vw * 4 && (st.nnId === r.id || !!r.planes)
+        // paused: the model runs once for the paused frame (a result from playback is a frame or more earlier), then rests
+        // until the picture changes (seek, new source)
+        const pausedFrameDone = video.paused && usable && r.paused && Math.abs(r.mediaTime - video.currentTime) < 0.05
+        // too slow for this video: tried again now and then (warm-up or a busy moment may have made it look slow), 5 s,
+        // then twice as long after each slow try up to 60 s. Never with the wasm backend: it runs on the page's main thread
+        // and froze the film for the whole run each time.
+        const probe = !video.paused && !fast && nnS && nnS.ms > 0 && nnS.backend !== 'wasm' && now - nnS.lastProbe > nnS.probeEvery
+        if (wantNN && !nnS.busy && (video.paused ? !pausedFrameDone : (fast || !nnS.ms || probe))) {
+          if (probe) nnS.probeEvery = Math.min(60000, nnS.probeEvery * 2)
+          nnS.lastProbe = now; nnRun(video, vw, vh, probe)
+        }
+        const fresh = wantNN && usable && (video.paused ? pausedFrameDone : fast && Math.abs(r.mediaTime - video.currentTime) < 3 * T / 1000)
         // a paused picture that is already on the overlay is not uploaded, analysed and drawn again 4 times a second
-        const key = video.paused ? [video.currentTime, w, h, fresh ? 'nn' + r.id : 'cur', cfg.tone, cfg.sharpness, cfg.denoise].join('|') : ''
+        const key = video.paused ? [g, vw, vh, video.currentTime, w, h, fresh ? 'nn' + r.id : 'cur', cfg.tone, cfg.sharpness, cfg.denoise].join('|') : ''
         if (!key || key !== st.drawn) {
           st.R.resize(vw, vh); st.R.upload(video); st.frame++
           if (cfg.tone && (st.frame % 3 === 1 || video.paused)) analyseTone(st, video) // every 3rd frame (each read copies the video frame to the CPU): scene cuts still snap within ~0.1 s
           const tone = cfg.tone ? st.tone : { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }
           if (fresh) {
-            if (st.nnId !== r.id) { st.R.uploadPlanes(r.planes, r.w, r.h); st.nnId = r.id }
+            if (st.nnId !== r.id) { st.R.uploadPlanes(r.planes, r.w, r.h); st.nnId = r.id; r.planes = null } // on the GPU now: no CPU copy kept per video
             st.R.draw('nn', vw, vh, tone, cfg.sharpness * 0.3)
           } else st.R.draw('cur', vw, vh, tone, cfg.sharpness)
           st.drawn = key
         }
-        video.style.opacity = '0'; st.errors = 0
-      } catch (e) { if (++st.errors > 3) { log('video disabled (', String(e), ') src=', (video.currentSrc || '').slice(0, 80)); detach(video); st.running = false; return } }
+        hideVideo(video, st); st.errors = 0
+        if (st.lost && now - st.goodSince > 60000) st.lost = 0 // a minute of good drawing: earlier losses (app switches, ...) are forgiven
+      } catch (e) {
+        if (e && e.name === 'SecurityError') { // another site's video without CORS: can never be enhanced, given up at once
+          tainted.set(video, video.currentSrc || ''); log('video from another site without CORS skipped:', (video.currentSrc || '').slice(0, 80)); detach(video); st.running = false; return
+        }
+        if (++st.errors > 3) { log('video disabled (', String(e), ') src=', (video.currentSrc || '').slice(0, 80)); detach(video); st.running = false; return }
+      }
       next(tick)
     }
     tick()
@@ -400,6 +457,16 @@ void main(){
     try { return new URL(src, location.href).origin === location.origin || img.crossOrigin != null } catch (e) { return false }
   }
   function releaseImgR () { if (imgR) { try { imgR.dispose() } catch (e) { /* lost */ } imgR = null } }
+  // The enhanced copy is opaque: see-through parts of an image (logos, icons, cut-out photos) came out black. Such images
+  // are left alone; a 64x64 copy is enough to find them (readable() was checked first, so it can be read back).
+  const alphaCanvas = document.createElement('canvas'); alphaCanvas.width = 64; alphaCanvas.height = 64
+  const alphaCtx = alphaCanvas.getContext('2d', { willReadFrequently: true })
+  function opaque (img) {
+    alphaCtx.clearRect(0, 0, 64, 64); alphaCtx.drawImage(img, 0, 0, 64, 64)
+    const d = alphaCtx.getImageData(0, 0, 64, 64).data
+    for (let i = 3; i < d.length; i += 4) if (d[i] < 255) return false
+    return true
+  }
   /** calls done(true) when the image was replaced by its enhanced copy, done(false) otherwise */
   function upscaleImage (img, done) {
     if (doneImages.has(img) || !img.complete || !img.naturalWidth || img.dataset.minEnhanced) return done(false)
@@ -410,14 +477,21 @@ void main(){
     const pic = img.parentElement && img.parentElement.tagName === 'PICTURE' && img.parentElement.querySelector('source')
     if (!readable(img) || pic) return done(false) // other site without CORS / <picture> sources would win over our copy
     try {
+      if (!opaque(img)) return done(false)
       if (!imgR || imgR.gl.isContextLost()) { releaseImgR(); imgR = makeRenderer(document.createElement('canvas')); if (!imgR) return done(false) }
       const R = imgR; const scale = Math.min(4, Math.ceil(wantW / img.naturalWidth))
       R.canvas.width = img.naturalWidth * scale; R.canvas.height = img.naturalHeight * scale
       R.resize(img.naturalWidth, img.naturalHeight); R.upload(img)
       R.draw('cur', img.naturalWidth, img.naturalHeight, { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }, cfg.sharpness)
+      // the site may give the <img> another picture while the copy is encoded (a lazy loader swapping its placeholder for
+      // the real image): the copy of the old picture must not replace the new one; the new one is looked at on a later scan
+      const src0 = img.src; const cur0 = img.currentSrc; const set0 = img.getAttribute('srcset')
       R.canvas.toBlob(b => {
-        if (b && img.isConnected) { img.dataset.minEnhanced = '1'; img.removeAttribute('srcset'); img.src = URL.createObjectURL(b) }
-        done(!!b)
+        const same = img.src === src0 && img.currentSrc === cur0 && img.getAttribute('srcset') === set0
+        if (!same) doneImages.delete(img)
+        const ok = !!b && same && img.isConnected
+        if (ok) { img.dataset.minEnhanced = '1'; img.removeAttribute('srcset'); img.src = URL.createObjectURL(b) }
+        done(ok)
       }, 'image/webp', 0.92)
     } catch (e) { done(false) } // unreadable after all (tainted)
   }
