@@ -34,8 +34,11 @@
   // off until the page is reloaded, so the phone never stays overloaded.
   const guard = { noNeural: false, strikes: 0, retryAt: 0, off: false }
   const longTasks = []
-  try { new PerformanceObserver(l => { for (const e of l.getEntries()) longTasks.push([e.startTime, e.duration]) }).observe({ entryTypes: ['longtask'] }) } catch (e) { /* unsupported */ }
+  // live list: the periodic jobs below return at once in frames without any video (most ad and widget iframes)
+  const videoEls = document.getElementsByTagName('video')
+  try { new PerformanceObserver(l => { if (videoEls.length) for (const e of l.getEntries()) longTasks.push([e.startTime, e.duration]) }).observe({ entryTypes: ['longtask'] }) } catch (e) { /* unsupported */ }
   setInterval(() => {
+    if (!videoEls.length && !state.videos.size) { longTasks.length = 0; return }
     const now = performance.now()
     while (longTasks.length && now - longTasks[0][0] > 3000) longTasks.shift()
     const busy = longTasks.reduce((a, t) => a + t[1], 0)
@@ -147,13 +150,16 @@ void main(){
     }
     R.uploadPlanes = function (data, w, h) { // Float32 NCHW (3 planes) straight to the GPU; converted by a shader
       const n = w * h
-      if (!R.texP || R.pw !== w || R.ph !== h) {
-        R.texP = [0, 1, 2].map(() => texture(gl, 0, 0, gl.NEAREST)); R.pw = w; R.ph = h
+      if (!R.texP) R.texP = [0, 1, 2].map(() => texture(gl, 0, 0, gl.NEAREST))
+      if (R.pw !== w || R.ph !== h) {
+        R.pw = w; R.ph = h
         R.bind(0, R.texNN); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null)
       }
       gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1)
       for (let i = 0; i < 3; i++) { R.bind(i, R.texP[i]); gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, w, h, 0, gl.RED, gl.FLOAT, data.subarray(i * n, (i + 1) * n)) }
       R.pass(R.planesP, R.texNN, w, h, u => { gl.uniform1i(u.pr, 0); gl.uniform1i(u.pg, 1); gl.uniform1i(u.pb, 2) })
+      // the float planes are only needed for this conversion: shrink them (3 x 50 MB of GPU memory at 660p)
+      for (let i = 0; i < 3; i++) { R.bind(i, R.texP[i]); gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, 1, 1, 0, gl.RED, gl.FLOAT, null) }
     }
     // which: 'cur' (current video frame) | 'nn' (neural 4x output). Only the current frame is ever shown:
     // nothing is blended with earlier frames, so motion can never leave a trail.
@@ -220,7 +226,7 @@ void main(){
     })().catch((e) => { state.stats.nn = 'error'; log('neural SR load failed:', String(e)) })
   }
   const grab = document.createElement('canvas'); const grabCtx = grab.getContext('2d', { willReadFrequently: true })
-  async function nnRun (video, vw, vh) {
+  async function nnRun (video, vw, vh) { // the result's Float32 planes are dropped once uploaded to the GPU
     const nn = state.nn; nn.busy = true
     try {
       grab.width = vw; grab.height = vh; grabCtx.drawImage(video, 0, 0, vw, vh)
@@ -230,7 +236,7 @@ void main(){
       const out = await nn.session.run({ [nn.session.inputNames[0]]: new window.ort.Tensor('float32', inp, [1, 3, vh, vw]) })
       nn.ms = nn.ms ? nn.ms * 0.7 + (performance.now() - t0) * 0.3 : performance.now() - t0
       const o = out[nn.session.outputNames[0]].data; const ow = vw * 4; const oh = vh * 4 // Float32 NCHW, converted on the GPU
-      nn.last = { mediaTime: mt, w: ow, h: oh, planes: o, id: ++nn.rid }
+      nn.last = state.videos.has(video) ? { video, mediaTime: mt, w: ow, h: oh, planes: o, id: ++nn.rid } : null
     } catch (e) { state.stats.nn = 'error'; log('SR inference failed:', String(e)) } finally { nn.busy = false }
   }
 
@@ -259,7 +265,7 @@ void main(){
   document.addEventListener('webkitfullscreenchange', () => state.videos.forEach(st => host().appendChild(st.canvas)))
   function attach (video) {
     if (video.mediaKeys) { log('DRM video skipped'); return }
-    if (state.videos.has(video) || state.failed) return
+    if (state.videos.has(video) || state.failed || lostVideos.has(video)) return
     const canvas = document.createElement('canvas')
     canvas.style.cssText = 'position:fixed;pointer-events:none;z-index:2147483646;display:none'
     let R
@@ -267,22 +273,32 @@ void main(){
     if (!R) { state.failed = true; log('WebGL2 unavailable'); return }
     const st = { canvas, R, running: false, prevOpacity: video.style.opacity, errors: 0, frame: 0, tone: { lo: 0, hi: 1, contrast: 0.22, sat: 1.1, gamma: 1 }, lastT: 0, fpsEMA: 30 }
     state.videos.set(video, st); host().appendChild(canvas)
-    video.addEventListener('play', () => { st.fpsEMA = 30; st.lastT = 0; loop(video) }); loop(video)
+    // the browser may drop the context (GPU reset, too many contexts): show the real video again, never a dead canvas
+    canvas.addEventListener('webglcontextlost', () => { if (state.videos.get(video) === st) lost(video) })
+    video.addEventListener('play', () => { st.fpsEMA = 30; st.lastT = 0; loop(video) })
+    // a frame callback pending at pause never fires (no new frame): switch to the paused timer, so the paused
+    // frame still gets its neural pass
+    video.addEventListener('pause', () => { if (st.vfc != null && state.videos.get(video) === st) { video.cancelVideoFrameCallback(st.vfc); st.vfc = null; st.resume() } })
+    loop(video)
   }
   function detach (video) {
     const st = state.videos.get(video); if (!st) return
-    st.canvas.remove(); st.R.dispose(); video.style.opacity = st.prevOpacity; state.videos.delete(video)
+    state.videos.delete(video); st.canvas.remove(); st.R.dispose(); video.style.opacity = st.prevOpacity
+    if (state.nn && state.nn.last && state.nn.last.video === video) state.nn.last = null
   }
+  const lostVideos = new WeakSet() // their WebGL context was lost: left to the browser for the rest of the page
+  function lost (video) { log('video renderer context lost, showing the original video'); lostVideos.add(video); detach(video) }
   function loop (video) {
     const st = state.videos.get(video); if (!st || st.running) return
     st.running = true
     const next = (cb) => {
-      if (video.requestVideoFrameCallback && !video.paused) video.requestVideoFrameCallback(cb)
+      if (video.requestVideoFrameCallback && !video.paused) st.vfc = video.requestVideoFrameCallback((n, m) => { st.vfc = null; cb(n, m) })
       else setTimeout(() => requestAnimationFrame(cb), video.paused ? 250 : 16)
     }
     const tick = (now, meta) => {
       if (video.mediaKeys) { detach(video); st.running = false; return }
       if (!state.videos.has(video) || !cfg.enabled) { st.running = false; return }
+      if (st.R.gl.isContextLost()) { lost(video); st.running = false; return }
       const rect = video.getBoundingClientRect(); const vw = video.videoWidth; const vh = video.videoHeight; const dpr = window.devicePixelRatio || 1
       const wantH = Math.min(effTarget(), fitRect(video, rect, vw, vh).height * dpr)
       const visible = vw > 0 && video.readyState >= 2 && rect.width > 40 && rect.height > 40 && rect.bottom > 0 && rect.top < window.innerHeight && !document.hidden
@@ -307,36 +323,64 @@ void main(){
         // model keeps up with the video (always one steady frame late). Never mix stale and live frames.
         const nnS = state.nn; const T = 1000 / Math.max(st.fpsEMA, 1)
         const fast = !!nnS && nnS.ms > 0 && nnS.ms < 0.6 * T
-        if (wantNN && !nnS.busy && (video.paused || fast || !nnS.ms)) { nnS.lastProbe = performance.now(); nnRun(video, vw, vh) }
+        // while paused the model runs once per shown frame (a seek or a new size gives a new frame), not over and over
+        const frameKey = video.paused ? video.currentTime + ':' + vw + 'x' + vh : ''
+        if (!video.paused) st.nnKey = ''
+        if (wantNN && !nnS.busy && (video.paused ? st.nnKey !== frameKey && !video.seeking : fast || !nnS.ms)) { nnS.lastProbe = performance.now(); st.nnKey = frameKey; nnRun(video, vw, vh) }
         const r = nnS && nnS.last
-        const fresh = wantNN && r && r.w === vw * 4 && (video.paused ? Math.abs(r.mediaTime - video.currentTime) < 0.05 : fast && Math.abs(r.mediaTime - video.currentTime) < 3 * T / 1000)
+        const fresh = wantNN && r && r.video === video && r.w === vw * 4 && (r.planes || st.nnId === r.id) &&
+          (video.paused ? Math.abs(r.mediaTime - video.currentTime) < 0.05 : fast && Math.abs(r.mediaTime - video.currentTime) < 3 * T / 1000)
         if (fresh) {
-          if (st.nnId !== r.id) { st.R.uploadPlanes(r.planes, r.w, r.h); st.nnId = r.id }
+          if (st.nnId !== r.id) { st.R.uploadPlanes(r.planes, r.w, r.h); st.nnId = r.id; r.planes = null } // now on the GPU: free the Float32 copy
           st.R.draw('nn', vw, vh, tone, cfg.sharpness * 0.3)
-        } else st.R.draw('cur', vw, vh, tone, cfg.sharpness)
+        } else {
+          // a playing video never goes back to a stale result: free it (~150 MB of Float32 at 660p)
+          if (r && r.video === video && !video.paused) nnS.last = null
+          st.R.draw('cur', vw, vh, tone, cfg.sharpness)
+        }
         video.style.opacity = '0'; st.errors = 0
       } catch (e) { if (++st.errors > 3) { log('video disabled (', String(e), ') src=', (video.currentSrc || '').slice(0, 80)); detach(video); st.running = false; return } }
       next(tick)
     }
+    st.resume = () => next(tick)
     tick(performance.now())
   }
 
   /* ---------------- images ---------------- */
-  const doneImages = new WeakSet()
-  function upscaleImage (img) {
-    if (doneImages.has(img) || !img.complete || !img.naturalWidth || img.dataset.minEnhanced) return
+  // All images share ONE WebGL renderer: a context per image used up the browser's limit (16), and then the
+  // oldest context, the video's, was dropped.
+  const doneImages = new WeakMap() // img -> the source it was processed for
+  const imgKey = (img) => img.currentSrc + '\n' + img.src + '\n' + (img.getAttribute('srcset') || '')
+  let imgR = null
+  function imageRenderer () {
+    if (imgR && !imgR.gl.isContextLost()) return imgR
+    try { imgR = makeRenderer(document.createElement('canvas')) } catch (e) { imgR = null }
+    return imgR
+  }
+  function readable (img) { // pixels of a cross-origin image without CORS cannot be read (WebGL throws)
+    if (img.crossOrigin != null) return true // CORS request: it only loads if the server allowed it
+    try { const u = new URL(img.currentSrc || img.src, location.href); return u.protocol === 'data:' || u.protocol === 'blob:' || u.origin === location.origin } catch (e) { return false }
+  }
+  function upscaleImage (img) { // returns true when the image was upscaled
+    const key = imgKey(img)
+    if (doneImages.get(img) === key || !img.complete || !img.naturalWidth || img.dataset.minEnhanced) return false
     const rect = img.getBoundingClientRect(); const dpr = window.devicePixelRatio || 1
     const wantW = Math.min(rect.width * dpr, effTarget() * (img.naturalWidth / img.naturalHeight))
-    if (rect.width < 80 || img.naturalWidth >= wantW * 0.9 || img.naturalWidth * img.naturalHeight > 4e6) return
-    doneImages.add(img)
+    if (rect.width < 80 || img.naturalWidth >= wantW * 0.9 || img.naturalWidth * img.naturalHeight > 4e6) return false
+    doneImages.set(img, key)
+    if (!readable(img)) return false
+    const R = imageRenderer(); if (!R) return false
+    const scale = Math.min(4, Math.ceil(wantW / img.naturalWidth)); const w = img.naturalWidth * scale; const h = img.naturalHeight * scale
+    const out = document.createElement('canvas'); out.width = w; out.height = h
     try {
-      const scale = Math.min(4, Math.ceil(wantW / img.naturalWidth)); const canvas = document.createElement('canvas')
-      canvas.width = img.naturalWidth * scale; canvas.height = img.naturalHeight * scale
-      const R = makeRenderer(canvas); if (!R) return
+      R.canvas.width = w; R.canvas.height = h
       R.resize(img.naturalWidth, img.naturalHeight); R.upload(img)
       R.draw('cur', img.naturalWidth, img.naturalHeight, { lo: 0, hi: 0, contrast: 0, sat: 1, gamma: 1 }, cfg.sharpness)
-      canvas.toBlob(b => { R.dispose(); if (b) { img.dataset.minEnhanced = '1'; img.removeAttribute('srcset'); img.src = URL.createObjectURL(b) } }, 'image/webp', 0.92)
-    } catch (e) { /* tainted cross-origin image */ }
+      out.getContext('2d').drawImage(R.canvas, 0, 0) // copied now: the shared canvas is reused for the next image
+    } catch (e) { return false /* tainted (e.g. redirected cross-origin) image */ } finally { R.canvas.width = R.canvas.height = 1 }
+    // a lazy loader may swap the picture while it is encoded: only replace the source that was upscaled
+    out.toBlob(b => { if (b && imgKey(img) === key && !img.dataset.minEnhanced) { img.dataset.minEnhanced = '1'; img.removeAttribute('srcset'); img.src = URL.createObjectURL(b) } }, 'image/webp', 0.92)
+    return true
   }
 
   /* ---------------- fullscreen button (like Samsung Internet) ---------------- */
@@ -503,8 +547,8 @@ void main(){
   // tell the app when a video plays here (enables PiP on Home and the ad-redirect guard)
   let reported = false
   setInterval(() => {
-    if (!NATIVE) return
-    const v = Array.from(document.querySelectorAll('video')).find(x => !x.paused && !x.ended && x.readyState >= 2 && x.videoWidth > 0)
+    if (!NATIVE || (!videoEls.length && !reported)) return
+    const v = Array.from(videoEls).find(x => !x.paused && !x.ended && x.readyState >= 2 && x.videoWidth > 0)
     if (v) { NATIVE.playing(true, v.videoWidth, v.videoHeight); reported = true } else if (reported) { NATIVE.playing(false, 0, 0); reported = false }
     // where the film is, so reopening the browser after Android closed it continues from there
     if (v && v.duration >= 120 && NATIVE.position) try { NATIVE.position(v.currentTime, v.duration) } catch (err) { /* ignore */ }
@@ -512,8 +556,9 @@ void main(){
 
   function updateFsButton () {
     if (locked) return
+    if (!videoEls.length && ctl.style.display === 'none' && fsBtn.style.display === 'none') return
     let best = null; let area = 0
-    document.querySelectorAll('video').forEach(v => {
+    Array.prototype.forEach.call(videoEls, v => {
       const r = v.getBoundingClientRect()
       if (r.width < 200 || r.height < 110 || r.bottom <= 0 || r.top >= window.innerHeight || v.readyState < 2 || v.ended) return
       if (r.width * r.height > area) { best = v; area = r.width * r.height }
@@ -550,8 +595,8 @@ void main(){
     const step = () => {
       const img = imgQueue.shift()
       if (!img || imgDone >= 40 || !cfg.images || !cfg.enabled) { imgPumping = false; imgQueue.length = 0; return }
-      if (!doneImages.has(img)) { upscaleImage(img); if (doneImages.has(img)) imgDone++ }
-      setTimeout(step, doneImages.has(img) ? 120 : 0)
+      const did = upscaleImage(img); if (did) imgDone++
+      setTimeout(step, did ? 120 : 0)
     }
     step()
   }
