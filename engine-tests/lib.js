@@ -19,9 +19,9 @@ function run (title, body) {
   body().then(() => process.exit(failures ? 1 : 0), e => { console.log('  FAIL crashed: ' + (e && e.stack || e)); process.exit(1) })
 }
 /** in-page: a <video> fed by a canvas stream (no media file needed). page.evaluate passes one argument: the video id,
- *  or { id, w, h, split (red top / blue bottom), duration (fake, seconds; a stream is otherwise endless) } */
+ *  or { id, w, h, split (red top / blue bottom), duration (fake, seconds; a stream is otherwise endless), play (false = left paused) } */
 function canvasVideo (a) {
-  const o = Object.assign({ w: 160, h: 90, split: false, duration: 0 }, typeof a === 'string' ? { id: a } : a)
+  const o = Object.assign({ w: 160, h: 90, split: false, duration: 0, play: true }, typeof a === 'string' ? { id: a } : a)
   const v = document.getElementById(o.id); const c = document.createElement('canvas'); c.width = o.w; c.height = o.h
   const x = c.getContext('2d'); let t = 0
   setInterval(() => {
@@ -30,7 +30,22 @@ function canvasVideo (a) {
     x.fillStyle = '#0f0'; x.fillRect(t % (o.w - 4), 0, 4, 4) // something moves, so the stream keeps sending frames
   }, 33)
   if (o.duration) Object.defineProperty(v, 'duration', { configurable: true, get: () => o.duration })
-  v.muted = true; v.srcObject = c.captureStream(30); return v.play().catch(() => {}) // the engine may pause it at once (hand-over)
+  v.muted = true; v.srcObject = c.captureStream(30)
+  return o.play ? v.play().catch(() => {}) : null // the engine may pause it at once (hand-over)
+}
+/** in-page: a <video> playing a real (looping) webm file, recorded here from a canvas: behaves like a site's video file
+ *  (unlike a live stream, a paused file video sends no more frames). One argument: id, or { id, seconds, play }. */
+async function fileVideo (a) {
+  const o = Object.assign({ seconds: 2, play: false }, typeof a === 'string' ? { id: a } : a)
+  const c = document.createElement('canvas'); c.width = 160; c.height = 90; const x = c.getContext('2d'); let t = 0
+  const iv = setInterval(() => { t++; x.fillStyle = '#48c'; x.fillRect(0, 0, 160, 90); x.fillStyle = '#0f0'; x.fillRect(t % 150, 0, 6, 6) }, 33)
+  const rec = new MediaRecorder(c.captureStream(30), { mimeType: 'video/webm' }); const parts = []
+  rec.ondataavailable = e => parts.push(e.data); rec.start()
+  await new Promise(r => setTimeout(r, o.seconds * 1000)); rec.stop(); await new Promise(r => { rec.onstop = r }); clearInterval(iv)
+  const v = document.getElementById(o.id); v.muted = true; v.loop = true; v.preload = 'auto'
+  v.src = URL.createObjectURL(new Blob(parts, { type: 'video/webm' }))
+  await new Promise(r => { if (v.readyState >= 2) r(); else v.addEventListener('loadeddata', r, { once: true }) })
+  if (o.play) await v.play().catch(() => {})
 }
 /** serve the app's asset host: ONNX Runtime from node_modules, the fake model for every model path */
 async function routeAssets (page) {
@@ -42,4 +57,4 @@ async function routeAssets (page) {
   })
 }
 const ortScript = () => fs.readFileSync(path.join(ORT_DIR, 'ort.wasm.min.js'), 'utf8')
-module.exports = { ENGINE, ORT_DIR, FAKE_X4, launch, run, check, canvasVideo, routeAssets, ortScript, fs, path }
+module.exports = { ENGINE, ORT_DIR, FAKE_X4, launch, run, check, canvasVideo, fileVideo, routeAssets, ortScript, fs, path }

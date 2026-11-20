@@ -310,11 +310,23 @@ void main(){
   function loop (video) {
     const st = state.videos.get(video); if (!st || st.running) return
     st.running = true
+    // Next tick on the next video frame; but a video that gets no new frame (paused after playing, buffering, stalled)
+    // never fires that callback, which froze the loop: the overlay stayed where it was while the page scrolled the
+    // (hidden) video away. So a timer takes over when no frame came for 300 ms; whichever fires first runs the tick.
     const next = (cb) => {
-      if (video.requestVideoFrameCallback && !video.paused) video.requestVideoFrameCallback(cb)
-      else setTimeout(() => requestAnimationFrame(cb), video.paused ? 250 : 16)
+      let done = false; let vfc = null; let t = 0
+      const run = (frame) => { // frame: a new video frame (counts for the frame rate), not a timer tick
+        if (done) return
+        done = true; clearTimeout(t)
+        if (vfc !== null) { try { video.cancelVideoFrameCallback(vfc) } catch (e) { /* ignore */ } vfc = null }
+        cb(frame)
+      }
+      if (video.requestVideoFrameCallback && !video.paused) {
+        vfc = video.requestVideoFrameCallback(() => { vfc = null; run(true) })
+        t = setTimeout(() => requestAnimationFrame(() => run(false)), 300)
+      } else t = setTimeout(() => requestAnimationFrame(() => run(!video.paused)), video.paused ? 250 : 16)
     }
-    const tick = () => {
+    const tick = (frame) => {
       const now = performance.now()
       if (video.mediaKeys || !video.isConnected) { detach(video); st.running = false; return } // DRM, or the page removed the video
       if (state.videos.get(video) !== st || !cfg.enabled) { st.running = false; return }
@@ -339,8 +351,10 @@ void main(){
       state.stats.fps = Math.round(st.fpsEMA)
       state.stats.active = Array.from(state.videos.values()).filter(x => x.canvas && x.canvas.style.display === 'block').length
       try {
-        const dt = st.lastT ? (now - st.lastT) : 33; st.lastT = now
-        if (!video.paused) st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
+        if (frame !== false) { // first tick (undefined) or a real frame
+          const dt = st.lastT ? (now - st.lastT) : 33; st.lastT = now
+          if (!video.paused) st.fpsEMA = st.fpsEMA * 0.9 + (1000 / Math.max(dt, 1)) * 0.1
+        }
         const nnLiveOk = vh <= 660 // 360p..660p get the neural 4x path at their own size (the result is scaled to the screen); bigger sources use the shader path
         const wantNN = cfg.neural && (video.paused || (!guard.noNeural && nnLiveOk)) && vh <= 660 && state.nn && state.nn.session && state.stats.nn !== 'error'
         if (cfg.neural && vh <= 660) nnInit()

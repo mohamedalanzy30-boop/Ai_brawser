@@ -2,7 +2,7 @@
 //  1) "Enhance images" on a page full of images from another site must never take the video's GPU context away
 //     (the video was left hidden under a dead overlay: a white box where the film should be).
 //  2) A paused video must not keep running the neural model on the same frame (battery and heat).
-const { ENGINE, launch, run, check, canvasVideo } = require('./lib')
+const { ENGINE, launch, run, check, canvasVideo, fileVideo } = require('./lib')
 
 run('critical: images vs video context, paused video vs neural model', async () => {
   const browser = await launch()
@@ -45,10 +45,10 @@ run('critical: images vs video context, paused video vs neural model', async () 
   await page.close() // one page at a time: a page left open in front keeps the next one's video frames from ticking
 
   // ---- 2) paused video: the model runs once for the paused frame, then stays idle
-  const stubPage = async (delayMs) => { // ONNX Runtime stand-in: counts model runs, returns a 4x picture after delayMs
+  const stubPage = async (delayMs, play, file) => { // ONNX Runtime stand-in: counts model runs, returns a 4x picture after delayMs
     const p = await browser.newPage({ viewport: { width: 800, height: 500 } })
     await p.route('https://appassets.min.local/**', r => r.fulfill({ body: Buffer.from('fake'), headers: { 'access-control-allow-origin': '*' } }))
-    await p.route('https://test.local/', r => r.fulfill({ contentType: 'text/html', body: '<body style="margin:0"><video id=v style="width:640px;height:360px"></video></body>' }))
+    await p.route('https://test.local/', r => r.fulfill({ contentType: 'text/html', body: '<body style="margin:0;height:3000px"><video id=v style="width:640px;height:360px;display:block"></video></body>' }))
     await p.addInitScript((delay) => {
       window.__runs = 0
       window.ort = {
@@ -58,28 +58,39 @@ run('critical: images vs video context, paused video vs neural model', async () 
       }
     }, delayMs)
     await p.goto('https://test.local/')
-    await p.evaluate(canvasVideo, 'v')
+    await p.evaluate(file ? fileVideo : canvasVideo, { id: 'v', play })
     await p.waitForFunction(() => document.getElementById('v').videoWidth > 0)
     await p.addScriptTag({ content: ENGINE })
     await p.evaluate(() => window.__minEnhanceSet({ enabled: true, neural: true, tone: false, images: false, target: 1080 }))
     return p
   }
-  const p2 = await stubPage(0)
-  await p2.waitForFunction(() => window.__runs > 5, null, { timeout: 15000 })
-  await p2.evaluate(() => document.getElementById('v').pause())
-  await p2.waitForTimeout(800)
-  const a = await p2.evaluate(() => window.__runs)
+  const runs = (p) => p.evaluate(() => window.__runs)
+  // the usual case in this browser (no autoplay): the video sits paused on the page. The old engine ran the model ~4 times a second on it.
+  const p2 = await stubPage(0, false, true) // a video file, like on a site
+  await p2.waitForTimeout(1500)
+  const a = await runs(p2)
   await p2.waitForTimeout(5000)
-  const b = await p2.evaluate(() => window.__runs)
-  check('paused 5 s: no repeated model runs on the same frame', b - a <= 1, { runsWhilePaused: b - a })
+  const b = await runs(p2)
+  check('paused video: one model run for its frame, none in the next 5 s', a >= 1 && b - a === 0, { first: a, next5s: b - a })
   await p2.evaluate(() => document.getElementById('v').play())
   await p2.waitForTimeout(1500)
-  const c = await p2.evaluate(() => window.__runs)
-  check('playing again: the model runs again', c - b > 3, { runsAfterPlay: c - b })
+  const c = await runs(p2)
+  check('playing: the model runs on the frames', c - b > 3, { runsAfterPlay: c - b })
+  // paused after playing, then scrolled: the overlay must follow the video (the loop used to wait for a frame that never came)
+  await p2.evaluate(() => document.getElementById('v').pause())
+  await p2.waitForTimeout(800)
+  const d = await runs(p2)
+  await p2.evaluate(() => window.scrollTo(0, 200))
+  await p2.waitForTimeout(1200)
+  const pos = await p2.evaluate(() => { const v = document.getElementById('v'); const st = window.__minEnhance.state.videos.get(v); return { overlayTop: st && st.canvas && parseFloat(st.canvas.style.top), videoTop: v.getBoundingClientRect().top } })
+  check('paused, then scrolled: the overlay follows the video', pos.overlayTop === pos.videoTop, pos)
+  await p2.waitForTimeout(3000)
+  const e = await runs(p2)
+  check('paused after playing: at most one more model run', e - d <= 1, { runsWhilePaused: e - d })
   await p2.close()
 
   // ---- 3) a model too slow for live video is not given up for good: tried again every 5 s
-  const p3 = await stubPage(60)
+  const p3 = await stubPage(60, true)
   await p3.waitForTimeout(12500)
   const n = await p3.evaluate(() => window.__runs)
   check('slow model: re-checked every 5 s while playing (not every frame, not never)', n >= 2 && n <= 5, { runsIn12s: n })
