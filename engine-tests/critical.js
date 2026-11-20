@@ -45,7 +45,7 @@ run('critical: images vs video context, paused video vs neural model', async () 
   await page.close() // one page at a time: a page left open in front keeps the next one's video frames from ticking
 
   // ---- 2) paused video: the model runs once for the paused frame, then stays idle
-  const stubPage = async (delayMs, play, file) => { // ONNX Runtime stand-in: counts model runs, returns a 4x picture after delayMs
+  const stubPage = async (delayMs, play, file, noGuard) => { // ONNX Runtime stand-in: counts model runs, returns a 4x picture after delayMs
     const p = await browser.newPage({ viewport: { width: 800, height: 500 } })
     await p.route('https://appassets.min.local/**', r => r.fulfill({ body: Buffer.from('fake'), headers: { 'access-control-allow-origin': '*' } }))
     await p.route('https://test.local/', r => r.fulfill({ contentType: 'text/html', body: '<body style="margin:0;height:3000px"><video id=v style="width:640px;height:360px;display:block"></video></body>' }))
@@ -57,6 +57,9 @@ run('critical: images vs video context, paused video vs neural model', async () 
         InferenceSession: { create: async () => ({ inputNames: ['x'], outputNames: ['y'], run: async (f) => { window.__runs++; const d = f.x.dims; if (delay) await new Promise(r => setTimeout(r, delay)); return { y: { data: new Float32Array(3 * d[2] * 4 * d[3] * 4) } } } }) }
       }
     }, delayMs)
+    // the performance guard pauses the model for 20 s when the page is busy; on a loaded test machine it can do that at
+    // any time, so a check that is not about the guard switches its long-task watcher off
+    if (noGuard) await p.addInitScript(() => { const PO = window.PerformanceObserver; window.PerformanceObserver = function (cb) { const o = new PO(cb); return { observe (x) { if (!(x && x.entryTypes && x.entryTypes.includes('longtask'))) o.observe(x) }, disconnect () { o.disconnect() } } } })
     await p.goto('https://test.local/')
     await p.evaluate(file ? fileVideo : canvasVideo, { id: 'v', play })
     await p.waitForFunction(() => document.getElementById('v').videoWidth > 0)
@@ -66,7 +69,7 @@ run('critical: images vs video context, paused video vs neural model', async () 
   }
   const runs = (p) => p.evaluate(() => window.__runs)
   // the usual case in this browser (no autoplay): the video sits paused on the page. The old engine ran the model ~4 times a second on it.
-  const p2 = await stubPage(0, false, true) // a video file, like on a site
+  const p2 = await stubPage(0, false, true, true) // a video file, like on a site
   await p2.waitForTimeout(1500)
   const a = await runs(p2)
   await p2.waitForTimeout(5000)
@@ -90,9 +93,9 @@ run('critical: images vs video context, paused video vs neural model', async () 
   await p2.close()
 
   // ---- 3) a model too slow for live video is not given up for good: tried again every 5 s
-  const p3 = await stubPage(60, true)
+  const p3 = await stubPage(60, true, false, true)
   await p3.waitForTimeout(12500)
-  const n = await p3.evaluate(() => window.__runs)
-  check('slow model: re-checked every 5 s while playing (not every frame, not never)', n >= 2 && n <= 5, { runsIn12s: n })
+  const n = await p3.evaluate(() => ({ runs: window.__runs, guard: window.__minEnhance.guard.noNeural }))
+  check('slow model: re-checked every 5 s while playing (not every frame, not never)', n.runs >= 2 && n.runs <= 5, { runsIn12s: n.runs, guardPaused: n.guard })
   await browser.close()
 })

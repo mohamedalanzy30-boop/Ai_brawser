@@ -662,7 +662,7 @@ void main(){
     Object.assign(cfg, c || {}); forward(c || {})
     if (cfg.enabled) { scan(); state.videos.forEach((_, v) => loop(v)) } else Array.from(state.videos.keys()).forEach(detach)
   }
-  window.__minEnhance = { cfg, state }
+  window.__minEnhance = { cfg, state, guard } // guard: diagnostics (log sheet, tests)
   log('init', window.top === window ? 'TOP' : 'FRAME', location.host, 'enabled=' + cfg.enabled, 'neural=' + cfg.neural, 'target=' + (cfg.target || 'auto'))
   if (window.top === window && navigator.gpu) navigator.gpu.requestAdapter().then(a => log('webgpu adapter:', a ? 'ok' : 'none')).catch(e => log('webgpu adapter error', String(e)))
   scan()
