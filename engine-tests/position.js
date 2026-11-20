@@ -1,0 +1,23 @@
+// Film position for "continue watching" / session restore: reported while the site's player plays, and the end of the
+// film is reported as the end (the app then forgets the position instead of reopening 20 s before the end).
+const { ENGINE, launch, run, check, canvasVideo } = require('./lib')
+run('position: playing position and film end reach the app', async () => {
+  const browser = await launch()
+  const page = await browser.newPage()
+  await page.route('https://test.local/', r => r.fulfill({ contentType: 'text/html', body: '<body><video id=v style="width:400px;height:225px"></video><video id=t style="width:400px;height:225px"></video></body>' }))
+  await page.addInitScript(() => { window.__pos = []; window.AIBNative = { playing () {}, position: (t, d) => window.__pos.push([Math.round(t), Math.round(d)]) } })
+  await page.goto('https://test.local/')
+  await page.addScriptTag({ content: ENGINE })
+  await page.evaluate(canvasVideo, { id: 'v', duration: 3600 })
+  await page.evaluate(() => { const v = document.getElementById('v'); Object.defineProperty(v, 'currentTime', { configurable: true, get: () => 1234, set () {} }) })
+  await page.waitForTimeout(1800)
+  const a = await page.evaluate(() => window.__pos.slice())
+  check('position reported while playing', a.some(p => p[0] === 1234 && p[1] === 3600), a)
+  await page.evaluate(() => { const v = document.getElementById('v'); v.pause(); v.dispatchEvent(new Event('ended')) })
+  const b = await page.evaluate(() => window.__pos[window.__pos.length - 1])
+  check('film end reported as position = duration', b && b[0] === 3600 && b[1] === 3600, b)
+  await page.evaluate(() => { const t = document.getElementById('t'); Object.defineProperty(t, 'duration', { get: () => 30 }); t.dispatchEvent(new Event('ended')) })
+  const c = await page.evaluate(() => window.__pos[window.__pos.length - 1])
+  check('a 30 s clip ending is not reported', c && c[1] === 3600, c)
+  await browser.close()
+})

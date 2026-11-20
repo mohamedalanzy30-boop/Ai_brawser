@@ -1,0 +1,20 @@
+# Python bytecode
+__pycache__/
+*.pyc
+# engine tests: dependencies and local output
+engine-tests/node_modules/
+engine-tests/*.png
+engine-tests/fixtures/*.webm
+# Android build output and local SDK path
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+# assets the CI build downloads (ONNX Runtime, models, block lists)
+android/app/src/main/assets/ort/
+android/app/src/main/assets/model/
+android/app/src/main/assets/adhosts.txt
+android/app/src/main/assets/adulthosts.txt
+# IDE
+.idea/
+*.iml

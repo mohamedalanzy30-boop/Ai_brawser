@@ -1,35 +1,32 @@
-// Orientation test: top half red, bottom half blue. Reads overlay pixels for each render path.
-const { chromium } = require('playwright'); const fs = require('fs'); const path = require('path')
-const ENGINE = path.resolve(__dirname, '../android/app/src/main/assets/engine.js')
-;(async () => {
-  const browser = await chromium.launch({ args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist', '--autoplay-policy=no-user-gesture-required'] })
+// Orientation and colours on both render paths (shader on the current frame, neural output): top half red, bottom half blue.
+// A flip anywhere (upload, render-to-texture, model planes) shows up as blue on top.
+const { ENGINE, launch, run, check, canvasVideo, routeAssets, ortScript } = require('./lib')
+run('orient: picture the right way up on every path', async () => {
+  const browser = await launch()
   const page = await browser.newPage({ viewport: { width: 800, height: 500 } })
-  const ortDir = '/home/user/min/node_modules/onnxruntime-web/dist'
-  await page.route('https://appassets.min.local/**', route => {
-    const q = new URL(route.request().url()).pathname; let f = null
-    if (q.startsWith('/ort/')) f = path.join(ortDir, q.slice(5)); else if (q.includes('rife')) f = '/home/user/scratch_test/fake_rife.onnx'; else if (q.startsWith('/model/')) f = '/home/user/scratch_test/fake_x4.onnx'
-    if (!f || !fs.existsSync(f)) return route.fulfill({ status: 404 })
-    route.fulfill({ body: fs.readFileSync(f), headers: { 'access-control-allow-origin': '*', 'content-type': f.endsWith('.wasm') ? 'application/wasm' : f.endsWith('.onnx') ? 'application/octet-stream' : 'text/javascript' } })
-  })
-  await page.route('https://test.local/', r => r.fulfill({ contentType: 'text/html', body: '<body style="margin:0"><video id=v muted autoplay style="width:640px;height:360px"></video></body>' }))
+  await routeAssets(page)
+  await page.route('https://test.local/', r => r.fulfill({ contentType: 'text/html', body: '<body style="margin:0"><video id=v style="width:640px;height:360px"></video></body>' }))
   await page.goto('https://test.local/')
-  await page.evaluate(() => {
-    const c = document.createElement('canvas'); c.width = 160; c.height = 90; const x = c.getContext('2d'); let t = 0
-    setInterval(() => { t++; x.fillStyle = '#f00'; x.fillRect(0, 0, 160, 45); x.fillStyle = '#00f'; x.fillRect(0, 45, 160, 45); x.fillStyle = '#0f0'; x.fillRect(t % 150, 0, 4, 4) }, 33)
-    const v = document.getElementById('v'); v.srcObject = c.captureStream(30); v.play()
-  })
+  await page.evaluate(canvasVideo, { id: 'v', split: true })
   await page.waitForFunction(() => document.getElementById('v').videoWidth > 0)
-  await page.addScriptTag({ content: fs.readFileSync(path.join(ortDir, 'ort.wasm.min.js'), 'utf8') })
-  await page.addScriptTag({ content: fs.readFileSync(ENGINE, 'utf8') })
+  await page.addScriptTag({ content: ortScript() })
+  await page.addScriptTag({ content: ENGINE })
   const probe = () => page.evaluate(() => {
-    const c = document.querySelector('canvas[style*="fixed"]'); if (!c) return 'no overlay'
+    const c = document.querySelector('canvas[style*="fixed"]'); if (!c || c.style.display !== 'block') return null
     const t = document.createElement('canvas'); t.width = c.width; t.height = c.height; const x = t.getContext('2d'); x.drawImage(c, 0, 0)
-    const top = x.getImageData(c.width / 2, 20, 1, 1).data, bot = x.getImageData(c.width / 2, c.height - 20, 1, 1).data
-    return 'top=' + Array.from(top).slice(0, 3) + ' bottom=' + Array.from(bot).slice(0, 3)
+    const st = window.__minEnhance.state.videos.get(document.getElementById('v'))
+    return { top: Array.from(x.getImageData(c.width / 2, 20, 1, 1).data).slice(0, 3), bottom: Array.from(x.getImageData(c.width / 2, c.height - 20, 1, 1).data).slice(0, 3), nnShown: !!(st && st.nnId), glError: st && st.R ? st.R.gl.getError() : -1 }
   })
-  for (const [name, c] of [['current frame', { neural: false, tone: false }], ['neural SR (nn)', { neural: true, tone: false }]]) {
-    await page.evaluate(c => window.__minEnhanceSet(Object.assign({ enabled: true, target: 1080 }, c)), c)
-    await page.waitForTimeout(name.startsWith('neural') ? 9000 : 2000); console.log(name.padEnd(22), await probe(), name.startsWith('neural SR') ? await page.evaluate(() => { const n = window.__minEnhance.state.nn; const c = document.querySelector('canvas[style*="fixed"]'); const gl = c.getContext('webgl2'); return ' planes=' + (n && n.last && n.last.planes && n.last.planes.constructor.name) + ' glError=' + (gl ? gl.getError() : 'n/a') }) : '')
-  }
+  const redTop = p => p && p.top[0] > 180 && p.top[2] < 80 && p.bottom[2] > 180 && p.bottom[0] < 80
+  await page.evaluate(() => window.__minEnhanceSet({ enabled: true, neural: false, tone: false, target: 1080 }))
+  await page.waitForTimeout(1500)
+  const a = await probe()
+  check('shader path: red on top, blue at the bottom', redTop(a) && a.glError === 0, a)
+  await page.evaluate(() => window.__minEnhanceSet({ neural: true }))
+  await page.waitForFunction(() => { const st = window.__minEnhance.state.videos.get(document.getElementById('v')); return st && st.nnId }, null, { timeout: 30000 }).catch(() => {})
+  await page.evaluate(() => document.getElementById('v').pause()) // the paused frame is always shown from the model
+  await page.waitForTimeout(2500)
+  const b = await probe()
+  check('neural path: model output shown, red on top, blue at the bottom', b && b.nnShown && redTop(b) && b.glError === 0, b)
   await browser.close()
-})()
+})
