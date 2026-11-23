@@ -103,6 +103,69 @@ void main(){
     float l=dot(r,vec3(.2126,.7152,.0722)); r=mix(vec3(l),r,tone.w); }
   o=vec4(clamp(r,0.,1.),1.); }`
 
+  /* Shader path (every frame when the neural model cannot keep up, and for images): AMD FidelityFX Super Resolution 1
+     (MIT licence), ported to WebGL2. EASU is an edge-adaptive Lanczos-like upscale: it follows the direction of each edge
+     instead of blurring across it like bicubic, so lines and text stay clean at 2-4x. RCAS then sharpens with a limit
+     that never pushes a pixel past its neighbours (no halos, no ringing). A light deblock runs before, at source size. */
+  const FS_DENOISE = `#version 300 es
+precision highp float; uniform sampler2D tex; uniform vec2 texSize; uniform float denoise; in vec2 uv; out vec4 o;
+void main(){
+  vec2 px=1.0/texSize; vec3 c=texture(tex,uv).rgb; vec3 acc=c; float ws=1.0; float k=denoise*224.0;
+  vec3 n[4]=vec3[4](texture(tex,uv+vec2(0.,-px.y)).rgb, texture(tex,uv+vec2(-px.x,0.)).rgb, texture(tex,uv+vec2(px.x,0.)).rgb, texture(tex,uv+vec2(0.,px.y)).rgb);
+  for(int i=0;i<4;i++){ float w=exp(-k*dot(n[i]-c,n[i]-c)); acc+=n[i]*w; ws+=w; }
+  o=vec4(mix(c,acc/ws,clamp(denoise*1.6,0.,1.)),1.); }`
+
+  const FS_EASU = `#version 300 es
+precision highp float; uniform sampler2D tex; uniform vec2 inSize, outSize; out vec4 o;
+vec3 F(vec2 p){ return texelFetch(tex, ivec2(clamp(p, vec2(0.), inSize-1.)), 0).rgb; }
+float L(vec3 c){ return c.b*0.5+(c.r*0.5+c.g); }
+void tap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp, vec3 c){
+  vec2 v=vec2(dot(off,dir), dot(off,vec2(-dir.y,dir.x)))*len;
+  float d2=min(dot(v,v),clp); float wB=0.4*d2-1.0; float wA=lob*d2-1.0;
+  wB*=wB; wA*=wA; wB=1.5625*wB-0.5625; float w=wB*wA; aC+=c*w; aW+=w; }
+void dirLen(inout vec2 dir, inout float len, float w, float a, float b, float c, float d, float e){
+  float lx=max(abs(d-c),abs(c-b)); float dx=d-b; dir.x+=dx*w; lx=clamp(abs(dx)/max(lx,1e-5),0.,1.); len+=lx*lx*w;
+  float ly=max(abs(e-c),abs(c-a)); float dy=e-a; dir.y+=dy*w; ly=clamp(abs(dy)/max(ly,1e-5),0.,1.); len+=ly*ly*w; }
+void main(){
+  vec2 pp=gl_FragCoord.xy*inSize/outSize-0.5; vec2 fp=floor(pp); pp-=fp;
+  vec3 b=F(fp+vec2(0,-1)), c=F(fp+vec2(1,-1)), e=F(fp+vec2(-1,0)), f=F(fp), g=F(fp+vec2(1,0)), h=F(fp+vec2(2,0)),
+       i=F(fp+vec2(-1,1)), j=F(fp+vec2(0,1)), k=F(fp+vec2(1,1)), l=F(fp+vec2(2,1)), n=F(fp+vec2(0,2)), oo=F(fp+vec2(1,2));
+  float bL=L(b),cL=L(c),eL=L(e),fL=L(f),gL=L(g),hL=L(h),iL=L(i),jL=L(j),kL=L(k),lL=L(l),nL=L(n),oL=L(oo);
+  vec2 dir=vec2(0.); float len=0.;
+  dirLen(dir,len,(1.-pp.x)*(1.-pp.y),bL,eL,fL,gL,jL); dirLen(dir,len,pp.x*(1.-pp.y),cL,fL,gL,hL,kL);
+  dirLen(dir,len,(1.-pp.x)*pp.y,fL,iL,jL,kL,nL); dirLen(dir,len,pp.x*pp.y,gL,jL,kL,lL,oL);
+  float r=dot(dir,dir); bool z=r<1.0/32768.0; dir=z?vec2(1.,0.):dir*inversesqrt(r);
+  len=len*0.5; len*=len;
+  float st=dot(dir,dir)/max(abs(dir.x),abs(dir.y)); vec2 len2=vec2(1.+(st-1.)*len, 1.-0.5*len);
+  float lob=0.5-0.29*len; float clp=1.0/lob;
+  vec3 aC=vec3(0.); float aW=0.;
+  tap(aC,aW,vec2(0,-1)-pp,dir,len2,lob,clp,b); tap(aC,aW,vec2(1,-1)-pp,dir,len2,lob,clp,c);
+  tap(aC,aW,vec2(-1,1)-pp,dir,len2,lob,clp,i); tap(aC,aW,vec2(0,1)-pp,dir,len2,lob,clp,j);
+  tap(aC,aW,vec2(0,0)-pp,dir,len2,lob,clp,f); tap(aC,aW,vec2(-1,0)-pp,dir,len2,lob,clp,e);
+  tap(aC,aW,vec2(1,1)-pp,dir,len2,lob,clp,k); tap(aC,aW,vec2(2,1)-pp,dir,len2,lob,clp,l);
+  tap(aC,aW,vec2(2,0)-pp,dir,len2,lob,clp,h); tap(aC,aW,vec2(1,0)-pp,dir,len2,lob,clp,g);
+  tap(aC,aW,vec2(1,2)-pp,dir,len2,lob,clp,oo); tap(aC,aW,vec2(0,2)-pp,dir,len2,lob,clp,n);
+  vec3 mn=min(min(f,g),min(j,k)), mx=max(max(f,g),max(j,k));
+  o=vec4(clamp(aC/aW,mn,mx),1.); }`
+
+  // RCAS + the same adaptive tone mapping as FS_MAIN; drawn to the screen at the canvas size
+  const FS_RCAS = `#version 300 es
+precision highp float; uniform sampler2D tex; uniform vec2 outSize; uniform float sharp;
+uniform vec4 tone; uniform float gammaV; in vec2 uv; out vec4 o;
+vec3 F(ivec2 p){ return texelFetch(tex, clamp(p, ivec2(0), ivec2(outSize)-1), 0).rgb; }
+void main(){
+  ivec2 ip=ivec2(uv*outSize);
+  vec3 b=F(ip+ivec2(0,-1)), d=F(ip+ivec2(-1,0)), e=F(ip), f=F(ip+ivec2(1,0)), h=F(ip+ivec2(0,1));
+  vec3 mn=min(min(b,d),min(f,h)), mx=max(max(b,d),max(f,h));
+  vec3 hitMin=mn/max(4.0*mx,1e-4); vec3 hitMax=(1.0-mx)/min(4.0*mn-4.0,-1e-4);
+  vec3 lo=max(-hitMin,hitMax); float lobe=max(-0.1875,min(max(lo.r,max(lo.g,lo.b)),0.))*sharp;
+  vec3 r=clamp((lobe*(b+d+f+h)+e)/(4.0*lobe+1.0),0.,1.);
+  if(tone.y>tone.x){
+    r=clamp((r-tone.x)/(tone.y-tone.x),0.,1.); r=pow(r,vec3(gammaV));
+    r=mix(r, r*r*(3.0-2.0*r), tone.z);
+    float l=dot(r,vec3(.2126,.7152,.0722)); r=mix(vec3(l),r,tone.w); }
+  o=vec4(r,1.); }`
+
   function compile (gl, type, src) {
     const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s)
     if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s))
@@ -132,10 +195,11 @@ void main(){
     if (!gl) return null
     const R = { gl, canvas, w: 0, h: 0 }
     R.planesP = program(gl, FS_PLANES, VS_FBO); R.main = program(gl, FS_MAIN)
+    R.dn = program(gl, FS_DENOISE, VS_FBO); R.easu = program(gl, FS_EASU, VS_FBO); R.rcas = program(gl, FS_RCAS)
     const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf)
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW)
     gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0)
-    R.texCur = texture(gl); R.texNN = texture(gl)
+    R.texCur = texture(gl); R.texNN = texture(gl); R.texDn = texture(gl, 0, 0, gl.NEAREST); R.texUp = texture(gl, 0, 0, gl.NEAREST)
     R.fbo = gl.createFramebuffer()
     R.resize = function (w, h) { R.w = w; R.h = h }
     R.bind = function (unit, tex) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, tex) }
@@ -164,11 +228,29 @@ void main(){
     // which: 'cur' (current video frame) | 'nn' (neural 4x output). Only the current frame is ever shown:
     // nothing is blended with earlier frames, so motion can never leave a trail.
     R.draw = function (which, vw, vh, tone, sharp) {
+      if (which === 'cur') return R.drawFsr(vw, vh, tone, sharp)
       let src = R.texCur; let sw = vw; let sh = vh
       if (which === 'nn') { src = R.texNN; sw = vw * 4; sh = vh * 4 }
       R.pass(R.main, null, R.canvas.width, R.canvas.height, u => {
         R.bind(0, src); gl.uniform1i(u.tex, 0); gl.uniform2f(u.texSize, sw, sh)
         gl.uniform1f(u.sharp, sharp); gl.uniform1f(u.denoise, which === 'nn' ? cfg.denoise * 0.3 : cfg.denoise)
+        gl.uniform4f(u.tone, tone.lo, tone.hi, tone.contrast, tone.sat); gl.uniform1f(u.gammaV, tone.gamma)
+      })
+    }
+    // current frame: deblock (source size) -> EASU (to canvas size) -> RCAS + tone (screen)
+    R.drawFsr = function (vw, vh, tone, sharp) {
+      const ow = R.canvas.width; const oh = R.canvas.height
+      let src = R.texCur
+      if (cfg.denoise > 0) {
+        if (R.dw !== vw || R.dh !== vh) { R.dw = vw; R.dh = vh; R.bind(0, R.texDn); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, vw, vh, 0, gl.RGBA, gl.UNSIGNED_BYTE, null) }
+        R.pass(R.dn, R.texDn, vw, vh, u => { R.bind(0, R.texCur); gl.uniform1i(u.tex, 0); gl.uniform2f(u.texSize, vw, vh); gl.uniform1f(u.denoise, cfg.denoise) })
+        src = R.texDn
+      }
+      if (R.uw !== ow || R.uh !== oh) { R.uw = ow; R.uh = oh; R.bind(0, R.texUp); gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, ow, oh, 0, gl.RGBA, gl.UNSIGNED_BYTE, null) }
+      R.pass(R.easu, R.texUp, ow, oh, u => { R.bind(0, src); gl.uniform1i(u.tex, 0); gl.uniform2f(u.inSize, vw, vh); gl.uniform2f(u.outSize, ow, oh) })
+      // cfg.sharpness 0..1 -> RCAS strength 2^-stops (0 stops = strongest)
+      R.pass(R.rcas, null, ow, oh, u => {
+        R.bind(0, R.texUp); gl.uniform1i(u.tex, 0); gl.uniform2f(u.outSize, ow, oh); gl.uniform1f(u.sharp, Math.pow(2, -(1 - Math.min(1, Math.max(0, sharp)))))
         gl.uniform4f(u.tone, tone.lo, tone.hi, tone.contrast, tone.sat); gl.uniform1f(u.gammaV, tone.gamma)
       })
     }
@@ -215,10 +297,13 @@ void main(){
     const ort = window.ort
     ort.env.wasm.wasmPaths = HOST + 'ort/'; ort.env.wasm.numThreads = 1
     ;(async () => {
-      const bytes = new Uint8Array(await (await fetch(HOST + 'model/realesr-general-x4v3.onnx')).arrayBuffer())
+      // WebGPU only. On the CPU (wasm) one 360p frame takes many seconds and blocks the page's main thread: the player
+      // and scrolling freeze. Without WebGPU (older Android WebView, some GPUs) the shader path (FSR) is used instead.
       let hasGpu = false
       try { hasGpu = !!(navigator.gpu && await navigator.gpu.requestAdapter()) } catch (e) { /* none */ }
-      for (const ep of hasGpu ? ['webgpu', 'wasm'] : ['wasm']) {
+      if (!hasGpu && !cfg.nnCpu) { state.stats.nn = 'error'; log('neural SR: no WebGPU in this WebView, shader upscaling (FSR) only'); return }
+      const bytes = new Uint8Array(await (await fetch(HOST + 'model/realesr-general-x4v3.onnx')).arrayBuffer())
+      for (const ep of hasGpu ? ['webgpu'] : ['wasm']) { // wasm only for the engine tests (cfg.nnCpu, never set by the app)
         try { nn.session = await ort.InferenceSession.create(bytes, { executionProviders: [ep], graphOptimizationLevel: 'all' }); nn.backend = ep; break } catch (e) { log('SR backend', ep, 'failed:', String(e)) }
       }
       state.stats.nn = nn.session ? 'ready:' + nn.backend : 'error'

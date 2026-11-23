@@ -13,6 +13,7 @@ run(async (browser) => {
   })
   await page.waitForFunction(() => document.getElementById('v').videoWidth > 0)
   await page.addScriptTag({ content: fs.readFileSync(path.join(ortDir, 'ort.wasm.min.js'), 'utf8') })
+  await page.evaluate(() => { window.__minCfg0 = Object.assign(window.__minCfg0 || {}, { nnCpu: true }) }) // no WebGPU in headless Chromium: test the model on wasm
   await page.addScriptTag({ content: ENGINE })
   const probe = () => page.evaluate(() => {
     const c = document.querySelector('canvas[style*="fixed"]'); if (!c) return null

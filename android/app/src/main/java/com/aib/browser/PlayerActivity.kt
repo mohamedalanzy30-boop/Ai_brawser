@@ -467,6 +467,10 @@ class PlayerActivity : Activity() {
         private var oesTex = 0; private var st: SurfaceTexture? = null; private var videoSurface: Surface? = null
         private var progOes = 0; private var progPlanes = 0; private var progDirect = 0
         private var fbo = 0; private var fboTex = 0; private var outTex = 0
+        // GPU path (FSR 1): video frame at its own size -> EASU at the picture's screen size -> RCAS to the screen
+        private var progEasu = 0; private var progRcas = 0
+        private var srcFbo = 0; private var srcTex = 0; private var srcW = 0; private var srcH = 0
+        private var upFbo = 0; private var upTex = 0; private var upW = 0; private var upH = 0
         private var viewW = 1; private var viewH = 1; @Volatile private var vidW = 0; @Volatile private var vidH = 0; @Volatile private var par = 1f
         private val stMatrix = FloatArray(16)
         // neural: one fixed-size model per source class, each fed the video at its own resolution
@@ -721,15 +725,54 @@ class PlayerActivity : Activity() {
             val f = fitRect(viewW, viewH, aspect)
             GLES30.glViewport(f[0].toInt(), f[1].toInt(), f[2].toInt(), f[3].toInt())
             if (p == progDirect) {
-                GLES30.glUseProgram(p)
-                GLES30.glUniform2f(GLES30.glGetUniformLocation(p, "texel"), 1f / Math.max(vidW, 1), 1f / Math.max(vidH, 1))
-                drawOes(p, flipY = false)
+                if (progEasu != 0 && progRcas != 0) drawFsr(f) else {
+                    GLES30.glUseProgram(p)
+                    GLES30.glUniform2f(GLES30.glGetUniformLocation(p, "texel"), 1f / Math.max(vidW, 1), 1f / Math.max(vidH, 1))
+                    drawOes(p, flipY = false)
+                }
             } else {
                 GLES30.glUseProgram(p)
                 GLES30.glActiveTexture(GLES30.GL_TEXTURE0); GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, outTex); GLES30.glUniform1i(GLES30.glGetUniformLocation(p, "img"), 0)
                 GLES30.glUniform4f(GLES30.glGetUniformLocation(p, "crop"), content[0], content[1], content[2], content[3])
                 drawQuad(p)
             }
+        }
+
+        private fun fboTexture(tex: Int, fb: Int, w: Int, h: Int) {
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, tex)
+            GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA8, w, h, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_NEAREST); GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE); GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, fb)
+            GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, tex, 0)
+        }
+
+        /** GPU path: AMD FSR 1 (EASU edge-adaptive upscale + RCAS limited sharpening) instead of Catmull-Rom.
+         *  [f] is the picture's rect on the screen (x, y, w, h); the screen viewport is already set to it. */
+        private fun drawFsr(f: FloatArray) {
+            val vw = vidW; val vh = vidH; val ow = Math.max(f[2].toInt(), 1); val oh = Math.max(f[3].toInt(), 1)
+            val t = IntArray(1)
+            if (srcFbo == 0) { GLES30.glGenFramebuffers(1, t, 0); srcFbo = t[0]; GLES30.glGenTextures(1, t, 0); srcTex = t[0]
+                GLES30.glGenFramebuffers(1, t, 0); upFbo = t[0]; GLES30.glGenTextures(1, t, 0); upTex = t[0] }
+            if (srcW != vw || srcH != vh) { srcW = vw; srcH = vh; fboTexture(srcTex, srcFbo, vw, vh) }
+            if (upW != ow || upH != oh) { upW = ow; upH = oh; fboTexture(upTex, upFbo, ow, oh) }
+            // 1) video frame (external OES) -> plain texture at the video's own size
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, srcFbo); GLES30.glViewport(0, 0, vw, vh)
+            drawOes(progOes, flipY = false)
+            // 2) EASU -> picture size
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, upFbo); GLES30.glViewport(0, 0, ow, oh)
+            GLES30.glUseProgram(progEasu)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0); GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, srcTex); GLES30.glUniform1i(GLES30.glGetUniformLocation(progEasu, "tex"), 0)
+            GLES30.glUniform2f(GLES30.glGetUniformLocation(progEasu, "inSize"), vw.toFloat(), vh.toFloat())
+            GLES30.glUniform2f(GLES30.glGetUniformLocation(progEasu, "outSize"), ow.toFloat(), oh.toFloat())
+            drawQuad(progEasu)
+            // 3) RCAS -> screen
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0); GLES30.glViewport(f[0].toInt(), f[1].toInt(), ow, oh)
+            GLES30.glUseProgram(progRcas)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0); GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, upTex); GLES30.glUniform1i(GLES30.glGetUniformLocation(progRcas, "tex"), 0)
+            GLES30.glUniform2f(GLES30.glGetUniformLocation(progRcas, "outSize"), ow.toFloat(), oh.toFloat())
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(progRcas, "sharp"), 0.8f)
+            drawQuad(progRcas)
         }
 
         private fun setupEgl() {
@@ -750,6 +793,12 @@ class PlayerActivity : Activity() {
         }
         private fun program(vs: String, fs: String): Int {
             val p = GLES30.glCreateProgram(); GLES30.glAttachShader(p, compile(GLES30.GL_VERTEX_SHADER, vs)); GLES30.glAttachShader(p, compile(GLES30.GL_FRAGMENT_SHADER, fs)); GLES30.glLinkProgram(p); return p
+        }
+
+        private fun programOrZero(vs: String, fs: String): Int {
+            val p = program(vs, fs); val ok = IntArray(1); GLES30.glGetProgramiv(p, GLES30.GL_LINK_STATUS, ok, 0)
+            if (ok[0] == 0) { addLog("[player] FSR shader unavailable: " + GLES30.glGetProgramInfoLog(p)); GLES30.glDeleteProgram(p); return 0 }
+            return p
         }
 
         private fun setupGl() {
@@ -801,6 +850,55 @@ in vec2 pos; uniform vec4 crop; out vec2 uv;
 void main(){ vec2 t = pos*0.5+0.5; t.y = 1.0 - t.y; uv = mix(crop.xy, crop.zw, t); gl_Position = vec4(pos,0.,1.); }""", """#version 300 es
 precision mediump float; uniform sampler2D img; in vec2 uv; out vec4 o;
 void main(){ o = vec4(texture(img, uv).rgb, 1.); }""")
+            // FSR 1 for the GPU path (same shaders as the page engine, assets/engine.js); if either fails to compile
+            // (an old GPU driver) the Catmull-Rom program above stays in use
+            val vsQuad = """#version 300 es
+in vec2 pos; out vec2 uv;
+void main(){ uv = pos*0.5+0.5; gl_Position = vec4(pos,0.,1.); }"""
+            progEasu = programOrZero(vsQuad, """#version 300 es
+precision highp float; uniform sampler2D tex; uniform vec2 inSize, outSize; out vec4 o;
+vec3 F(vec2 p){ return texelFetch(tex, ivec2(clamp(p, vec2(0.), inSize-1.)), 0).rgb; }
+float L(vec3 c){ return c.b*0.5+(c.r*0.5+c.g); }
+void tap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp, vec3 c){
+  vec2 v=vec2(dot(off,dir), dot(off,vec2(-dir.y,dir.x)))*len;
+  float d2=min(dot(v,v),clp); float wB=0.4*d2-1.0; float wA=lob*d2-1.0;
+  wB*=wB; wA*=wA; wB=1.5625*wB-0.5625; float w=wB*wA; aC+=c*w; aW+=w; }
+void dirLen(inout vec2 dir, inout float len, float w, float a, float b, float c, float d, float e){
+  float lx=max(abs(d-c),abs(c-b)); float dx=d-b; dir.x+=dx*w; lx=clamp(abs(dx)/max(lx,1e-5),0.,1.); len+=lx*lx*w;
+  float ly=max(abs(e-c),abs(c-a)); float dy=e-a; dir.y+=dy*w; ly=clamp(abs(dy)/max(ly,1e-5),0.,1.); len+=ly*ly*w; }
+void main(){
+  vec2 pp=gl_FragCoord.xy*inSize/outSize-0.5; vec2 fp=floor(pp); pp-=fp;
+  vec3 b=F(fp+vec2(0,-1)), c=F(fp+vec2(1,-1)), e=F(fp+vec2(-1,0)), f=F(fp), g=F(fp+vec2(1,0)), h=F(fp+vec2(2,0)),
+       i=F(fp+vec2(-1,1)), j=F(fp+vec2(0,1)), k=F(fp+vec2(1,1)), l=F(fp+vec2(2,1)), n=F(fp+vec2(0,2)), oo=F(fp+vec2(1,2));
+  float bL=L(b),cL=L(c),eL=L(e),fL=L(f),gL=L(g),hL=L(h),iL=L(i),jL=L(j),kL=L(k),lL=L(l),nL=L(n),oL=L(oo);
+  vec2 dir=vec2(0.); float len=0.;
+  dirLen(dir,len,(1.-pp.x)*(1.-pp.y),bL,eL,fL,gL,jL); dirLen(dir,len,pp.x*(1.-pp.y),cL,fL,gL,hL,kL);
+  dirLen(dir,len,(1.-pp.x)*pp.y,fL,iL,jL,kL,nL); dirLen(dir,len,pp.x*pp.y,gL,jL,kL,lL,oL);
+  float r=dot(dir,dir); bool z=r<1.0/32768.0; dir=z?vec2(1.,0.):dir*inversesqrt(r);
+  len=len*0.5; len*=len;
+  float st=dot(dir,dir)/max(abs(dir.x),abs(dir.y)); vec2 len2=vec2(1.+(st-1.)*len, 1.-0.5*len);
+  float lob=0.5-0.29*len; float clp=1.0/lob;
+  vec3 aC=vec3(0.); float aW=0.;
+  tap(aC,aW,vec2(0,-1)-pp,dir,len2,lob,clp,b); tap(aC,aW,vec2(1,-1)-pp,dir,len2,lob,clp,c);
+  tap(aC,aW,vec2(-1,1)-pp,dir,len2,lob,clp,i); tap(aC,aW,vec2(0,1)-pp,dir,len2,lob,clp,j);
+  tap(aC,aW,vec2(0,0)-pp,dir,len2,lob,clp,f); tap(aC,aW,vec2(-1,0)-pp,dir,len2,lob,clp,e);
+  tap(aC,aW,vec2(1,1)-pp,dir,len2,lob,clp,k); tap(aC,aW,vec2(2,1)-pp,dir,len2,lob,clp,l);
+  tap(aC,aW,vec2(2,0)-pp,dir,len2,lob,clp,h); tap(aC,aW,vec2(1,0)-pp,dir,len2,lob,clp,g);
+  tap(aC,aW,vec2(1,2)-pp,dir,len2,lob,clp,oo); tap(aC,aW,vec2(0,2)-pp,dir,len2,lob,clp,n);
+  vec3 mn=min(min(f,g),min(j,k)), mx=max(max(f,g),max(j,k));
+  o=vec4(clamp(aC/aW,mn,mx),1.); }""")
+            progRcas = programOrZero(vsQuad, """#version 300 es
+precision highp float; uniform sampler2D tex; uniform vec2 outSize; uniform float sharp;
+in vec2 uv; out vec4 o;
+vec3 F(ivec2 p){ return texelFetch(tex, clamp(p, ivec2(0), ivec2(outSize)-1), 0).rgb; }
+void main(){
+  ivec2 ip=ivec2(uv*outSize);
+  vec3 b=F(ip+ivec2(0,-1)), d=F(ip+ivec2(-1,0)), e=F(ip), f=F(ip+ivec2(1,0)), h=F(ip+ivec2(0,1));
+  vec3 mn=min(min(b,d),min(f,h)), mx=max(max(b,d),max(f,h));
+  vec3 hitMin=mn/max(4.0*mx,1e-4); vec3 hitMax=(1.0-mx)/min(4.0*mn-4.0,-1e-4);
+  vec3 lo=max(-hitMin,hitMax); float lobe=max(-0.1875,min(max(lo.r,max(lo.g,lo.b)),0.))*sharp;
+  vec3 r=clamp((lobe*(b+d+f+h)+e)/(4.0*lobe+1.0),0.,1.);
+  o=vec4(r,1.); }""")
         }
     }
 }

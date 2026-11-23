@@ -11,6 +11,7 @@ run(async (browser) => {
   await page.evaluate(() => { const c = document.createElement('canvas'); c.width = 160; c.height = 90; const x = c.getContext('2d'); setInterval(() => { x.fillStyle = '#f00'; x.fillRect(0, 0, 160, 45); x.fillStyle = '#00f'; x.fillRect(0, 45, 160, 45) }, 33); const v = document.getElementById('v'); v.srcObject = c.captureStream(30); v.play() })
   await page.waitForFunction(() => document.getElementById('v').videoWidth > 0)
   await page.addScriptTag({ content: fs.readFileSync(path.join(ortDir, 'ort.wasm.min.js'), 'utf8') })
+  await page.evaluate(() => { window.__minCfg0 = Object.assign(window.__minCfg0 || {}, { nnCpu: true }) }) // no WebGPU in headless Chromium: test the model on wasm
   await page.addScriptTag({ content: ENGINE })
   await page.evaluate(() => window.__minEnhanceSet({ enabled: true, neural: true, tone: false, target: 1080 }))
   await nnReady(page)
