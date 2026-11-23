@@ -215,10 +215,13 @@ void main(){
     const ort = window.ort
     ort.env.wasm.wasmPaths = HOST + 'ort/'; ort.env.wasm.numThreads = 1
     ;(async () => {
-      const bytes = new Uint8Array(await (await fetch(HOST + 'model/realesr-general-x4v3.onnx')).arrayBuffer())
+      // WebGPU only. On the CPU (wasm) one 360p frame takes many seconds and blocks the page's main thread: the player
+      // and scrolling freeze. Without WebGPU (older Android WebView, some GPUs) the shader path (FSR) is used instead.
       let hasGpu = false
       try { hasGpu = !!(navigator.gpu && await navigator.gpu.requestAdapter()) } catch (e) { /* none */ }
-      for (const ep of hasGpu ? ['webgpu', 'wasm'] : ['wasm']) {
+      if (!hasGpu && !cfg.nnCpu) { state.stats.nn = 'error'; log('neural SR: no WebGPU in this WebView, shader upscaling (FSR) only'); return }
+      const bytes = new Uint8Array(await (await fetch(HOST + 'model/realesr-general-x4v3.onnx')).arrayBuffer())
+      for (const ep of hasGpu ? ['webgpu'] : ['wasm']) { // wasm only for the engine tests (cfg.nnCpu, never set by the app)
         try { nn.session = await ort.InferenceSession.create(bytes, { executionProviders: [ep], graphOptimizationLevel: 'all' }); nn.backend = ep; break } catch (e) { log('SR backend', ep, 'failed:', String(e)) }
       }
       state.stats.nn = nn.session ? 'ready:' + nn.backend : 'error'

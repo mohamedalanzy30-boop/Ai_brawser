@@ -15,6 +15,7 @@ run(async (browser) => {
     }
   })
   await page.waitForFunction(() => document.getElementById('v').readyState >= 2)
+  await page.evaluate(() => { window.__minCfg0 = Object.assign(window.__minCfg0 || {}, { nnCpu: true }) }) // no WebGPU in headless Chromium: test the model on wasm
   await page.addScriptTag({ content: ENGINE })
   await page.evaluate(() => window.__minEnhanceSet({ enabled: true, neural: true, target: 1080 }))
   const runs = () => page.evaluate(() => window.__runs)
